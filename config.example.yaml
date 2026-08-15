@@ -1,0 +1,58 @@
+# CertPilot Configuration (Development)
+# Copy this to config.dev.yaml and fill in your values
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  mode: "development"  # development | production
+
+# Supabase
+supabase:
+  url: "https://wlhrdxswnzwpiffvbkez.supabase.co"
+  anon_key: ""       # Your Supabase anon/publishable key
+  service_role_key: "" # Your Supabase service role key (backend only, never expose)
+  jwt_secret: ""      # Supabase JWT secret for token validation
+
+# Gateway plugin settings
+plugins:
+  # How the core discovers and communicates with gateways
+  discovery_mode: "static"  # static | docker | kubernetes
+  # Static gateway registrations (for local dev)
+  gateways: []
+    # - name: "selfsigned"
+    #   addr: "localhost:9091"
+    #   type: "selfsigned"
+    # - name: "acme-letsencrypt"
+    #   addr: "localhost:9092"
+    #   type: "acme"
+
+# PKI monitoring
+pki:
+  # How often to check CA health (in minutes)
+  ca_health_check_interval: 360  # 6 hours
+  # How often to check CRL/OCSP (in minutes)
+  crl_ocsp_check_interval: 60   # 1 hour
+
+# Certificate renewal
+renewal:
+  # How often to scan for certificates needing renewal (in minutes)
+  scan_interval: 60
+  # Default lead days before expiry to trigger renewal
+  default_lead_days: 30
+  # Retry backoff (in minutes): 60, 240, 720, 1440
+  retry_backoff: [60, 240, 720, 1440]
+
+# Notifications
+notifications:
+  channels: []
+    # - type: "slack"
+    #   webhook_url: "https://hooks.slack.com/services/..."
+    # - type: "email"
+    #   smtp_host: "smtp.example.com"
+    #   smtp_port: 587
+    #   from: "certpilot@example.com"
+
+# Logging
+logging:
+  level: "debug"  # debug | info | warn | error
+  format: "text"  # text | json

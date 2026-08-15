@@ -1,0 +1,50 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+certpilot-core
+gateway-*
+
+# Go
+/vendor/
+go.work.sum
+
+# Generated protobuf
+pkg/pb/**/*.go
+!pkg/pb/.gitkeep
+
+# Test
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+config.dev.yaml
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Docker
+.docker/
+
+# Logs
+*.log

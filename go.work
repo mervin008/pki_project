@@ -1,0 +1,8 @@
+go 1.26.6
+
+use (
+	./core
+	./gateways/acme
+	./gateways/selfsigned
+	./pkg
+)
