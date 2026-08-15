@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  # CertPilot Core API & Control Plane
+  core:
+    build:
+      context: ..
+      dockerfile: deploy/docker/core.Dockerfile
+    container_name: certpilot-core
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - CERTPILOT_DB_URL=${CERTPILOT_DB_URL}
+      - CERTPILOT_MODE=production
+    depends_on:
+      - gateway-selfsigned
+      - gateway-acme
+
+  # Gateway: Self-Signed (Dev/Internal)
+  gateway-selfsigned:
+    build:
+      context: ..
+      dockerfile: deploy/docker/gateway-selfsigned.Dockerfile
+    container_name: certpilot-gateway-selfsigned
+    restart: unless-stopped
+    ports:
+      - "9091:9091"
+
+  # Gateway: ACME (Let's Encrypt / ZeroSSL)
+  gateway-acme:
+    build:
+      context: ..
+      dockerfile: deploy/docker/gateway-acme.Dockerfile
+    container_name: certpilot-gateway-acme
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+
+  # Frontend SPA
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../deploy/docker/frontend.Dockerfile
+    container_name: certpilot-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - core
