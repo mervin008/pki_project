@@ -9,8 +9,8 @@ import (
 // ChainNode represents a node in the CA hierarchy tree.
 type ChainNode struct {
 	Authority *store.CAAuthority `json:"authority"`
-	Children  []*ChainNode        `json:"children"`
-	Depth     int                 `json:"depth"`
+	Children  []*ChainNode       `json:"children"`
+	Depth     int                `json:"depth"`
 }
 
 // ChainResolver builds hierarchy trees from flat CA authority lists.

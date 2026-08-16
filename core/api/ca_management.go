@@ -70,13 +70,13 @@ func (h *CAHandler) Chain(c *gin.Context) {
 
 // CreateCAInput represents the payload to register a new CA Authority.
 type CreateCAInput struct {
-	Name                 string  `json:"name" binding:"required"`
-	CertificatePEM       string  `json:"certificate_pem" binding:"required"`
-	ParentCAID           *string `json:"parent_ca_id"`
-	CAAccountID          *string `json:"ca_account_id"`
-	CRLDistributionURL   string  `json:"crl_distribution_url"`
-	OCSPResponderURL     string  `json:"ocsp_responder_url"`
-	Notes                string  `json:"notes"`
+	Name               string  `json:"name" binding:"required"`
+	CertificatePEM     string  `json:"certificate_pem" binding:"required"`
+	ParentCAID         *string `json:"parent_ca_id"`
+	CAAccountID        *string `json:"ca_account_id"`
+	CRLDistributionURL string  `json:"crl_distribution_url"`
+	OCSPResponderURL   string  `json:"ocsp_responder_url"`
+	Notes              string  `json:"notes"`
 }
 
 // Create handles POST /api/v1/pki/authorities.

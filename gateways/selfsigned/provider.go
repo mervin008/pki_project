@@ -14,9 +14,9 @@ import (
 	"math/big"
 	"time"
 
+	certcrypto "github.com/certpilot/certpilot/pkg/crypto"
 	commonv1 "github.com/certpilot/certpilot/pkg/pb/common/v1"
 	providerv1 "github.com/certpilot/certpilot/pkg/pb/provider/v1"
-	certcrypto "github.com/certpilot/certpilot/pkg/crypto"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -116,17 +116,17 @@ func (p *Provider) IssueCertificate(ctx context.Context, req *providerv1.IssueCe
 
 	return &providerv1.IssueCertificateResponse{
 		Certificate: &commonv1.CertificateInfo{
-			CommonName:        commonName,
-			Sans:              req.Domains,
-			SerialNumber:      serialNumber.Text(16),
-			IssuerDn:          template.Subject.String(),
-			SubjectDn:         template.Subject.String(),
-			NotBefore:         timestamppb.New(template.NotBefore),
-			NotAfter:          timestamppb.New(template.NotAfter),
-			KeyType:           string(keyType),
-			KeySize:           int32(keySize),
-			CertificatePem:    certPEM,
-			PrivateKeyPem:     keyPEM,
+			CommonName:     commonName,
+			Sans:           req.Domains,
+			SerialNumber:   serialNumber.Text(16),
+			IssuerDn:       template.Subject.String(),
+			SubjectDn:      template.Subject.String(),
+			NotBefore:      timestamppb.New(template.NotBefore),
+			NotAfter:       timestamppb.New(template.NotAfter),
+			KeyType:        string(keyType),
+			KeySize:        int32(keySize),
+			CertificatePem: certPEM,
+			PrivateKeyPem:  keyPEM,
 		},
 		ProviderCertificateId: serialNumber.Text(16),
 	}, nil
@@ -137,9 +137,9 @@ func (p *Provider) RenewCertificate(ctx context.Context, req *providerv1.RenewCe
 	slog.Info("renewing self-signed certificate", "domains", req.Domains)
 
 	issueResp, err := p.IssueCertificate(ctx, &providerv1.IssueCertificateRequest{
-		Domains:  req.Domains,
-		KeyType:  req.KeyType,
-		KeySize:  req.KeySize,
+		Domains: req.Domains,
+		KeyType: req.KeyType,
+		KeySize: req.KeySize,
 	})
 	if err != nil {
 		return nil, err

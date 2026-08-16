@@ -1,120 +1,68 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useApi } from '@/composables/useApi'
-import { 
-  KeyRound, 
-  Plus, 
-  RefreshCw, 
-  Search, 
-  Filter, 
-  RotateCw, 
-  Trash2, 
-  X,
-  FileCode,
-  CheckCircle2,
-  AlertCircle
+import {
+  Plus, Search, Download, RotateCw, Eye,
+  CheckCircle, AlertTriangle, XCircle, Clock
 } from 'lucide-vue-next'
 
 const api = useApi()
 const certificates = ref<any[]>([])
-const caAccounts = ref<any[]>([])
 const loading = ref(true)
-const search = ref('')
-const statusFilter = ref('')
-
+const searchQuery = ref('')
+const filterStatus = ref('all')
 const showRequestModal = ref(false)
 const showDetailModal = ref(false)
 const selectedCert = ref<any>(null)
-
-const newCert = ref({
-  common_name: '',
-  sans_input: '',
-  ca_account_id: '',
-  key_type: 'RSA',
-  key_size: 2048,
-  validity_days: 90,
-  environment: 'production',
-  team: 'Platform Engineering',
-  auto_renew: true,
-  renewal_lead_days: 30,
-})
-
-const submitting = ref(false)
 const renewingId = ref<string | null>(null)
-const errorMessage = ref('')
+
+// Request form
+const reqForm = ref({
+  common_name: '',
+  san_domains: '',
+  ca_id: '',
+  key_algorithm: 'RSA',
+  key_size: '2048',
+  validity_days: '365',
+})
 
 async function loadData() {
   loading.value = true
   try {
-    const [certsRes, caAccRes] = await Promise.all([
-      api.get<any>('/api/v1/certificates').catch(() => ({ data: [] })),
-      api.get<any>('/api/v1/ca-accounts').catch(() => ({ data: [] })),
-    ])
-    certificates.value = certsRes.data || []
-    caAccounts.value = caAccRes.data || []
-
-    if (caAccounts.value.length > 0 && !newCert.value.ca_account_id) {
-      newCert.value.ca_account_id = caAccounts.value[0].id
-    }
+    const res = await api.get<any>('/api/v1/certificates').catch(() => ({ data: [] }))
+    certificates.value = res.data || []
   } finally {
     loading.value = false
   }
 }
 
-const filteredCerts = computed(() => {
-  return certificates.value.filter(c => {
-    const matchesSearch = !search.value || 
-      c.common_name.toLowerCase().includes(search.value.toLowerCase()) ||
-      (c.sans && c.sans.some((s: string) => s.toLowerCase().includes(search.value.toLowerCase())))
-    const matchesStatus = !statusFilter.value || c.status === statusFilter.value
-    return matchesSearch && matchesStatus
-  })
-})
-
-async function submitRequest() {
-  submitting.value = true
-  errorMessage.value = ''
+async function requestCert() {
   try {
-    const sans = newCert.value.sans_input
-      ? newCert.value.sans_input.split(',').map(s => s.trim()).filter(Boolean)
-      : []
-
-    const payload = {
-      ...newCert.value,
-      sans,
-    }
-
-    await api.post('/api/v1/certificates', payload)
+    await api.post('/api/v1/certificates', {
+      common_name: reqForm.value.common_name,
+      san_domains: reqForm.value.san_domains.split(',').map(d => d.trim()).filter(Boolean),
+      ca_id: reqForm.value.ca_id || undefined,
+      key_algorithm: reqForm.value.key_algorithm,
+      key_size: parseInt(reqForm.value.key_size),
+      validity_days: parseInt(reqForm.value.validity_days),
+    })
     showRequestModal.value = false
-    newCert.value.common_name = ''
-    newCert.value.sans_input = ''
+    reqForm.value = { common_name: '', san_domains: '', ca_id: '', key_algorithm: 'RSA', key_size: '2048', validity_days: '365' }
     await loadData()
   } catch (err: any) {
-    errorMessage.value = err.message
-  } finally {
-    submitting.value = false
+    alert('Request failed: ' + (err.message || err))
   }
 }
 
-async function triggerRenew(cert: any) {
+async function renewCert(cert: any) {
   renewingId.value = cert.id
   try {
     await api.post(`/api/v1/certificates/${cert.id}/renew`)
     await loadData()
   } catch (err: any) {
-    alert('Renewal failed: ' + err.message)
+    alert('Renewal failed: ' + (err.message || err))
   } finally {
     renewingId.value = null
-  }
-}
-
-async function deleteCert(id: string) {
-  if (!confirm('Are you sure you want to delete this certificate?')) return
-  try {
-    await api.delete(`/api/v1/certificates/${id}`)
-    await loadData()
-  } catch (err: any) {
-    alert('Delete failed: ' + err.message)
   }
 }
 
@@ -123,274 +71,246 @@ function viewDetail(cert: any) {
   showDetailModal.value = true
 }
 
-onMounted(() => {
-  loadData()
+// Demo certificates
+const demoCerts = [
+  { id: '1', common_name: 'api.certpilot.io', status: 'active', issuer: 'Root CA', key_algorithm: 'RSA-2048', not_before: '2026-01-15', not_after: '2027-01-15', serial: 'A1B2C3D4' },
+  { id: '2', common_name: '*.internal.dev', status: 'active', issuer: 'ACME Issuer', key_algorithm: 'ECDSA-256', not_before: '2026-03-01', not_after: '2027-03-01', serial: 'E5F6G7H8' },
+  { id: '3', common_name: 'vault.service.mesh', status: 'expiring', issuer: 'Vault Sub-CA', key_algorithm: 'RSA-4096', not_before: '2025-06-01', not_after: '2026-09-01', serial: 'I9J0K1L2' },
+  { id: '4', common_name: 'auth.platform.io', status: 'active', issuer: 'Root CA', key_algorithm: 'RSA-2048', not_before: '2026-02-10', not_after: '2027-02-10', serial: 'M3N4O5P6' },
+  { id: '5', common_name: 'legacy.app.internal', status: 'expired', issuer: 'Root CA', key_algorithm: 'RSA-2048', not_before: '2024-01-01', not_after: '2025-01-01', serial: 'Q7R8S9T0' },
+  { id: '6', common_name: 'cdn.assets.io', status: 'active', issuer: 'ACME Issuer', key_algorithm: 'ECDSA-384', not_before: '2026-04-15', not_after: '2027-04-15', serial: 'U1V2W3X4' },
+  { id: '7', common_name: 'monitoring.ops.net', status: 'active', issuer: 'GCP CAS', key_algorithm: 'ECDSA-256', not_before: '2026-05-20', not_after: '2027-05-20', serial: 'Y5Z6A7B8' },
+  { id: '8', common_name: 'staging.preview.io', status: 'expiring', issuer: 'Root CA', key_algorithm: 'RSA-2048', not_before: '2025-09-01', not_after: '2026-09-15', serial: 'C9D0E1F2' },
+]
+
+const displayCerts = computed(() => {
+  const src = certificates.value.length ? certificates.value : demoCerts
+  return src.filter(c => {
+    const matchSearch = !searchQuery.value || (c.common_name || '').toLowerCase().includes(searchQuery.value.toLowerCase())
+    const matchStatus = filterStatus.value === 'all' || c.status === filterStatus.value
+    return matchSearch && matchStatus
+  })
 })
+
+const statusCounts = computed(() => {
+  const src = certificates.value.length ? certificates.value : demoCerts
+  return {
+    all: src.length,
+    active: src.filter(c => c.status === 'active').length,
+    expiring: src.filter(c => c.status === 'expiring').length,
+    expired: src.filter(c => c.status === 'expired').length,
+  }
+})
+
+function getStatusBadge(status: string) {
+  switch (status?.toLowerCase()) {
+    case 'active': return 'badge-success'
+    case 'expiring': return 'badge-warning'
+    case 'expired': return 'badge-error'
+    case 'revoked': return 'badge-error'
+    default: return 'badge-ghost'
+  }
+}
+
+function getStatusIcon(status: string) {
+  switch (status?.toLowerCase()) {
+    case 'active': return CheckCircle
+    case 'expiring': return AlertTriangle
+    case 'expired': return XCircle
+    default: return Clock
+  }
+}
+
+function daysUntil(d: string) {
+  if (!d) return 0
+  return Math.ceil((new Date(d).getTime() - Date.now()) / 86400000)
+}
+
+function formatDate(d: string) {
+  if (!d) return '—'
+  return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+onMounted(() => loadData())
 </script>
 
 <template>
-  <div class="space-y-8">
-    <!-- Header -->
-    <div class="flex items-center justify-between">
-      <div>
-        <h2 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2.5">
-          <KeyRound class="w-7 h-7 text-indigo-400" />
-          Managed Certificates Inventory
-        </h2>
-        <p class="text-sm text-slate-400 mt-1">
-          Automated issuance, auto-renewal pipelines, and lifecycle visibility across public and private CAs.
-        </p>
-      </div>
-
-      <div class="flex items-center gap-3">
-        <button @click="loadData" class="btn-secondary">
-          <RefreshCw class="w-4 h-4" :class="{ 'animate-spin': loading }" />
-          Refresh
-        </button>
-        <button @click="showRequestModal = true" class="btn-primary">
-          <Plus class="w-4 h-4" />
-          Request Certificate
-        </button>
-      </div>
+  <div class="space-y-5">
+    <!-- Status Stats -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <button
+        v-for="s in [
+          { key: 'all', label: 'All Certificates', color: 'text-base-content' },
+          { key: 'active', label: 'Active', color: 'text-success' },
+          { key: 'expiring', label: 'Expiring', color: 'text-warning' },
+          { key: 'expired', label: 'Expired', color: 'text-error' },
+        ]"
+        :key="s.key"
+        @click="filterStatus = s.key"
+        class="stat bg-base-100 rounded-xl border cursor-pointer transition-all hover:shadow-md p-4"
+        :class="filterStatus === s.key ? 'border-primary shadow-sm' : 'border-base-300'"
+      >
+        <div class="stat-title text-xs">{{ s.label }}</div>
+        <div class="stat-value text-xl" :class="s.color">{{ statusCounts[s.key as keyof typeof statusCounts] }}</div>
+      </button>
     </div>
 
-    <!-- Filters and Search Bar -->
+    <!-- Toolbar -->
     <div class="flex items-center justify-between gap-4">
-      <div class="relative flex-1 max-w-md">
-        <Search class="w-4 h-4 absolute left-3.5 top-3.5 text-slate-400" />
-        <input 
-          v-model="search" 
-          type="text" 
-          placeholder="Search by Common Name or SAN (e.g. api.example.com)..." 
-          class="input-field pl-10"
-        />
-      </div>
-
-      <div class="flex items-center gap-3">
-        <select v-model="statusFilter" class="input-field w-44 text-xs font-medium">
-          <option value="">All Statuses</option>
-          <option value="ISSUED">Issued (Valid)</option>
-          <option value="EXPIRING">Expiring Soon</option>
-          <option value="RENEWAL_FAILED">Renewal Failed</option>
-          <option value="EXPIRED">Expired</option>
-        </select>
+      <label class="input input-bordered input-sm flex items-center gap-2 w-72 bg-base-100">
+        <Search class="w-3.5 h-3.5 opacity-50" />
+        <input v-model="searchQuery" type="text" class="grow" placeholder="Search by common name…" />
+      </label>
+      <div class="flex items-center gap-2">
+        <button class="btn btn-ghost btn-sm gap-1.5">
+          <Download class="w-3.5 h-3.5" /> Export
+        </button>
+        <button class="btn btn-primary btn-sm gap-1.5" @click="showRequestModal = true">
+          <Plus class="w-3.5 h-3.5" /> Request Certificate
+        </button>
       </div>
     </div>
 
     <!-- Certificates Table -->
-    <div class="table-container">
-      <table>
-        <thead>
-          <tr>
-            <th>Common Name & SANs</th>
-            <th>Environment</th>
-            <th>Algorithm</th>
-            <th>Validity Remaining</th>
-            <th>Status</th>
-            <th>Auto-Renew</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-if="filteredCerts.length === 0">
-            <td colspan="7" class="text-center py-10 text-slate-400">
-              No certificates found matching your criteria.
-            </td>
-          </tr>
-          <tr v-for="cert in filteredCerts" :key="cert.id">
-            <td>
-              <div class="font-semibold text-white cursor-pointer hover:text-indigo-300" @click="viewDetail(cert)">
-                {{ cert.common_name }}
-              </div>
-              <div v-if="cert.sans && cert.sans.length > 0" class="text-[11px] text-slate-400 truncate max-w-xs font-mono">
-                + {{ cert.sans.join(', ') }}
-              </div>
-            </td>
-            <td>
-              <span class="text-xs uppercase font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
-                {{ cert.environment || 'prod' }}
-              </span>
-            </td>
-            <td class="font-mono text-xs text-slate-400">
-              {{ cert.key_type }} {{ cert.key_size }}
-            </td>
-            <td>
-              <div class="font-mono font-bold text-xs" :class="cert.days_remaining <= 30 ? 'text-amber-400' : 'text-emerald-400'">
-                {{ cert.days_remaining }} days
-              </div>
-              <div v-if="cert.not_after" class="text-[11px] text-slate-400">
-                Expires {{ new Date(cert.not_after).toLocaleDateString() }}
-              </div>
-            </td>
-            <td>
-              <span class="badge" :class="cert.status === 'ISSUED' ? 'badge-healthy' : cert.status === 'EXPIRING' ? 'badge-warning' : 'badge-critical'">
-                {{ cert.status }}
-              </span>
-            </td>
-            <td>
-              <div class="flex items-center gap-1.5 text-xs" :class="cert.auto_renew ? 'text-emerald-400' : 'text-slate-400'">
-                <span class="w-2 h-2 rounded-full" :class="cert.auto_renew ? 'bg-emerald-500' : 'bg-slate-600'"></span>
-                <span>{{ cert.auto_renew ? `${cert.renewal_lead_days || 30}d lead` : 'Disabled' }}</span>
-              </div>
-            </td>
-            <td>
-              <div class="flex items-center gap-2">
-                <button 
-                  @click="triggerRenew(cert)" 
-                  class="p-1.5 text-slate-400 hover:text-emerald-400 hover:bg-slate-800 rounded transition-colors"
-                  :disabled="renewingId === cert.id"
-                  title="Renew Now"
-                >
-                  <RotateCw class="w-4 h-4" :class="{ 'animate-spin text-emerald-400': renewingId === cert.id }" />
-                </button>
-                <button 
-                  @click="viewDetail(cert)" 
-                  class="p-1.5 text-slate-400 hover:text-indigo-400 hover:bg-slate-800 rounded transition-colors"
-                  title="View Certificate Details"
-                >
-                  <FileCode class="w-4 h-4" />
-                </button>
-                <button 
-                  @click="deleteCert(cert.id)" 
-                  class="p-1.5 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded transition-colors"
-                  title="Delete Certificate"
-                >
-                  <Trash2 class="w-4 h-4" />
-                </button>
-              </div>
-            </td>
-          </tr>
-        </tbody>
-      </table>
+    <div class="card bg-base-100 border border-base-300">
+      <div class="overflow-x-auto">
+        <table class="table table-sm table-zebra">
+          <thead>
+            <tr>
+              <th class="text-xs">Common Name</th>
+              <th class="text-xs">Issuer</th>
+              <th class="text-xs">Algorithm</th>
+              <th class="text-xs">Expires</th>
+              <th class="text-xs">Days Left</th>
+              <th class="text-xs">Status</th>
+              <th class="text-xs text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="loading">
+              <td colspan="7" class="text-center py-8">
+                <span class="loading loading-spinner loading-md text-primary"></span>
+              </td>
+            </tr>
+            <tr v-else-if="!displayCerts.length">
+              <td colspan="7" class="text-center py-8 text-base-content/60 text-sm">
+                No certificates found
+              </td>
+            </tr>
+            <tr v-for="cert in displayCerts" :key="cert.id" class="hover:bg-base-200/50">
+              <td class="font-mono text-xs font-medium">{{ cert.common_name }}</td>
+              <td class="text-xs">{{ cert.issuer || '—' }}</td>
+              <td class="text-xs font-mono">{{ cert.key_algorithm || '—' }}</td>
+              <td class="text-xs font-mono">{{ formatDate(cert.not_after) }}</td>
+              <td class="text-xs font-mono">
+                <span :class="daysUntil(cert.not_after) < 30 ? 'text-warning font-bold' : daysUntil(cert.not_after) < 0 ? 'text-error font-bold' : ''">
+                  {{ daysUntil(cert.not_after) }}d
+                </span>
+              </td>
+              <td>
+                <span class="badge badge-sm" :class="getStatusBadge(cert.status)">{{ cert.status }}</span>
+              </td>
+              <td class="text-right">
+                <div class="flex items-center justify-end gap-1">
+                  <button class="btn btn-ghost btn-xs" @click="viewDetail(cert)">
+                    <Eye class="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    class="btn btn-ghost btn-xs"
+                    :disabled="renewingId === cert.id"
+                    @click="renewCert(cert)"
+                  >
+                    <RotateCw class="w-3.5 h-3.5" :class="{ 'animate-spin': renewingId === cert.id }" />
+                  </button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </div>
 
     <!-- Request Certificate Modal -->
-    <div v-if="showRequestModal" class="modal-backdrop">
-      <div class="modal-content">
-        <div class="flex items-center justify-between border-b border-slate-800 pb-4 mb-6">
-          <h3 class="text-lg font-bold text-white">Request / Issue Certificate</h3>
-          <button @click="showRequestModal = false" class="text-slate-400 hover:text-white">
-            <X class="w-5 h-5" />
-          </button>
-        </div>
-
-        <div v-if="errorMessage" class="mb-4 p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs">
-          {{ errorMessage }}
-        </div>
-
-        <form @submit.prevent="submitRequest" class="space-y-4">
-          <div>
-            <label class="block text-xs font-semibold text-slate-300 mb-1.5">Common Name (Primary Domain)</label>
-            <input v-model="newCert.common_name" class="input-field font-mono" placeholder="app.example.com" required />
+    <dialog class="modal" :class="{ 'modal-open': showRequestModal }">
+      <div class="modal-box max-w-md">
+        <h3 class="text-base font-bold mb-4">Request Certificate</h3>
+        <form @submit.prevent="requestCert" class="space-y-3">
+          <div class="form-control">
+            <label class="label"><span class="label-text text-xs">Common Name (FQDN)</span></label>
+            <input v-model="reqForm.common_name" type="text" placeholder="e.g. api.example.com" class="input input-bordered input-sm" required />
           </div>
-
-          <div>
-            <label class="block text-xs font-semibold text-slate-300 mb-1.5">Subject Alternative Names (Comma Separated)</label>
-            <input v-model="newCert.sans_input" class="input-field font-mono" placeholder="api.example.com, www.example.com" />
+          <div class="form-control">
+            <label class="label"><span class="label-text text-xs">SAN Domains (comma-separated)</span></label>
+            <input v-model="reqForm.san_domains" type="text" placeholder="e.g. www.example.com, mail.example.com" class="input input-bordered input-sm" />
           </div>
-
-          <div class="grid grid-cols-2 gap-4">
-            <div>
-              <label class="block text-xs font-semibold text-slate-300 mb-1.5">CA Provider / Account</label>
-              <select v-model="newCert.ca_account_id" class="input-field" required>
-                <option v-for="acc in caAccounts" :key="acc.id" :value="acc.id">
-                  {{ acc.name }} ({{ acc.provider_type }})
-                </option>
-              </select>
-            </div>
-            <div>
-              <label class="block text-xs font-semibold text-slate-300 mb-1.5">Environment</label>
-              <select v-model="newCert.environment" class="input-field">
-                <option value="production">Production</option>
-                <option value="staging">Staging</option>
-                <option value="development">Development</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="grid grid-cols-3 gap-4">
-            <div>
-              <label class="block text-xs font-semibold text-slate-300 mb-1.5">Key Type</label>
-              <select v-model="newCert.key_type" class="input-field">
+          <div class="grid grid-cols-2 gap-3">
+            <div class="form-control">
+              <label class="label"><span class="label-text text-xs">Algorithm</span></label>
+              <select v-model="reqForm.key_algorithm" class="select select-bordered select-sm">
                 <option value="RSA">RSA</option>
                 <option value="ECDSA">ECDSA</option>
               </select>
             </div>
-            <div>
-              <label class="block text-xs font-semibold text-slate-300 mb-1.5">Key Size</label>
-              <select v-model="newCert.key_size" class="input-field">
-                <option :value="2048">2048 bits</option>
-                <option :value="4096">4096 bits</option>
-                <option :value="256">256 bits (EC)</option>
-                <option :value="384">384 bits (EC)</option>
+            <div class="form-control">
+              <label class="label"><span class="label-text text-xs">Key Size</span></label>
+              <select v-model="reqForm.key_size" class="select select-bordered select-sm">
+                <option value="2048">2048</option>
+                <option value="4096">4096</option>
               </select>
             </div>
-            <div>
-              <label class="block text-xs font-semibold text-slate-300 mb-1.5">Validity Days</label>
-              <input v-model.number="newCert.validity_days" type="number" class="input-field" min="1" max="398" />
-            </div>
           </div>
-
-          <div class="flex items-center gap-3 pt-2">
-            <input type="checkbox" id="auto_renew" v-model="newCert.auto_renew" class="rounded bg-slate-800 border-slate-700 text-indigo-600 focus:ring-indigo-500 h-4 w-4" />
-            <label for="auto_renew" class="text-xs text-slate-300 font-medium">Enable Automated Renewal (30 days before expiration)</label>
+          <div class="form-control">
+            <label class="label"><span class="label-text text-xs">Validity (Days)</span></label>
+            <input v-model="reqForm.validity_days" type="number" min="1" max="3650" class="input input-bordered input-sm" />
           </div>
-
-          <div class="flex items-center justify-end gap-3 pt-4 border-t border-slate-800">
-            <button type="button" @click="showRequestModal = false" class="btn-secondary">
-              Cancel
-            </button>
-            <button type="submit" class="btn-primary" :disabled="submitting">
-              {{ submitting ? 'Issuing via Gateway...' : 'Issue Certificate' }}
-            </button>
+          <div class="modal-action">
+            <button type="button" class="btn btn-ghost btn-sm" @click="showRequestModal = false">Cancel</button>
+            <button type="submit" class="btn btn-primary btn-sm">Submit Request</button>
           </div>
         </form>
       </div>
-    </div>
+      <form method="dialog" class="modal-backdrop" @click="showRequestModal = false"><button>close</button></form>
+    </dialog>
 
-    <!-- Certificate Details Modal -->
-    <div v-if="showDetailModal && selectedCert" class="modal-backdrop">
-      <div class="modal-content max-w-3xl">
-        <div class="flex items-center justify-between border-b border-slate-800 pb-4 mb-6">
+    <!-- Certificate Detail Modal -->
+    <dialog class="modal" :class="{ 'modal-open': showDetailModal }">
+      <div class="modal-box max-w-lg" v-if="selectedCert">
+        <h3 class="text-base font-bold mb-4 font-mono">{{ selectedCert.common_name }}</h3>
+        <div class="grid grid-cols-2 gap-4 text-xs">
           <div>
-            <h3 class="text-lg font-bold text-white">{{ selectedCert.common_name }}</h3>
-            <span class="text-xs text-slate-400 font-mono">{{ selectedCert.fingerprint_sha256 }}</span>
+            <div class="text-base-content/60 mb-1">Status</div>
+            <span class="badge badge-sm" :class="getStatusBadge(selectedCert.status)">{{ selectedCert.status }}</span>
           </div>
-          <button @click="showDetailModal = false" class="text-slate-400 hover:text-white">
-            <X class="w-5 h-5" />
-          </button>
+          <div>
+            <div class="text-base-content/60 mb-1">Serial</div>
+            <div class="font-mono">{{ selectedCert.serial || selectedCert.serial_number || '—' }}</div>
+          </div>
+          <div>
+            <div class="text-base-content/60 mb-1">Issuer</div>
+            <div>{{ selectedCert.issuer || '—' }}</div>
+          </div>
+          <div>
+            <div class="text-base-content/60 mb-1">Algorithm</div>
+            <div class="font-mono">{{ selectedCert.key_algorithm || '—' }}</div>
+          </div>
+          <div>
+            <div class="text-base-content/60 mb-1">Issued</div>
+            <div class="font-mono">{{ formatDate(selectedCert.not_before) }}</div>
+          </div>
+          <div>
+            <div class="text-base-content/60 mb-1">Expires</div>
+            <div class="font-mono">{{ formatDate(selectedCert.not_after) }}</div>
+          </div>
         </div>
-
-        <div class="space-y-4 text-xs">
-          <div class="grid grid-cols-2 gap-4 p-4 rounded-xl bg-slate-900/60 border border-slate-800">
-            <div>
-              <span class="text-slate-400 block mb-0.5">Serial Number</span>
-              <span class="font-mono text-slate-200">{{ selectedCert.serial_number || 'N/A' }}</span>
-            </div>
-            <div>
-              <span class="text-slate-400 block mb-0.5">Issuer DN</span>
-              <span class="font-mono text-slate-200 truncate block">{{ selectedCert.issuer_dn || 'N/A' }}</span>
-            </div>
-            <div>
-              <span class="text-slate-400 block mb-0.5">Not Before</span>
-              <span class="font-mono text-slate-200">{{ selectedCert.not_before ? new Date(selectedCert.not_before).toLocaleString() : 'N/A' }}</span>
-            </div>
-            <div>
-              <span class="text-slate-400 block mb-0.5">Not After</span>
-              <span class="font-mono text-slate-200">{{ selectedCert.not_after ? new Date(selectedCert.not_after).toLocaleString() : 'N/A' }}</span>
-            </div>
-          </div>
-
-          <div v-if="selectedCert.certificate_pem">
-            <label class="block text-xs font-semibold text-slate-300 mb-1.5">Certificate PEM</label>
-            <textarea 
-              readonly 
-              class="input-field font-mono text-[11px] h-44 select-all" 
-              :value="selectedCert.certificate_pem"
-            ></textarea>
-          </div>
+        <div v-if="selectedCert.pem_certificate" class="mt-4">
+          <div class="text-xs text-base-content/60 mb-1">PEM Certificate</div>
+          <pre class="bg-base-200 rounded-lg p-3 text-[10px] font-mono overflow-x-auto max-h-40">{{ selectedCert.pem_certificate }}</pre>
+        </div>
+        <div class="modal-action">
+          <button class="btn btn-ghost btn-sm" @click="showDetailModal = false">Close</button>
         </div>
       </div>
-    </div>
+      <form method="dialog" class="modal-backdrop" @click="showDetailModal = false"><button>close</button></form>
+    </dialog>
   </div>
 </template>

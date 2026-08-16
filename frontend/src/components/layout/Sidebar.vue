@@ -1,26 +1,20 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute } from 'vue-router'
+import { useThemeStore } from '@/stores/theme'
 import { 
-  LayoutDashboard, 
-  ShieldCheck, 
-  KeyRound, 
-  Cpu, 
-  Radar, 
-  Sliders, 
-  Settings,
-  Shield
+  LayoutDashboard, ShieldCheck, KeyRound, Cpu, 
+  Radar, Sliders, Settings, Sun, Moon
 } from 'lucide-vue-next'
 
 const route = useRoute()
-const router = useRouter()
+const themeStore = useThemeStore()
 
 const navItems = [
   { name: 'Dashboard', path: '/', icon: LayoutDashboard },
-  { name: 'PKI & CAs', path: '/pki', icon: ShieldCheck },
+  { name: 'Certificate Authorities', path: '/pki', icon: ShieldCheck },
   { name: 'Certificates', path: '/certificates', icon: KeyRound },
   { name: 'Gateways', path: '/gateways', icon: Cpu },
-  { name: 'Discovery', path: '/discovery', icon: Radar },
+  { name: 'TLS Discovery', path: '/discovery', icon: Radar },
   { name: 'Policies', path: '/policies', icon: Sliders },
   { name: 'Settings', path: '/settings', icon: Settings },
 ]
@@ -32,49 +26,54 @@ function isActive(path: string) {
 </script>
 
 <template>
-  <aside class="w-64 bg-slate-900/90 border-r border-slate-800/80 flex flex-col justify-between p-4 min-h-screen">
+  <aside class="w-60 bg-base-100 border-r border-base-300 flex flex-col justify-between min-h-screen select-none">
+    <!-- Brand -->
     <div>
-      <!-- Brand -->
-      <div class="flex items-center gap-3 px-3 py-4 mb-6">
-        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 via-purple-500 to-pink-500 flex items-center justify-center shadow-lg shadow-indigo-500/25">
-          <Shield class="w-6 h-6 text-white" />
+      <div class="px-5 py-4 flex items-center gap-3 border-b border-base-300">
+        <div class="w-8 h-8 rounded-lg bg-primary flex items-center justify-center text-primary-content text-xs font-bold font-mono">
+          CP
         </div>
         <div>
-          <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-1.5">
-            CertPilot
-            <span class="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-400 border border-indigo-500/30">OSS</span>
-          </h1>
-          <p class="text-xs text-slate-400">PKI & Cert Control Plane</p>
+          <div class="text-sm font-bold tracking-tight">CertPilot</div>
+          <div class="text-[10px] text-base-content/60 font-mono">PKI Command Center</div>
         </div>
       </div>
 
-      <!-- Navigation Links -->
-      <nav class="space-y-1">
-        <router-link
-          v-for="item in navItems"
-          :key="item.path"
-          :to="item.path"
-          class="flex items-center gap-3 px-3.5 py-2.5 rounded-xl font-medium text-sm transition-all duration-150"
-          :class="isActive(item.path) 
-            ? 'bg-indigo-600/15 text-indigo-300 border border-indigo-500/30 shadow-sm shadow-indigo-500/10' 
-            : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'"
-        >
-          <component :is="item.icon" class="w-4 h-4" :class="isActive(item.path) ? 'text-indigo-400' : 'text-slate-400'" />
-          <span>{{ item.name }}</span>
-        </router-link>
-      </nav>
+      <!-- Navigation -->
+      <ul class="menu menu-sm px-2 py-3 gap-0.5">
+        <li v-for="item in navItems" :key="item.path">
+          <router-link
+            :to="item.path"
+            class="flex items-center gap-2.5 rounded-lg text-xs font-semibold"
+            :class="isActive(item.path) ? 'active' : ''"
+          >
+            <component :is="item.icon" class="w-4 h-4" />
+            {{ item.name }}
+          </router-link>
+        </li>
+      </ul>
     </div>
 
-    <!-- Footer System Status -->
-    <div class="p-3 rounded-xl bg-slate-950/60 border border-slate-800/60">
-      <div class="flex items-center justify-between text-xs mb-1.5">
-        <span class="text-slate-400">Core Service</span>
-        <span class="flex items-center gap-1 text-emerald-400 font-medium">
-          <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-          Active
+    <!-- Footer -->
+    <div class="p-3 border-t border-base-300 space-y-2">
+      <!-- Theme Toggle -->
+      <button 
+        @click="themeStore.toggleTheme"
+        class="btn btn-ghost btn-sm btn-block justify-start gap-2 font-normal text-xs"
+      >
+        <Sun v-if="themeStore.currentTheme === 'dark'" class="w-4 h-4 text-warning" />
+        <Moon v-else class="w-4 h-4 text-primary" />
+        {{ themeStore.currentTheme === 'dark' ? 'Light Mode' : 'Dark Mode' }}
+      </button>
+
+      <!-- Status -->
+      <div class="px-3 py-1.5 text-[11px] font-mono flex items-center justify-between text-base-content/60">
+        <span>Engine</span>
+        <span class="badge badge-success badge-xs gap-1">
+          <span class="w-1.5 h-1.5 rounded-full bg-success animate-pulse"></span>
+          Online
         </span>
       </div>
-      <div class="text-[11px] text-slate-400 font-mono">PostgreSQL 17 (Supabase)</div>
     </div>
   </aside>
 </template>

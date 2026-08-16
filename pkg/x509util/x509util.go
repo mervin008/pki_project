@@ -2,12 +2,14 @@
 package x509util
 
 import (
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -66,22 +68,22 @@ func CertInfoFromX509(cert *x509.Certificate) *CertInfo {
 
 	// Determine key type and size
 	switch pub := cert.PublicKey.(type) {
-	case interface{ Size() int }: // *rsa.PublicKey
+	case *rsa.PublicKey:
 		info.KeyType = "RSA"
 		info.KeySize = pub.Size() * 8
-	default:
-		keyType := fmt.Sprintf("%T", cert.PublicKey)
-		if strings.Contains(keyType, "ecdsa") {
-			info.KeyType = "ECDSA"
-			// Extract curve size from the key
-			if ecKey, ok := cert.PublicKey.(interface{ Params() interface{ BitSize() int } }); ok {
-				_ = ecKey // Size determined by curve
-			}
-			info.KeySize = cert.PublicKey.(interface{ Params() *struct{ BitSize int } }).Params().BitSize
-		} else if strings.Contains(keyType, "ed25519") {
-			info.KeyType = "Ed25519"
+	case *ecdsa.PublicKey:
+		info.KeyType = "ECDSA"
+		if pub.Curve != nil {
+			info.KeySize = pub.Curve.Params().BitSize
+		} else {
 			info.KeySize = 256
 		}
+	case ed25519.PublicKey:
+		info.KeyType = "Ed25519"
+		info.KeySize = 256
+	default:
+		info.KeyType = "Unknown"
+		info.KeySize = 0
 	}
 
 	return info

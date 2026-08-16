@@ -1,128 +1,133 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useApi } from '@/composables/useApi'
-import { 
-  Radar, 
-  Search, 
-  Download, 
-  CheckCircle2, 
-  AlertCircle,
-  Globe,
-  Lock
-} from 'lucide-vue-next'
+import { Radar, Search, AlertTriangle, CheckCircle, Lock } from 'lucide-vue-next'
 
 const api = useApi()
-const host = ref('google.com')
-const port = ref(443)
+const target = ref('')
+const port = ref('443')
 const scanning = ref(false)
-const scanResult = ref<any>(null)
 const scanError = ref('')
+const results = ref<any>(null)
 
 async function runScan() {
+  if (!target.value) return
   scanning.value = true
   scanError.value = ''
-  scanResult.value = null
+  results.value = null
   try {
     const res = await api.post<any>('/api/v1/discovery/scan', {
-      host: host.value,
-      port: port.value,
+      target: target.value,
+      port: parseInt(port.value) || 443,
     })
-    scanResult.value = res
+    results.value = res
   } catch (err: any) {
-    scanError.value = err.message
+    scanError.value = err.message || 'Scan failed'
   } finally {
     scanning.value = false
   }
 }
+
+function formatDate(d: string) {
+  if (!d) return '—'
+  return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+function daysUntil(d: string) {
+  if (!d) return 0
+  return Math.ceil((new Date(d).getTime() - Date.now()) / 86400000)
+}
 </script>
 
 <template>
-  <div class="space-y-8">
-    <!-- Header -->
-    <div>
-      <h2 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2.5">
-        <Radar class="w-7 h-7 text-indigo-400" />
-        Certificate Discovery & Network Scanner
-      </h2>
-      <p class="text-sm text-slate-400 mt-1">
-        Probe network endpoints via TLS handshake to discover unmanaged, rogue, or shadow certificates across your infrastructure.
-      </p>
-    </div>
+  <div class="space-y-6">
+    <p class="text-sm text-base-content/60">Scan remote endpoints to discover and analyze TLS certificates</p>
 
-    <!-- Scan Bar -->
-    <div class="glass-panel p-6">
-      <form @submit.prevent="runScan" class="flex flex-col md:flex-row items-end gap-4">
-        <div class="flex-1 w-full">
-          <label class="block text-xs font-semibold text-slate-300 mb-1.5">Target Hostname or IP</label>
-          <div class="relative">
-            <Globe class="w-4 h-4 absolute left-3.5 top-3.5 text-slate-400" />
-            <input v-model="host" class="input-field pl-10 font-mono text-sm" placeholder="app.internal.corp or 10.0.0.1" required />
+    <!-- Scan Form -->
+    <div class="card bg-base-100 border border-base-300">
+      <div class="card-body p-5">
+        <h2 class="card-title text-sm font-bold mb-3">
+          <Radar class="w-4 h-4 text-primary" /> Scan Endpoint
+        </h2>
+        <form @submit.prevent="runScan" class="flex items-end gap-3">
+          <div class="form-control flex-1">
+            <label class="label"><span class="label-text text-xs">Hostname / IP</span></label>
+            <input v-model="target" type="text" placeholder="e.g. google.com" class="input input-bordered input-sm" required />
           </div>
-        </div>
-
-        <div class="w-full md:w-36">
-          <label class="block text-xs font-semibold text-slate-300 mb-1.5">TLS Port</label>
-          <input v-model.number="port" type="number" class="input-field font-mono text-sm" placeholder="443" required />
-        </div>
-
-        <button type="submit" class="btn-primary w-full md:w-auto h-[42px] px-6" :disabled="scanning">
-          <Search class="w-4 h-4" :class="{ 'animate-spin': scanning }" />
-          {{ scanning ? 'Scanning Handshake...' : 'Scan Endpoint' }}
-        </button>
-      </form>
+          <div class="form-control w-24">
+            <label class="label"><span class="label-text text-xs">Port</span></label>
+            <input v-model="port" type="number" class="input input-bordered input-sm" />
+          </div>
+          <button type="submit" class="btn btn-primary btn-sm gap-2" :disabled="scanning">
+            <span v-if="scanning" class="loading loading-spinner loading-xs"></span>
+            <Search v-else class="w-3.5 h-3.5" />
+            Scan
+          </button>
+        </form>
+      </div>
     </div>
 
-    <!-- Error state -->
-    <div v-if="scanError" class="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-sm flex items-center gap-3">
-      <AlertCircle class="w-5 h-5 flex-shrink-0" />
-      <span>Scan failed: {{ scanError }}</span>
+    <!-- Error -->
+    <div v-if="scanError" role="alert" class="alert alert-error">
+      <AlertTriangle class="w-4 h-4" />
+      <span class="text-sm">{{ scanError }}</span>
     </div>
 
-    <!-- Scan Results Card -->
-    <div v-if="scanResult" class="space-y-4">
-      <h3 class="text-base font-semibold text-white flex items-center gap-2">
-        <Lock class="w-4 h-4 text-emerald-400" />
-        Discovered Certificate Details
-      </h3>
-
-      <div v-if="scanResult.error" class="glass-panel p-6 text-rose-400 text-sm">
-        Remote host failed TLS handshake: {{ scanResult.error }}
+    <!-- Results -->
+    <div v-if="results" class="space-y-4">
+      <!-- Stats -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
+          <div class="stat-title text-xs">Subject</div>
+          <div class="stat-value text-sm font-mono truncate">{{ results.subject || results.common_name || target }}</div>
+        </div>
+        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
+          <div class="stat-title text-xs">Issuer</div>
+          <div class="stat-value text-sm font-mono truncate">{{ results.issuer || '—' }}</div>
+        </div>
+        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
+          <div class="stat-title text-xs">Valid Until</div>
+          <div class="stat-value text-sm font-mono">{{ formatDate(results.not_after) }}</div>
+        </div>
+        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
+          <div class="stat-figure" :class="daysUntil(results.not_after) > 30 ? 'text-success' : 'text-warning'">
+            <CheckCircle v-if="daysUntil(results.not_after) > 30" class="w-5 h-5" />
+            <AlertTriangle v-else class="w-5 h-5" />
+          </div>
+          <div class="stat-title text-xs">Days Remaining</div>
+          <div class="stat-value text-sm font-mono">{{ daysUntil(results.not_after) }}d</div>
+        </div>
       </div>
 
-      <div v-else-if="scanResult.certificate" class="glass-panel p-6 space-y-6">
-        <div class="flex items-start justify-between">
-          <div>
-            <div class="text-xl font-bold text-white">{{ scanResult.certificate.common_name }}</div>
-            <div class="text-xs text-slate-400 font-mono mt-1">
-              {{ scanResult.host }}:{{ scanResult.port }} &bull; Fingerprint: {{ scanResult.certificate.fingerprint_sha256 }}
+      <!-- Detail Card -->
+      <div class="card bg-base-100 border border-base-300">
+        <div class="card-body p-5">
+          <h2 class="card-title text-sm font-bold mb-3">
+            <Lock class="w-4 h-4 text-primary" /> Certificate Details
+          </h2>
+          <div class="grid grid-cols-2 gap-4 text-xs">
+            <div>
+              <div class="text-base-content/60 mb-1">Protocol</div>
+              <div class="font-mono">{{ results.protocol || 'TLSv1.3' }}</div>
             </div>
-          </div>
-          <span class="badge" :class="scanResult.certificate.days_remaining <= 30 ? 'badge-warning' : 'badge-healthy'">
-            {{ scanResult.certificate.days_remaining }} days left
-          </span>
-        </div>
-
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 p-4 rounded-xl bg-slate-900/60 border border-slate-800 text-xs">
-          <div>
-            <span class="text-slate-400 block mb-1">Issuer DN</span>
-            <span class="text-slate-200 font-mono break-all">{{ scanResult.certificate.issuer_dn }}</span>
-          </div>
-          <div>
-            <span class="text-slate-400 block mb-1">Key Algorithm</span>
-            <span class="text-slate-200 font-mono">{{ scanResult.certificate.key_type }} ({{ scanResult.certificate.key_size }} bits)</span>
-          </div>
-          <div>
-            <span class="text-slate-400 block mb-1">Expiration Date</span>
-            <span class="text-slate-200 font-mono">{{ new Date(scanResult.certificate.not_after).toLocaleString() }}</span>
-          </div>
-        </div>
-
-        <div v-if="scanResult.certificate.sans && scanResult.certificate.sans.length > 0">
-          <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-2">Subject Alternative Names</span>
-          <div class="flex flex-wrap gap-2">
-            <span v-for="san in scanResult.certificate.sans" :key="san" class="px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 font-mono text-xs border border-slate-700">
-              {{ san }}
-            </span>
+            <div>
+              <div class="text-base-content/60 mb-1">Cipher Suite</div>
+              <div class="font-mono">{{ results.cipher || '—' }}</div>
+            </div>
+            <div>
+              <div class="text-base-content/60 mb-1">Key Algorithm</div>
+              <div class="font-mono">{{ results.key_algorithm || results.public_key_algorithm || '—' }}</div>
+            </div>
+            <div>
+              <div class="text-base-content/60 mb-1">Serial Number</div>
+              <div class="font-mono truncate">{{ results.serial_number || '—' }}</div>
+            </div>
+            <div class="col-span-2" v-if="results.san_domains?.length">
+              <div class="text-base-content/60 mb-1">Subject Alternative Names</div>
+              <div class="flex flex-wrap gap-1.5">
+                <span v-for="san in results.san_domains" :key="san" class="badge badge-sm badge-ghost font-mono">{{ san }}</span>
+              </div>
+            </div>
           </div>
         </div>
       </div>

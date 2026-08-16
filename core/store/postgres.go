@@ -551,7 +551,7 @@ func (s *PostgresStore) GetCAAccount(ctx context.Context, id string) (*CAAccount
 	query := `
 		SELECT id, name, provider_type, gateway_addr, config_encrypted, is_default,
 		       status, last_health_at, created_by, created_at, updated_at
-		FROM public.ca_accounts WHERE id = $1
+		FROM public.ca_accounts WHERE id::text = $1 OR name = $1
 	`
 	acc := &CAAccount{}
 	err := s.pool.QueryRow(ctx, query, id).Scan(

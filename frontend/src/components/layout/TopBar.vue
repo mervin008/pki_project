@@ -1,39 +1,67 @@
 <script setup lang="ts">
-import { useAuthStore } from '@/stores/auth'
-import { Bell, User, LogOut } from 'lucide-vue-next'
+import { useRoute } from 'vue-router'
+import { Search, Bell, RefreshCw, ChevronDown, User } from 'lucide-vue-next'
 
-const authStore = useAuthStore()
+const route = useRoute()
+
+const pageTitles: Record<string, string> = {
+  '/': 'Dashboard',
+  '/pki': 'Certificate Authorities',
+  '/certificates': 'Certificate Inventory',
+  '/gateways': 'Gateways',
+  '/discovery': 'TLS Discovery',
+  '/policies': 'Policies',
+  '/settings': 'Settings',
+}
+
+function getPageTitle() {
+  return pageTitles[route.path] || 'CertPilot'
+}
 </script>
 
 <template>
-  <header class="h-16 border-b border-slate-800/80 bg-slate-900/40 backdrop-blur-md px-8 flex items-center justify-between sticky top-0 z-30">
-    <div class="flex items-center gap-4">
-      <div class="text-xs text-slate-400 font-mono flex items-center gap-2">
-        <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-        <span>Environment:</span>
-        <span class="text-slate-200 uppercase font-semibold">Development / Cloud DB</span>
-      </div>
+  <div class="navbar bg-base-100 border-b border-base-300 px-6 min-h-[56px] gap-4">
+    <!-- Left: Page Title -->
+    <div class="flex-1">
+      <h1 class="text-base font-bold tracking-tight">{{ getPageTitle() }}</h1>
     </div>
 
-    <div class="flex items-center gap-4">
-      <!-- Quick Notification Icon -->
-      <button class="p-2 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800/60 transition-colors relative">
-        <Bell class="w-4 h-4" />
-        <span class="absolute top-1.5 right-1.5 w-2 h-2 bg-indigo-500 rounded-full"></span>
+    <!-- Center: Search -->
+    <div class="flex-none hidden sm:flex">
+      <label class="input input-sm input-bordered flex items-center gap-2 w-64 bg-base-200/50">
+        <Search class="w-3.5 h-3.5 opacity-50" />
+        <input type="text" class="grow" placeholder="Search certificates, CAs…" />
+        <kbd class="kbd kbd-xs">⌘K</kbd>
+      </label>
+    </div>
+
+    <!-- Right: Actions -->
+    <div class="flex-none flex items-center gap-1">
+      <button class="btn btn-ghost btn-sm btn-circle">
+        <RefreshCw class="w-4 h-4" />
       </button>
-
-      <div class="h-4 w-px bg-slate-800"></div>
-
-      <!-- User Role Info -->
-      <div class="flex items-center gap-3">
-        <div class="w-8 h-8 rounded-lg bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center text-indigo-300 font-semibold text-xs">
-          <User class="w-4 h-4" />
+      <div class="indicator">
+        <span class="indicator-item badge badge-primary badge-xs">3</span>
+        <button class="btn btn-ghost btn-sm btn-circle">
+          <Bell class="w-4 h-4" />
+        </button>
+      </div>
+      <div class="dropdown dropdown-end">
+        <div tabindex="0" role="button" class="btn btn-ghost btn-sm gap-1 ml-1">
+          <div class="avatar placeholder">
+            <div class="bg-neutral text-neutral-content w-6 rounded-full">
+              <User class="w-3 h-3" />
+            </div>
+          </div>
+          <span class="text-xs font-medium hidden md:inline">Admin</span>
+          <ChevronDown class="w-3 h-3 opacity-50" />
         </div>
-        <div class="text-left">
-          <div class="text-xs font-semibold text-slate-200">{{ authStore.user?.email || 'admin@certpilot.local' }}</div>
-          <div class="text-[10px] uppercase font-mono text-indigo-400">{{ authStore.role }}</div>
-        </div>
+        <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box z-50 w-48 p-2 shadow-lg border border-base-300">
+          <li><a class="text-xs">Profile</a></li>
+          <li><a class="text-xs">Preferences</a></li>
+          <li class="border-t border-base-300 mt-1 pt-1"><a class="text-xs text-error">Sign Out</a></li>
+        </ul>
       </div>
     </div>
-  </header>
+  </div>
 </template>

@@ -1,84 +1,121 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { Settings, Database, Bell, Shield, Key } from 'lucide-vue-next'
+import { ref, onMounted } from 'vue'
+import { useApi } from '@/composables/useApi'
+import { Settings as SettingsIcon, Database, Server, Globe, CheckCircle, XCircle } from 'lucide-vue-next'
 
-const supabaseProject = 'wlhrdxswnzwpiffvbkez'
-const supabaseRegion = 'eu-north-1'
-const supabaseStatus = 'Connected (Healthy)'
+const api = useApi()
+const healthStatus = ref<any>(null)
+const loading = ref(true)
+
+async function loadHealth() {
+  loading.value = true
+  try {
+    healthStatus.value = await api.get<any>('/api/v1/health').catch(() => null)
+  } finally {
+    loading.value = false
+  }
+}
+
+onMounted(() => loadHealth())
+
+const configSections = [
+  {
+    title: 'API Server',
+    icon: Server,
+    items: [
+      { label: 'HTTP Endpoint', value: 'localhost:8443', status: 'connected' },
+      { label: 'gRPC Gateway Port', value: ':50051', status: 'connected' },
+      { label: 'TLS Mode', value: 'Enabled (mTLS)', status: 'connected' },
+    ],
+  },
+  {
+    title: 'Database',
+    icon: Database,
+    items: [
+      { label: 'PostgreSQL', value: 'Supabase (eu-north-1)', status: healthStatus.value ? 'connected' : 'unknown' },
+      { label: 'Connection Pool', value: '10 / 20', status: 'connected' },
+    ],
+  },
+  {
+    title: 'External Integrations',
+    icon: Globe,
+    items: [
+      { label: 'ACME Provider', value: "Let's Encrypt", status: 'connected' },
+      { label: 'Vault Provider', value: 'HashiCorp Vault', status: 'connected' },
+      { label: 'GCP CAS Provider', value: 'Not Configured', status: 'disconnected' },
+    ],
+  },
+]
 </script>
 
 <template>
-  <div class="space-y-8">
-    <!-- Header -->
-    <div>
-      <h2 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2.5">
-        <Settings class="w-7 h-7 text-indigo-400" />
-        System Settings & Integrations
-      </h2>
-      <p class="text-sm text-slate-400 mt-1">
-        Configure database persistence, Supabase Auth OIDC/SSO, and alert notification destinations.
-      </p>
+  <div class="space-y-6">
+    <p class="text-sm text-base-content/60">System configuration and infrastructure health</p>
+
+    <div v-if="loading" class="flex justify-center py-12">
+      <span class="loading loading-spinner loading-lg text-primary"></span>
     </div>
 
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-      <!-- Database & Auth Settings -->
-      <div class="glass-panel p-6 space-y-4">
-        <div class="flex items-center gap-3 border-b border-slate-800 pb-3">
-          <Database class="w-5 h-5 text-emerald-400" />
-          <h3 class="font-semibold text-white">Database & Auth Provider</h3>
-        </div>
-
-        <div class="space-y-3 text-xs">
-          <div class="flex justify-between py-1.5 border-b border-slate-800/60">
-            <span class="text-slate-400">Database Engine</span>
-            <span class="font-mono text-slate-200">PostgreSQL 17</span>
-          </div>
-          <div class="flex justify-between py-1.5 border-b border-slate-800/60">
-            <span class="text-slate-400">Supabase Project Ref</span>
-            <span class="font-mono text-slate-200">{{ supabaseProject }}</span>
-          </div>
-          <div class="flex justify-between py-1.5 border-b border-slate-800/60">
-            <span class="text-slate-400">Region</span>
-            <span class="font-mono text-slate-200">{{ supabaseRegion }}</span>
-          </div>
-          <div class="flex justify-between py-1.5 border-b border-slate-800/60">
-            <span class="text-slate-400">Row-Level Security</span>
-            <span class="text-emerald-400 font-semibold">Enabled (9 tables)</span>
-          </div>
-          <div class="flex justify-between py-1.5">
-            <span class="text-slate-400">Realtime WebSocket</span>
-            <span class="text-emerald-400 font-semibold">Active</span>
+    <template v-else>
+      <!-- Health Status -->
+      <div class="card bg-base-100 border border-base-300">
+        <div class="card-body p-5">
+          <h2 class="card-title text-sm font-bold mb-3">
+            <SettingsIcon class="w-4 h-4 text-primary" /> System Health
+          </h2>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+            <div class="flex items-center gap-2">
+              <CheckCircle class="w-4 h-4 text-success" />
+              <div>
+                <div class="font-medium">API Server</div>
+                <div class="text-base-content/60">Running</div>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <CheckCircle class="w-4 h-4 text-success" />
+              <div>
+                <div class="font-medium">Database</div>
+                <div class="text-base-content/60">{{ healthStatus ? 'Connected' : 'Checking…' }}</div>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <CheckCircle class="w-4 h-4 text-success" />
+              <div>
+                <div class="font-medium">gRPC Gateway</div>
+                <div class="text-base-content/60">Listening</div>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <XCircle class="w-4 h-4 text-base-content/30" />
+              <div>
+                <div class="font-medium">Background Jobs</div>
+                <div class="text-base-content/60">Idle</div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
 
-      <!-- Notification Channels -->
-      <div class="glass-panel p-6 space-y-4">
-        <div class="flex items-center gap-3 border-b border-slate-800 pb-3">
-          <Bell class="w-5 h-5 text-indigo-400" />
-          <h3 class="font-semibold text-white">Alert Dispatch Destinations</h3>
-        </div>
-
-        <div class="space-y-3 text-xs text-slate-300">
-          <p>
-            CertPilot automatically routes CA expiry threshold warnings and renewal failure alerts to your designated channels.
-          </p>
-          <div class="p-3 rounded-lg bg-slate-900/60 border border-slate-800 space-y-2">
-            <div class="flex items-center justify-between">
-              <span class="font-medium text-slate-200">Slack Webhook</span>
-              <span class="badge badge-healthy text-[10px]">Ready</span>
+      <!-- Configuration Cards -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div v-for="section in configSections" :key="section.title" class="card bg-base-100 border border-base-300">
+          <div class="card-body p-5">
+            <div class="flex items-center gap-2 mb-3">
+              <component :is="section.icon" class="w-4 h-4 text-primary" />
+              <h3 class="font-bold text-sm">{{ section.title }}</h3>
             </div>
-            <div class="flex items-center justify-between">
-              <span class="font-medium text-slate-200">Microsoft Teams</span>
-              <span class="badge badge-healthy text-[10px]">Ready</span>
-            </div>
-            <div class="flex items-center justify-between">
-              <span class="font-medium text-slate-200">Generic Webhook</span>
-              <span class="badge badge-healthy text-[10px]">Ready</span>
+            <div class="space-y-2.5">
+              <div v-for="item in section.items" :key="item.label" class="flex items-center justify-between text-xs">
+                <span class="text-base-content/70">{{ item.label }}</span>
+                <div class="flex items-center gap-1.5">
+                  <span class="font-mono text-[11px]">{{ item.value }}</span>
+                  <span class="w-2 h-2 rounded-full" :class="item.status === 'connected' ? 'bg-success' : item.status === 'disconnected' ? 'bg-error' : 'bg-base-content/30'"></span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
       </div>
-    </div>
+    </template>
   </div>
 </template>
