@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/certpilot/certpilot/core/server"
+	"github.com/certpilot/certpilot/core/store"
 	"github.com/certpilot/certpilot/pkg/config"
 	"github.com/certpilot/certpilot/pkg/grpckit"
 	"github.com/certpilot/certpilot/pkg/secrets"
@@ -33,6 +34,10 @@ func main() {
 		"print a new base64 key encryption key for CERTPILOT_KEK and exit")
 	generateDevCerts := flag.String("generate-dev-certs", "",
 		"write development mTLS material for the core-to-gateway channel into this directory and exit")
+	migrate := flag.Bool("migrate", false,
+		"apply outstanding database migrations and exit")
+	migrationsDir := flag.String("migrations", "migrations",
+		"directory holding the numbered .sql migration files")
 	flag.Parse()
 
 	// Setup subcommands run before anything else is initialized, so they work
@@ -61,6 +66,14 @@ func main() {
 		fmt.Printf("  gateway:  %s / %s\n", paths.ServerCert, paths.ServerKey)
 		fmt.Printf("  CA:       %s\n\n", paths.CACert)
 		fmt.Fprintln(os.Stderr, "Development use only — the CA key is stored beside the certificates it signs.")
+		return
+	}
+
+	if *migrate {
+		if err := runMigrations(resolveDBURL(*dbURLFlag), *migrationsDir); err != nil {
+			slog.Error("migration failed", "error", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -103,13 +116,7 @@ func main() {
 	}
 
 	// Determine Database URL
-	dbConnStr := *dbURLFlag
-	if dbConnStr == "" {
-		dbConnStr = os.Getenv("CERTPILOT_DB_URL")
-	}
-	if dbConnStr == "" {
-		dbConnStr = os.Getenv("DATABASE_URL")
-	}
+	dbConnStr := resolveDBURL(*dbURLFlag)
 
 	if dbConnStr == "" {
 		slog.Info("no database connection string provided; using in-memory store with sample seed data")
@@ -146,4 +153,54 @@ func main() {
 	}
 
 	slog.Info("CertPilot Core shutdown complete")
+}
+
+// resolveDBURL reads the connection string from, in order, the --db flag,
+// CERTPILOT_DB_URL, and DATABASE_URL. An empty result means no database was
+// configured, which is a supported local-development state rather than an error.
+func resolveDBURL(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	if v := os.Getenv("CERTPILOT_DB_URL"); v != "" {
+		return v
+	}
+	return os.Getenv("DATABASE_URL")
+}
+
+// runMigrations backs `--migrate`. It is a separate invocation rather than
+// something the server does on startup so that a schema change is something an
+// operator decides to run, not a side effect of a deploy restarting a replica.
+func runMigrations(connStr, dir string) error {
+	if connStr == "" {
+		return fmt.Errorf("no database configured; pass --db or set CERTPILOT_DB_URL")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	result, err := store.Migrate(ctx, connStr, dir)
+	if result != nil {
+		for _, name := range result.Applied {
+			fmt.Printf("  applied  %s\n", name)
+		}
+		for _, name := range result.Skipped {
+			fmt.Printf("  already  %s\n", name)
+		}
+		for _, name := range result.Drifted {
+			fmt.Fprintf(os.Stderr,
+				"  WARNING  %s has changed since it was applied to this database.\n"+
+					"           It was not rerun. Reconcile the difference with a new migration.\n", name)
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	if len(result.Applied) == 0 {
+		fmt.Println("\nThe database schema is up to date.")
+	} else {
+		fmt.Printf("\nApplied %d migration(s).\n", len(result.Applied))
+	}
+	return nil
 }

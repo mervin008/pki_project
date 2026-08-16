@@ -58,8 +58,19 @@ const maxActivityLimit = 500
 func (h *DashboardHandler) Activity(c *gin.Context) {
 	filter := store.AuditLogFilter{
 		EntityType: c.Query("entity_type"),
-		EntityID:   c.Query("entity_id"),
 		Limit:      20,
+	}
+
+	// audit_logs.entity_id is a uuid column, so PostgreSQL rejects a malformed
+	// value with a type error rather than an empty result. Caught here it is a
+	// 400 describing the problem; left to the driver it is a 500 that reads
+	// like the server is broken.
+	if raw := c.Query("entity_id"); raw != "" {
+		if !isUUID(raw) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "entity_id must be a UUID"})
+			return
+		}
+		filter.EntityID = raw
 	}
 
 	// Both `?action=a&action=b` and `?action=a,b` — the first is what an HTTP
@@ -113,4 +124,29 @@ func (h *DashboardHandler) Activity(c *gin.Context) {
 	// total counts the filtered set, so a client paging through CA alerts is
 	// told how many alerts there are rather than how large the audit table is.
 	c.JSON(http.StatusOK, gin.H{"data": logs, "total": total})
+}
+
+// isUUID reports whether s is a canonical 8-4-4-4-12 hex UUID.
+//
+// Hand-written rather than pulling in a UUID dependency for one format check:
+// nothing here needs to parse, generate, or compare versions, only to reject a
+// value PostgreSQL would refuse.
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
 }

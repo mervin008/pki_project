@@ -108,12 +108,25 @@ func TestActivityRejectsUnusableParameters(t *testing.T) {
 		"?limit=99999",
 		"?limit=lots",
 		"?offset=-1",
+
+		// audit_logs.entity_id is a uuid column, so PostgreSQL answers a
+		// malformed value with a type error. Rejected here, it reads as the
+		// client mistake it is instead of a 500 that looks like an outage.
+		"?entity_id=not-a-uuid",
+		"?entity_id=123",
+		"?entity_id=0d1f2e3a-4b5c-6d7e-8f90-a1b2c3d4e5f", // one hex digit short
 	}
 	for _, query := range cases {
 		w := do(r, http.MethodGet, "/api/v1/dashboard/activity"+query, nil, nil)
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("%s: want 400, got %d", query, w.Code)
 		}
+	}
+
+	// A well-formed one is a filter, not an error, even when it matches nothing.
+	w := do(r, http.MethodGet, "/api/v1/dashboard/activity?entity_id=0d1f2e3a-4b5c-6d7e-8f90-a1b2c3d4e5f6", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Errorf("a valid uuid should be accepted, got %d: %s", w.Code, w.Body)
 	}
 }
 

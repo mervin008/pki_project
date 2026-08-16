@@ -53,6 +53,15 @@ generate-kek: build-core
 dev-certs: build-core
 	@$(CORE_BIN) --generate-dev-certs=$(PKI)
 
+## Apply outstanding database migrations. Reads CERTPILOT_DB_URL (or DATABASE_URL);
+## override with `make migrate DB=postgres://...`.
+##
+## Deliberately not run by the server on startup: a schema change should be
+## something an operator decides to do, not a side effect of a replica restarting
+## mid-deploy while older replicas are still reading the old shape.
+migrate: build-core
+	@$(CORE_BIN) --migrate $(if $(DB),--db=$(DB),)
+
 # ── Run (Development) ───────────────────────────────────
 #
 # Each of these runs in its own terminal. Run `make dev-certs` first.

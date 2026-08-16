@@ -37,7 +37,17 @@ func NewPostgresStore(ctx context.Context, connStr string) (*PostgresStore, erro
 
 	// Test ping
 	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("failed to ping postgres: %w", err)
+	}
+
+	// A reachable database is not the same as a usable one. Preflight refuses
+	// an unmigrated schema, and refuses a connection that row-level security
+	// would silently filter to nothing — which would otherwise present as a
+	// perfectly healthy, perfectly empty estate.
+	if err := Preflight(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
 	}
 
 	slog.Info("connected to PostgreSQL/Supabase database")

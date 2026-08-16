@@ -129,6 +129,27 @@ make run-frontend
 
 The API is on `:8080`, the frontend on `:5173`.
 
+### Persisting to a database
+
+The in-memory store is seeded demonstration data and is discarded on every
+restart. To keep what you do, point the core at PostgreSQL — Supabase or
+otherwise:
+
+```bash
+export CERTPILOT_DB_URL='postgres://postgres.<ref>:<password>@<host>:5432/postgres?sslmode=require'
+make migrate
+make run-core
+```
+
+The dashboard then starts at zero, because a fresh database is empty. Two ways
+that could be a lie rather than a fact — an unmigrated schema, and a connection
+that row-level security silently filters to nothing — are refused at startup
+instead of rendered as green tiles.
+
+[docs/database.md](docs/database.md) covers which Supabase connection string to
+use and why the choice matters, why migration 005 is not optional, and what to do
+on plain PostgreSQL.
+
 ### Issue a certificate
 
 ```bash
@@ -229,10 +250,14 @@ travel to production unnoticed.
   renew the same certificate concurrently.
 - The OCSP responder check is an HTTP GET, not an RFC 6960 request, and reports
   a responder as healthy when it should not.
-- `migrations/001_initial_schema.sql` references `auth.users` and `auth.jwt()`,
-  which exist only on Supabase. It will not apply to vanilla PostgreSQL. The
-  Go store layer itself is plain `pgx` and has no Supabase dependency. Later
-  migrations avoid the dependency.
+- `migrations/001_initial_schema.sql` defines `get_user_role()` in terms of
+  `auth.jwt()` and grants its RLS policies to the `authenticated` role, neither
+  of which exists outside Supabase, so it will not apply to vanilla PostgreSQL.
+  Migrations 002–005 are portable, and the Go store layer is plain `pgx` with no
+  Supabase dependency. The `auth.users` foreign keys 001 declared were a harder
+  problem than a portability wart — they made Supabase Auth the only identity
+  provider the core could write against, and broke issuance under any other —
+  and [005](migrations/005_identity_decoupling.sql) removes them.
 - Trusted proxies are not configured, so client IPs are taken from
   `X-Forwarded-For` whoever sends it. Every recorded IP — audit entries and
   display-token `last_seen_ip` alike — is therefore a hint, not evidence.

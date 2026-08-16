@@ -97,6 +97,20 @@ logging:
 
 # Supabase is one supported deployment target, not a requirement. The core
 # talks to any PostgreSQL database via CERTPILOT_DB_URL or --db.
+#
+# The connection string does not live here. It carries a password, and this file
+# is a template meant to be committed:
+#
+#   export CERTPILOT_DB_URL='postgres://postgres.<ref>:<pw>@<host>:5432/postgres?sslmode=require'
+#   make migrate
+#
+# Prefer Supabase's session pooler (port 5432 on the pooler host) over the
+# transaction pooler (6543): pgx caches prepared statements per connection, and
+# transaction-mode pooling hands the next query to a backend that has never seen
+# them. See docs/database.md.
+#
+# With no connection string the core uses an in-memory store seeded with sample
+# data, which is discarded on every restart.
 supabase:
   url: "${SUPABASE_URL}"
   anon_key: "${SUPABASE_ANON_KEY}"
