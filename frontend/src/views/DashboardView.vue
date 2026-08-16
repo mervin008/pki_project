@@ -58,7 +58,8 @@ const summary = computed<DashboardStats>(
   () =>
     stats.data.value ?? {
       total_certificates: 0, healthy_certs: 0, expiring_soon_certs: 0, expired_certs: 0,
-      total_cas: 0, healthy_cas: 0, warning_cas: 0, critical_cas: 0, total_scans: 0,
+      total_cas: 0, healthy_cas: 0, warning_cas: 0, critical_cas: 0,
+      expired_cas: 0, unknown_cas: 0, total_scans: 0,
     },
 )
 
@@ -181,6 +182,28 @@ const casNeedingAttention = computed(
   () => caList.value.filter((ca) => caSeverity(ca.status) !== 'ok').length,
 )
 
+/**
+ * The breakdown behind that count, worst first, omitting empty buckets.
+ *
+ * All four states are listed because the backend reports them separately:
+ * critical no longer absorbs expired, and unknown is no longer dropped. Naming
+ * only two of them would leave an expired CA counted in the headline figure and
+ * explained by nothing underneath it.
+ */
+const caAttentionBreakdown = computed(() =>
+  (
+    [
+      [summary.value.expired_cas, 'expired'],
+      [summary.value.critical_cas, 'critical'],
+      [summary.value.warning_cas, 'warning'],
+      [summary.value.unknown_cas, 'unchecked'],
+    ] as const
+  )
+    .filter(([count]) => count > 0)
+    .map(([count, label]) => `${count} ${label}`)
+    .join(' · '),
+)
+
 /** Renders an audit entry as a sentence, with CA alerts given their real detail. */
 function describeActivity(log: AuditLog): string {
   if (log.action === 'ca.expiry_alert') {
@@ -276,7 +299,7 @@ watch(currentTheme, () => {
             {{ casNeedingAttention }}
           </div>
           <div class="stat-desc text-[11px]">
-            {{ summary.warning_cas }} warning · {{ summary.critical_cas }} critical
+            {{ caAttentionBreakdown || 'all authorities healthy' }}
           </div>
         </div>
       </div>

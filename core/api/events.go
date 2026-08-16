@@ -200,7 +200,9 @@ func (h *EventsHandler) writeSnapshot(ctx context.Context, c *gin.Context) bool 
 		})
 	}
 
-	cas, err := h.store.ListCAAuthorities(ctx)
+	// Urgency order, without the PEM. The snapshot is re-sent on every connect
+	// and every resynchronise, so it carries only what a dashboard draws.
+	cas, err := h.store.ListCAAuthorities(ctx, store.CAFilter{Sort: store.CASortUrgency})
 	if err != nil {
 		slog.Error("failed to list CAs for event stream snapshot", "error", err)
 		return writeNamed(c, "error", map[string]string{

@@ -25,7 +25,7 @@ func NewChainResolver(s store.Store) *ChainResolver {
 
 // BuildHierarchyTree returns the root CA nodes with their children recursively attached.
 func (r *ChainResolver) BuildHierarchyTree(ctx context.Context) ([]*ChainNode, error) {
-	cas, err := r.store.ListCAAuthorities(ctx)
+	cas, err := r.store.ListCAAuthorities(ctx, store.CAFilter{})
 	if err != nil {
 		return nil, err
 	}

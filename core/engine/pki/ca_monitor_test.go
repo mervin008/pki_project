@@ -33,7 +33,7 @@ func alertsFrom(t *testing.T, ca *store.CAAuthority, days int) []map[string]any 
 	m := NewCAMonitor(st, nil)
 	m.evaluateAlertThresholds(context.Background(), ca, days, time.Now())
 
-	logs, _, err := st.ListAuditLogs(context.Background(), 100, 0)
+	logs, _, err := st.ListAuditLogs(context.Background(), store.AuditLogFilter{Limit: 100})
 	if err != nil {
 		t.Fatalf("ListAuditLogs: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestAlertIsNotRepeatedAtTheSameThreshold(t *testing.T) {
 		m.evaluateAlertThresholds(context.Background(), ca, 25, time.Now())
 	}
 
-	logs, _, err := st.ListAuditLogs(context.Background(), 100, 0)
+	logs, _, err := st.ListAuditLogs(context.Background(), store.AuditLogFilter{Limit: 100})
 	if err != nil {
 		t.Fatalf("ListAuditLogs: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestAlertFiresAgainAtATighterThreshold(t *testing.T) {
 		m.evaluateAlertThresholds(context.Background(), ca, days, time.Now())
 	}
 
-	logs, _, err := st.ListAuditLogs(context.Background(), 100, 0)
+	logs, _, err := st.ListAuditLogs(context.Background(), store.AuditLogFilter{Limit: 100})
 	if err != nil {
 		t.Fatalf("ListAuditLogs: %v", err)
 	}

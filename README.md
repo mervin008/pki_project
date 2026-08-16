@@ -239,6 +239,15 @@ travel to production unnoticed.
 - Display tokens are not rate-limited. The credential is 256 bits, so guessing
   is not the concern; a stolen one being used heavily is, and nothing throttles
   it beyond revocation.
+- `PostgresStore` is exercised by review and by the compile checker, not by
+  tests. The store test suite runs against the in-memory implementation, which
+  the two are written to keep in step — filters evaluate the same predicates and
+  the dashboard buckets are defined clause for clause — but nothing yet proves
+  they agree. A container-backed suite is the fix and is not written.
+- `/dashboard/activity` is still available to any authenticated reader,
+  including `viewer`. Kiosk display tokens are refused it outright, since audit
+  entries carry actor identity and a corridor screen should not name who deleted
+  what — but a signed-in viewer is a person, and is not restricted.
 
 ## Post-quantum
 

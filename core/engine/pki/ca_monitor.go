@@ -85,7 +85,9 @@ func (m *CAMonitor) Stop() {
 
 // CheckAllCAs runs a full health check across all CA authorities.
 func (m *CAMonitor) CheckAllCAs(ctx context.Context) error {
-	cas, err := m.store.ListCAAuthorities(ctx)
+	// The one caller that needs the PEM: the sweep re-parses each certificate
+	// to refresh validity dates, key details, and the CRL and OCSP URLs.
+	cas, err := m.store.ListCAAuthorities(ctx, store.CAFilter{IncludePEM: true})
 	if err != nil {
 		return fmt.Errorf("failed to list CAs: %w", err)
 	}

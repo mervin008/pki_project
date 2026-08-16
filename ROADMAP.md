@@ -74,7 +74,7 @@ is already being collected; almost none of it reaches a human unprompted.
 | 1 | In-process event broker | ✅ |
 | 2 | `GET /api/v1/events` — Server-Sent Events | ✅ |
 | 3 | Kiosk display tokens | ✅ |
-| 4 | Store filtering: audit log by action, CA filters, an index | |
+| 4 | Store filtering: audit log by action, CA filters, an index | ✅ |
 | 5 | Frontend event stream and connection indicator | |
 | 6 | CA health view, then fullscreen wall mode | |
 | 7 | Alert delivery: Slack, webhook, SMTP | |
@@ -93,6 +93,20 @@ resynchronise rather than fed deltas onto a stale base.
 
 **Step 3** made the stream reachable from a screen nobody is sitting at, without
 that screen holding credentials worth stealing.
+
+**Step 4** made the collected data answerable. Audit logs can now be queried by
+action, so `ca.expiry_alert` is reachable instead of buried under a day's
+issuance; CAs can be filtered by status and expiry window and sorted by urgency,
+which is what the health view is built on. Looking for the gaps turned up three
+defects worth naming, all of the same kind — a store layer that quietly dropped
+what it was handed:
+
+- `UpdateCertificate` never wrote `private_key_encrypted`, so a renewal that
+  rotated the key stored the new certificate against the old one.
+- `GetCertificate` never read the column either, so private key export answered
+  "no private key is stored" for every certificate on PostgreSQL.
+- The in-memory store returned live pointers into its own maps, making the
+  health sweep and the event stream race over the same records.
 
 The rest:
 

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/certpilot/certpilot/core/engine/pki"
@@ -30,8 +32,31 @@ func NewCAHandler(s store.Store, mon *pki.CAMonitor, cr *pki.ChainResolver) *CAH
 }
 
 // List handles GET /api/v1/pki/authorities.
+//
+// Supports `status`, `expiring_within_days`, and `sort=urgency|name`. The
+// urgency ordering is what the CA health view is built on: for a team watching
+// a wall display the useful question is which CA fails first, and an
+// alphabetical list answers a different one.
 func (h *CAHandler) List(c *gin.Context) {
-	cas, err := h.store.ListCAAuthorities(c.Request.Context())
+	filter := store.CAFilter{
+		Status: strings.ToUpper(c.Query("status")),
+		Sort:   c.Query("sort"),
+		// The certificate PEM is several kilobytes per CA and no client renders
+		// it. The detail endpoint still returns it.
+		IncludePEM: false,
+	}
+	if raw := c.Query("expiring_within_days"); raw != "" {
+		days, err := strconv.Atoi(raw)
+		if err != nil || days < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "expiring_within_days must be a non-negative whole number of days",
+			})
+			return
+		}
+		filter.ExpiringWithinDays = days
+	}
+
+	cas, err := h.store.ListCAAuthorities(c.Request.Context(), filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

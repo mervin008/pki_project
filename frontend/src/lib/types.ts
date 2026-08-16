@@ -135,6 +135,12 @@ export interface DashboardStats {
   healthy_cas: number
   warning_cas: number
   critical_cas: number
+  /** Already expired. Split out from critical_cas: one can still be replaced
+   *  in an orderly way, the other is already an outage. */
+  expired_cas: number
+  /** Never checked, or whose certificate could not be parsed. Counted and
+   *  shown rather than hidden — a CA nobody can assess is not a healthy one. */
+  unknown_cas: number
   total_scans: number
 }
 

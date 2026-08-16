@@ -304,14 +304,24 @@ func (h *CertificateHandler) PrivateKey(c *gin.Context) {
 		return
 	}
 
-	if cert.PrivateKeyEncrypted == nil || *cert.PrivateKeyEncrypted == "" {
+	// Read through the dedicated accessor. The record returned by
+	// GetCertificate never carries the key — no list or detail query selects
+	// the column — so the previous check against cert.PrivateKeyEncrypted was
+	// always nil against PostgreSQL and this endpoint answered "no private key
+	// is stored" for every certificate, including the ones whose keys it held.
+	sealed, err := h.store.GetCertificatePrivateKey(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if sealed == "" {
 		c.JSON(http.StatusNotFound, gin.H{
 			"error": "no private key is stored for this certificate — it was either imported, discovered, or issued from a CSR whose key never left its host",
 		})
 		return
 	}
 
-	keyPEM, err := h.keyring.DecryptString(*cert.PrivateKeyEncrypted, secrets.ContextCertificatePrivKey)
+	keyPEM, err := h.keyring.DecryptString(sealed, secrets.ContextCertificatePrivKey)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": fmt.Sprintf("failed to decrypt the stored private key: %v", err),

@@ -137,6 +137,50 @@ GET /api/v1/dashboard/expiring   Certificates inside the renewal lead window
 GET /api/v1/dashboard/activity   Recent audit events
 ```
 
+### Statistics
+
+The five CA counts partition the estate — every authority lands in exactly one,
+and they sum to `total_cas`:
+
+| Field | |
+|:---|:---|
+| `healthy_cas` | |
+| `warning_cas` | |
+| `critical_cas` | Close to expiry. Still replaceable in an orderly way |
+| `expired_cas` | Already an outage. Separate from critical because the response differs |
+| `unknown_cas` | Never checked, or the certificate could not be parsed |
+
+`unknown_cas` is reported rather than folded away: a CA nobody can assess is not
+a healthy one, and hiding it is how a green dashboard covers an unmonitored CA.
+
+### Activity
+
+```
+GET /api/v1/dashboard/activity?action=ca.expiry_alert&limit=50
+```
+
+| Parameter | |
+|:---|:---|
+| `action` | Repeatable, or comma-separated. Matches any of the listed actions |
+| `entity_type`, `entity_id` | Narrow to one object's history |
+| `since` | RFC 3339 timestamp, inclusive lower bound |
+| `limit` | 1–500, default 20 |
+| `offset` | |
+
+`total` counts the filtered set, not the table, so a client paging through CA
+alerts is told how many alerts exist rather than how large the audit log is.
+
+Filtering is what makes CA alerts reachable. They share a table with every
+issuance, so without it the newest twenty rows on a busy day contain no alerts
+at all — they were recorded, and never seen. An unparseable `since`, `limit`, or
+`offset` is a 400 rather than a silently ignored parameter: a filter that
+quietly does nothing is worse than one that fails, because the caller believes
+they are looking at a narrowed view.
+
+> Refused to kiosk display tokens. Audit entries carry actor identity, and
+> "alice@example.com deleted a certificate" does not belong on a corridor
+> screen. Signed-in `viewer` accounts are not restricted.
+
 ## Certificates
 
 ```
@@ -224,6 +268,28 @@ POST   /api/v1/pki/authorities/:id/check  Health, CRL, and OCSP check (operator)
 DELETE /api/v1/pki/authorities/:id        Remove                      (admin)
 GET    /api/v1/pki/tree                   Hierarchy for visualization
 ```
+
+`GET /pki/authorities` filters and sorts:
+
+| Parameter | |
+|:---|:---|
+| `status` | `HEALTHY`, `WARNING`, `CRITICAL`, `EXPIRED`, `UNKNOWN` |
+| `expiring_within_days` | Keeps CAs expiring inside the window |
+| `sort` | `urgency` (soonest expiry first) or `name` (default) |
+
+`urgency` is the order the CA health view is built on: the question a team
+watching a wall display is asking is which authority fails first, and an
+alphabetical list answers a different one.
+
+The expiry window is evaluated against `not_after`, not the stored
+`days_remaining`. That column is a snapshot written by the health sweep and is
+stale by however long it has been since the last one — a CA whose sweep has not
+run since registration would otherwise report itself comfortable while expiring
+next week.
+
+The list omits `certificate_pem`; the detail endpoint still returns it. It is
+kilobytes per CA, no client renders it, and the list is re-read on every
+dashboard refresh.
 
 > The CRL freshness check is real. The OCSP check currently issues a plain GET
 > rather than an RFC 6960 request and reports a responder as healthy when it

@@ -321,7 +321,7 @@ func TestDisplayTokenChangesAreAudited(t *testing.T) {
 		t.Fatalf("revoke status = %d", w.Code)
 	}
 
-	logs, _, err := st.ListAuditLogs(context.Background(), 50, 0)
+	logs, _, err := st.ListAuditLogs(context.Background(), store.AuditLogFilter{Limit: 50})
 	if err != nil {
 		t.Fatalf("ListAuditLogs: %v", err)
 	}

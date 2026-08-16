@@ -13,6 +13,14 @@ import (
 )
 
 // MemoryStore provides a thread-safe in-memory store for local testing without external database dependencies.
+//
+// Every read returns copies of the stored records, never the stored pointers.
+// PostgresStore has no choice about this — a row scanned out of the database is
+// already a copy — and the in-memory store handing out live pointers made the
+// two behave differently in the one way that matters: the CA health sweep reads
+// every authority and mutates it field by field, while the event stream reads
+// the same records to build a snapshot. Sharing pointers between those two made
+// a data race out of an ordinary dashboard refresh.
 type MemoryStore struct {
 	mu            sync.RWMutex
 	certificates  map[string]*Certificate
@@ -21,7 +29,18 @@ type MemoryStore struct {
 	targets       map[string]*DeploymentTarget
 	policies      map[string]*Policy
 	displayTokens map[string]*DisplayToken
+	notifChannels map[string]*NotificationChannel
 	auditLogs     []*AuditLog
+}
+
+// clone returns a shallow copy of a stored record.
+//
+// Shallow is sufficient here. The pointer and slice fields on these models
+// (*time.Time, *string, []string) are only ever replaced wholesale, never
+// written through, so no caller can reach back into the store's copy.
+func clone[T any](v *T) *T {
+	c := *v
+	return &c
 }
 
 // NewMemoryStore creates a new in-memory store pre-populated with sample demonstration data.
@@ -196,6 +215,9 @@ func NewMemoryStore() *MemoryStore {
 		// first run has something to render, but a seeded credential is a
 		// credential someone forgets to remove.
 		displayTokens: make(map[string]*DisplayToken),
+		// Also empty, for the same reason: a channel's config holds a Slack
+		// webhook URL or an SMTP password.
+		notifChannels: make(map[string]*NotificationChannel),
 		auditLogs:     []*AuditLog{log1},
 	}
 }
@@ -206,7 +228,7 @@ func (m *MemoryStore) ListCertificates(ctx context.Context, filter CertificateFi
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var result []*Certificate
+	result := make([]*Certificate, 0)
 	for _, c := range m.certificates {
 		if filter.Status != "" && c.Status != filter.Status {
 			continue
@@ -217,10 +239,54 @@ func (m *MemoryStore) ListCertificates(ctx context.Context, filter CertificateFi
 		if filter.CommonName != "" && !strings.Contains(strings.ToLower(c.CommonName), strings.ToLower(filter.CommonName)) {
 			continue
 		}
-		result = append(result, c)
+		// Previously ignored, while Postgres honoured it — so a filtered view
+		// looked correct in development and changed meaning in production.
+		if filter.CAAccountID != "" && (c.CAAccountID == nil || *c.CAAccountID != filter.CAAccountID) {
+			continue
+		}
+		result = append(result, clone(c))
 	}
 
-	return result, int64(len(result)), nil
+	// Soonest expiry first, matching the Postgres ORDER BY. Map iteration order
+	// is randomised, so without this the same request returns the same rows in
+	// a different order every time.
+	sort.Slice(result, func(i, j int) bool {
+		a, b := result[i].NotAfter, result[j].NotAfter
+		switch {
+		case a == nil && b == nil:
+			return result[i].ID < result[j].ID
+		case a == nil:
+			return false // NULLS LAST
+		case b == nil:
+			return true
+		case a.Equal(*b):
+			return result[i].ID < result[j].ID
+		default:
+			return a.Before(*b)
+		}
+	})
+
+	// The total is the size of the filtered set, before the page is taken.
+	total := int64(len(result))
+	return paginate(result, filter.Limit, filter.Offset), total, nil
+}
+
+// paginate applies limit and offset with the same defaults as PostgresStore.
+func paginate[T any](items []T, limit, offset int) []T {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(items) {
+		return []T{}
+	}
+	end := offset + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	return items[offset:end]
 }
 
 func (m *MemoryStore) GetCertificate(ctx context.Context, id string) (*Certificate, error) {
@@ -230,7 +296,7 @@ func (m *MemoryStore) GetCertificate(ctx context.Context, id string) (*Certifica
 	if !ok {
 		return nil, fmt.Errorf("certificate %s not found", id)
 	}
-	return c, nil
+	return clone(c), nil
 }
 
 func (m *MemoryStore) GetCertificateByFingerprint(ctx context.Context, fingerprint string) (*Certificate, error) {
@@ -238,7 +304,7 @@ func (m *MemoryStore) GetCertificateByFingerprint(ctx context.Context, fingerpri
 	defer m.mu.RUnlock()
 	for _, c := range m.certificates {
 		if c.FingerprintSHA256 == fingerprint {
-			return c, nil
+			return clone(c), nil
 		}
 	}
 	return nil, nil
@@ -259,7 +325,7 @@ func (m *MemoryStore) CreateCertificate(ctx context.Context, cert *Certificate) 
 			cert.DaysRemaining = int(d)
 		}
 	}
-	m.certificates[cert.ID] = cert
+	m.certificates[cert.ID] = clone(cert)
 	return nil
 }
 
@@ -273,7 +339,17 @@ func (m *MemoryStore) UpdateCertificate(ctx context.Context, cert *Certificate) 
 			cert.DaysRemaining = int(d)
 		}
 	}
-	m.certificates[cert.ID] = cert
+	stored := clone(cert)
+	// Matches the COALESCE in PostgresStore.UpdateCertificate: a supplied key
+	// replaces the stored one, an absent key leaves it alone. No read path
+	// populates this field, so without the second half every ordinary update
+	// would destroy the key.
+	if stored.PrivateKeyEncrypted == nil {
+		if prev, ok := m.certificates[cert.ID]; ok {
+			stored.PrivateKeyEncrypted = prev.PrivateKeyEncrypted
+		}
+	}
+	m.certificates[cert.ID] = stored
 	return nil
 }
 
@@ -287,21 +363,68 @@ func (m *MemoryStore) DeleteCertificate(ctx context.Context, id string) error {
 func (m *MemoryStore) GetCertificatesDueForRenewal(ctx context.Context, leadDays int) ([]*Certificate, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var due []*Certificate
+	due := make([]*Certificate, 0)
 	for _, c := range m.certificates {
 		if c.AutoRenew && (c.DaysRemaining <= leadDays || c.Status == "EXPIRING" || c.Status == "RENEWAL_FAILED") {
-			due = append(due, c)
+			due = append(due, clone(c))
 		}
 	}
+	sort.Slice(due, func(i, j int) bool { return due[i].DaysRemaining < due[j].DaysRemaining })
 	return due, nil
 }
 
-func (m *MemoryStore) ListCAAuthorities(ctx context.Context) ([]*CAAuthority, error) {
+func (m *MemoryStore) GetCertificatePrivateKey(ctx context.Context, id string) (string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var list []*CAAuthority
+	c, ok := m.certificates[id]
+	if !ok {
+		return "", fmt.Errorf("certificate %s not found", id)
+	}
+	if c.PrivateKeyEncrypted == nil {
+		return "", nil
+	}
+	return *c.PrivateKeyEncrypted, nil
+}
+
+func (m *MemoryStore) ListCAAuthorities(ctx context.Context, filter CAFilter) ([]*CAAuthority, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	now := time.Now()
+	list := make([]*CAAuthority, 0)
 	for _, ca := range m.caAuthorities {
-		list = append(list, ca)
+		if filter.Status != "" && ca.Status != filter.Status {
+			continue
+		}
+		// Against NotAfter, matching the Postgres predicate. Filtering on the
+		// cached DaysRemaining here would have made the two stores disagree
+		// about which CAs are urgent whenever a sweep was overdue.
+		if filter.ExpiringWithinDays > 0 {
+			cutoff := now.AddDate(0, 0, filter.ExpiringWithinDays)
+			if ca.NotAfter.After(cutoff) {
+				continue
+			}
+		}
+		if filter.ExcludeExpired && !ca.NotAfter.After(now) {
+			continue
+		}
+
+		c := clone(ca)
+		if !filter.IncludePEM {
+			c.CertificatePEM = ""
+		}
+		list = append(list, c)
+	}
+
+	if filter.Sort == CASortUrgency {
+		sort.Slice(list, func(i, j int) bool {
+			if list[i].NotAfter.Equal(list[j].NotAfter) {
+				return list[i].Name < list[j].Name
+			}
+			return list[i].NotAfter.Before(list[j].NotAfter)
+		})
+	} else {
+		sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	}
 	return list, nil
 }
@@ -313,7 +436,7 @@ func (m *MemoryStore) GetCAAuthority(ctx context.Context, id string) (*CAAuthori
 	if !ok {
 		return nil, fmt.Errorf("CA authority %s not found", id)
 	}
-	return ca, nil
+	return clone(ca), nil
 }
 
 func (m *MemoryStore) CreateCAAuthority(ctx context.Context, ca *CAAuthority) error {
@@ -325,15 +448,25 @@ func (m *MemoryStore) CreateCAAuthority(ctx context.Context, ca *CAAuthority) er
 	now := time.Now()
 	ca.CreatedAt = now
 	ca.UpdatedAt = now
-	m.caAuthorities[ca.ID] = ca
+	m.caAuthorities[ca.ID] = clone(ca)
 	return nil
 }
 
 func (m *MemoryStore) UpdateCAAuthority(ctx context.Context, ca *CAAuthority) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	ca.UpdatedAt = time.Now()
-	m.caAuthorities[ca.ID] = ca
+	stored := clone(ca)
+	// The stored PEM survives the update, because PostgresStore's UPDATE does
+	// not include the column. A caller that listed without CAFilter.IncludePEM
+	// holds a record whose PEM is blank; writing that back would destroy the
+	// only copy of the CA certificate the system has, and the next health sweep
+	// would report the CA as UNKNOWN rather than as expiring.
+	if prev, ok := m.caAuthorities[ca.ID]; ok {
+		stored.CertificatePEM = prev.CertificatePEM
+	}
+	m.caAuthorities[ca.ID] = stored
 	return nil
 }
 
@@ -357,7 +490,7 @@ func (m *MemoryStore) GetCAChain(ctx context.Context, id string) ([]*CAAuthority
 		if !ok {
 			break
 		}
-		chain = append(chain, ca)
+		chain = append(chain, clone(ca))
 		if ca.ParentCAID != nil && *ca.ParentCAID != "" {
 			currID = *ca.ParentCAID
 		} else {
@@ -370,10 +503,11 @@ func (m *MemoryStore) GetCAChain(ctx context.Context, id string) ([]*CAAuthority
 func (m *MemoryStore) ListCAAccounts(ctx context.Context) ([]*CAAccount, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var list []*CAAccount
+	list := make([]*CAAccount, 0, len(m.caAccounts))
 	for _, acc := range m.caAccounts {
-		list = append(list, acc)
+		list = append(list, clone(acc))
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	return list, nil
 }
 
@@ -382,11 +516,11 @@ func (m *MemoryStore) GetCAAccount(ctx context.Context, id string) (*CAAccount, 
 	defer m.mu.RUnlock()
 	acc, ok := m.caAccounts[id]
 	if ok {
-		return acc, nil
+		return clone(acc), nil
 	}
 	for _, a := range m.caAccounts {
 		if a.Name == id {
-			return a, nil
+			return clone(a), nil
 		}
 	}
 	return nil, fmt.Errorf("CA account %s not found", id)
@@ -401,7 +535,7 @@ func (m *MemoryStore) CreateCAAccount(ctx context.Context, acc *CAAccount) error
 	now := time.Now()
 	acc.CreatedAt = now
 	acc.UpdatedAt = now
-	m.caAccounts[acc.ID] = acc
+	m.caAccounts[acc.ID] = clone(acc)
 	return nil
 }
 
@@ -409,7 +543,7 @@ func (m *MemoryStore) UpdateCAAccount(ctx context.Context, acc *CAAccount) error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	acc.UpdatedAt = time.Now()
-	m.caAccounts[acc.ID] = acc
+	m.caAccounts[acc.ID] = clone(acc)
 	return nil
 }
 
@@ -423,10 +557,11 @@ func (m *MemoryStore) DeleteCAAccount(ctx context.Context, id string) error {
 func (m *MemoryStore) ListDeploymentTargets(ctx context.Context) ([]*DeploymentTarget, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var list []*DeploymentTarget
+	list := make([]*DeploymentTarget, 0, len(m.targets))
 	for _, t := range m.targets {
-		list = append(list, t)
+		list = append(list, clone(t))
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	return list, nil
 }
 
@@ -437,7 +572,7 @@ func (m *MemoryStore) GetDeploymentTarget(ctx context.Context, id string) (*Depl
 	if !ok {
 		return nil, fmt.Errorf("target %s not found", id)
 	}
-	return t, nil
+	return clone(t), nil
 }
 
 func (m *MemoryStore) CreateDeploymentTarget(ctx context.Context, target *DeploymentTarget) error {
@@ -446,7 +581,7 @@ func (m *MemoryStore) CreateDeploymentTarget(ctx context.Context, target *Deploy
 	if target.ID == "" {
 		target.ID = uuid.New().String()
 	}
-	m.targets[target.ID] = target
+	m.targets[target.ID] = clone(target)
 	return nil
 }
 
@@ -460,10 +595,11 @@ func (m *MemoryStore) DeleteDeploymentTarget(ctx context.Context, id string) err
 func (m *MemoryStore) ListPolicies(ctx context.Context) ([]*Policy, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var list []*Policy
+	list := make([]*Policy, 0, len(m.policies))
 	for _, p := range m.policies {
-		list = append(list, p)
+		list = append(list, clone(p))
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	return list, nil
 }
 
@@ -474,7 +610,7 @@ func (m *MemoryStore) GetPolicy(ctx context.Context, id string) (*Policy, error)
 	if !ok {
 		return nil, fmt.Errorf("policy %s not found", id)
 	}
-	return p, nil
+	return clone(p), nil
 }
 
 func (m *MemoryStore) CreatePolicy(ctx context.Context, p *Policy) error {
@@ -485,7 +621,7 @@ func (m *MemoryStore) CreatePolicy(ctx context.Context, p *Policy) error {
 	}
 	p.CreatedAt = time.Now()
 	p.UpdatedAt = time.Now()
-	m.policies[p.ID] = p
+	m.policies[p.ID] = clone(p)
 	return nil
 }
 
@@ -493,7 +629,7 @@ func (m *MemoryStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p.UpdatedAt = time.Now()
-	m.policies[p.ID] = p
+	m.policies[p.ID] = clone(p)
 	return nil
 }
 
@@ -602,22 +738,129 @@ func (m *MemoryStore) CreateAuditLog(ctx context.Context, log *AuditLog) error {
 		log.ID = uuid.New().String()
 	}
 	log.CreatedAt = time.Now()
-	m.auditLogs = append([]*AuditLog{log}, m.auditLogs...)
+	m.auditLogs = append([]*AuditLog{clone(log)}, m.auditLogs...)
 	return nil
 }
 
-func (m *MemoryStore) ListAuditLogs(ctx context.Context, limit, offset int) ([]*AuditLog, int64, error) {
+func (m *MemoryStore) ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	total := int64(len(m.auditLogs))
-	if offset >= len(m.auditLogs) {
-		return []*AuditLog{}, total, nil
+
+	// m.auditLogs is already newest-first; CreateAuditLog prepends.
+	matched := make([]*AuditLog, 0)
+	for _, l := range m.auditLogs {
+		if len(filter.Actions) > 0 && !containsString(filter.Actions, l.Action) {
+			continue
+		}
+		if filter.EntityType != "" && l.EntityType != filter.EntityType {
+			continue
+		}
+		if filter.EntityID != "" && (l.EntityID == nil || *l.EntityID != filter.EntityID) {
+			continue
+		}
+		if !filter.Since.IsZero() && l.CreatedAt.Before(filter.Since) {
+			continue
+		}
+		// A copy, and a fresh slice. This previously returned a subslice of the
+		// live backing array: the caller held memory that CreateAuditLog would
+		// go on to write through, so reading a returned entry raced every
+		// subsequent audit write. Harmless while nothing read audit logs
+		// concurrently — which stopped being true the moment the event stream
+		// arrived.
+		matched = append(matched, clone(l))
 	}
-	end := offset + limit
-	if end > len(m.auditLogs) {
-		end = len(m.auditLogs)
+
+	total := int64(len(matched))
+	return paginate(matched, filter.Limit, filter.Offset), total, nil
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
 	}
-	return m.auditLogs[offset:end], total, nil
+	return false
+}
+
+// ── Notification Channels ───────────────────────────────
+
+func (m *MemoryStore) ListNotificationChannels(ctx context.Context) ([]*NotificationChannel, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	list := make([]*NotificationChannel, 0, len(m.notifChannels))
+	for _, ch := range m.notifChannels {
+		list = append(list, clone(ch))
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	return list, nil
+}
+
+func (m *MemoryStore) GetNotificationChannel(ctx context.Context, id string) (*NotificationChannel, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ch, ok := m.notifChannels[id]
+	if !ok {
+		return nil, fmt.Errorf("notification channel %s not found", id)
+	}
+	return clone(ch), nil
+}
+
+func (m *MemoryStore) CreateNotificationChannel(ctx context.Context, ch *NotificationChannel) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, existing := range m.notifChannels {
+		if existing.Name == ch.Name {
+			return fmt.Errorf("a notification channel named %q already exists", ch.Name)
+		}
+	}
+	if ch.ID == "" {
+		ch.ID = uuid.New().String()
+	}
+	now := time.Now()
+	ch.CreatedAt = now
+	ch.UpdatedAt = now
+	stored := clone(ch)
+	stored.Topics = normalizeTopics(ch.Topics)
+	m.notifChannels[ch.ID] = stored
+	return nil
+}
+
+func (m *MemoryStore) UpdateNotificationChannel(ctx context.Context, ch *NotificationChannel) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	prev, ok := m.notifChannels[ch.ID]
+	if !ok {
+		return fmt.Errorf("notification channel %s not found", ch.ID)
+	}
+	ch.UpdatedAt = time.Now()
+	stored := clone(ch)
+	stored.Topics = normalizeTopics(ch.Topics)
+	// last_sent_at belongs to the dispatcher, matching PostgresStore.
+	stored.LastSentAt = prev.LastSentAt
+	m.notifChannels[ch.ID] = stored
+	return nil
+}
+
+func (m *MemoryStore) DeleteNotificationChannel(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.notifChannels, id)
+	return nil
+}
+
+func (m *MemoryStore) MarkNotificationChannelSent(ctx context.Context, id string, sentAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ch, ok := m.notifChannels[id]
+	if !ok {
+		return fmt.Errorf("notification channel %s not found", id)
+	}
+	ch.LastSentAt = &sentAt
+	return nil
 }
 
 func (m *MemoryStore) GetDashboardStats(ctx context.Context) (*DashboardStats, error) {
@@ -627,22 +870,33 @@ func (m *MemoryStore) GetDashboardStats(ctx context.Context) (*DashboardStats, e
 		TotalCertificates: int64(len(m.certificates)),
 		TotalCAs:          int64(len(m.caAuthorities)),
 	}
+	// Deliberately mirrors the SQL in PostgresStore.GetDashboardStats, clause
+	// for clause. The expired test comes first: previously an expired
+	// certificate matched the `days_remaining <= 30` branch and was reported as
+	// "expiring soon", so the dashboard showed nothing expired no matter how
+	// much of the estate already had.
 	for _, c := range m.certificates {
-		if c.Status == "ISSUED" && c.DaysRemaining > 30 {
-			stats.HealthyCerts++
-		} else if c.Status == "EXPIRING" || c.DaysRemaining <= 30 {
-			stats.ExpiringSoonCerts++
-		} else if c.Status == "EXPIRED" {
+		switch {
+		case c.Status == "EXPIRED" || c.DaysRemaining == 0:
 			stats.ExpiredCerts++
+		case c.Status == "EXPIRING" || (c.Status == "ISSUED" && c.DaysRemaining <= 30):
+			stats.ExpiringSoonCerts++
+		case c.Status == "ISSUED" && c.DaysRemaining > 30:
+			stats.HealthyCerts++
 		}
 	}
 	for _, ca := range m.caAuthorities {
-		if ca.Status == "HEALTHY" {
+		switch ca.Status {
+		case "HEALTHY":
 			stats.HealthyCAs++
-		} else if ca.Status == "WARNING" {
+		case "WARNING":
 			stats.WarningCAs++
-		} else {
+		case "CRITICAL":
 			stats.CriticalCAs++
+		case "EXPIRED":
+			stats.ExpiredCAs++
+		default:
+			stats.UnknownCAs++
 		}
 	}
 	return stats, nil

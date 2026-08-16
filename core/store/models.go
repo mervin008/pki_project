@@ -187,7 +187,78 @@ func (t *DisplayToken) IsUsable(now time.Time) bool {
 	return t.Status(now) == DisplayTokenActive
 }
 
+// NotificationChannel is a destination alerts are delivered to.
+type NotificationChannel struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	ChannelType string `json:"channel_type"` // email, slack, webhook
+	// ConfigEncrypted holds the sealed destination credentials — a Slack
+	// webhook URL, an SMTP password. Never serialized, for the same reason as
+	// CAAccount.ConfigEncrypted: a webhook URL is a bearer credential.
+	ConfigEncrypted string `json:"-"`
+	IsEnabled       bool   `json:"is_enabled"`
+	// SeverityThreshold is the minimum severity this channel delivers.
+	SeverityThreshold string `json:"severity_threshold"` // INFO, WARNING, CRITICAL
+	// Topics restricts which event topics reach this channel. Empty means all
+	// of them — a channel that matches nothing looks configured and delivers
+	// nothing, which is the failure this whole subsystem exists to avoid.
+	Topics     []string   `json:"topics"`
+	LastSentAt *time.Time `json:"last_sent_at,omitempty"`
+	CreatedBy  *string    `json:"created_by,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// Severity ordering, lowest first. Used to compare a channel's threshold
+// against an event.
+var severityRank = map[string]int{
+	"INFO":     0,
+	"WARNING":  1,
+	"CRITICAL": 2,
+}
+
+// Accepts reports whether an event of this topic and severity should be
+// delivered to the channel.
+//
+// A channel that is disabled accepts nothing. An unrecognised severity is
+// treated as CRITICAL rather than dropped: failing to deliver an alert because
+// its severity was spelled unexpectedly is the worse of the two mistakes.
+func (c *NotificationChannel) Accepts(topic, severity string) bool {
+	if !c.IsEnabled {
+		return false
+	}
+
+	rank, ok := severityRank[severity]
+	if !ok {
+		rank = severityRank["CRITICAL"]
+	}
+	threshold, ok := severityRank[c.SeverityThreshold]
+	if !ok {
+		threshold = severityRank["WARNING"]
+	}
+	if rank < threshold {
+		return false
+	}
+
+	if len(c.Topics) == 0 {
+		return true
+	}
+	for _, t := range c.Topics {
+		if t == topic {
+			return true
+		}
+	}
+	return false
+}
+
 // DashboardStats holds summary statistics for the overview dashboard.
+//
+// The five CA counts partition the estate: every CA lands in exactly one, and
+// they sum to TotalCAs. That matters more than it looks. Before this split,
+// one implementation folded UNKNOWN into CriticalCAs and the other dropped it
+// entirely, so the same database produced different numbers depending on which
+// store was running — and a dashboard whose figures do not add up is one nobody
+// trusts enough to act on.
 type DashboardStats struct {
 	TotalCertificates int64 `json:"total_certificates"`
 	HealthyCerts      int64 `json:"healthy_certs"`
@@ -197,5 +268,10 @@ type DashboardStats struct {
 	HealthyCAs        int64 `json:"healthy_cas"`
 	WarningCAs        int64 `json:"warning_cas"`
 	CriticalCAs       int64 `json:"critical_cas"`
-	TotalScans        int64 `json:"total_scans"`
+	ExpiredCAs        int64 `json:"expired_cas"`
+	// UnknownCAs counts authorities that have never been checked, or whose
+	// certificate could not be parsed. Shown rather than hidden: a CA nobody
+	// can assess is not a healthy one.
+	UnknownCAs int64 `json:"unknown_cas"`
+	TotalScans int64 `json:"total_scans"`
 }
