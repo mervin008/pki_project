@@ -136,6 +136,57 @@ type AuditLog struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// DisplayToken is a long-lived, read-only credential for an unattended screen.
+//
+// It exists because a browser's EventSource cannot set an Authorization header,
+// and because the alternative — an operator session left logged in on a machine
+// in a corridor — carries the authority to issue, revoke, and export private
+// keys. This credential carries none of that: the role it grants is hardcoded
+// to viewer and the middleware refuses it on anything but a GET.
+type DisplayToken struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// TokenHash is never serialized. It is not directly usable as a
+	// credential, but shipping it to API clients would let anyone who can read
+	// a list response confirm a guessed token offline.
+	TokenHash  string     `json:"-"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+	LastSeenIP *string    `json:"last_seen_ip,omitempty"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy  *string    `json:"revoked_by,omitempty"`
+	CreatedBy  *string    `json:"created_by,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+// Display token lifecycle states.
+const (
+	DisplayTokenActive  = "ACTIVE"
+	DisplayTokenExpired = "EXPIRED"
+	DisplayTokenRevoked = "REVOKED"
+)
+
+// Status reports the token's lifecycle state at the given instant.
+//
+// Revocation outranks expiry: a token that was revoked and has since also
+// expired should still read as revoked, because that is the fact someone
+// reviewing the list needs to see.
+func (t *DisplayToken) Status(now time.Time) string {
+	switch {
+	case t.RevokedAt != nil:
+		return DisplayTokenRevoked
+	case !t.ExpiresAt.After(now):
+		return DisplayTokenExpired
+	default:
+		return DisplayTokenActive
+	}
+}
+
+// IsUsable reports whether the token may authenticate a request.
+func (t *DisplayToken) IsUsable(now time.Time) bool {
+	return t.Status(now) == DisplayTokenActive
+}
+
 // DashboardStats holds summary statistics for the overview dashboard.
 type DashboardStats struct {
 	TotalCertificates int64 `json:"total_certificates"`

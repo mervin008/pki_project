@@ -30,6 +30,19 @@ const (
 	ContextUserID    = "user_id"
 	ContextUserEmail = "user_email"
 	ContextUserRole  = "user_role"
+	// ContextAuthMethod records how the caller proved who they are. It is what
+	// lets a later middleware tell "already authenticated" from "not yet
+	// looked at", and it is worth recording in its own right: an audit entry
+	// attributed to a corridor screen means something different from one
+	// attributed to a person.
+	ContextAuthMethod = "auth_method"
+)
+
+// Authentication methods recorded in ContextAuthMethod.
+const (
+	AuthMethodBearer       = "bearer"
+	AuthMethodAnonymous    = "anonymous"
+	AuthMethodDisplayToken = "display_token"
 )
 
 // UserClaims represents the claims inside an identity provider's JWT.
@@ -95,6 +108,15 @@ func NewAuthenticator(ctx context.Context, cfg config.AuthConfig) (*Authenticato
 // Middleware returns the Gin handler that authenticates each request.
 func (a *Authenticator) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// An earlier middleware may already have established an identity — in
+		// practice, a display token. That path grants nothing but read-only
+		// viewer access and enforces its own restrictions, so there is nothing
+		// left to check here.
+		if c.GetString(ContextAuthMethod) != "" {
+			c.Next()
+			return
+		}
+
 		authHeader := c.GetHeader("Authorization")
 
 		if authHeader == "" {
@@ -110,6 +132,7 @@ func (a *Authenticator) Middleware() gin.HandlerFunc {
 				c.Set(ContextUserID, "00000000-0000-0000-0000-000000000001")
 				c.Set(ContextUserEmail, "anonymous@certpilot.local")
 				c.Set(ContextUserRole, RoleAdmin)
+				c.Set(ContextAuthMethod, AuthMethodAnonymous)
 				c.Next()
 				return
 			}
@@ -140,6 +163,7 @@ func (a *Authenticator) Middleware() gin.HandlerFunc {
 		c.Set(ContextUserID, claims.Subject)
 		c.Set(ContextUserEmail, claims.Email)
 		c.Set(ContextUserRole, claims.Role(a.cfg.RoleClaim))
+		c.Set(ContextAuthMethod, AuthMethodBearer)
 		c.Next()
 	}
 }

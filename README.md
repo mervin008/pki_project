@@ -89,7 +89,8 @@ explicitly.
 | Automated renewal | ⚠️ | Works; no retry, backoff, or distributed locking yet |
 | CA health monitoring | ⚠️ | Scheduled sweep, expiry thresholds, and CRL freshness are real; the OCSP check is not a real OCSP request |
 | CA expiry alerting | ⚠️ | Threshold crossings recorded to the audit log; no Slack/email/PagerDuty delivery yet |
-| Live dashboard updates | ❌ | The UI polls. Server-Sent Events are Phase 3 |
+| Live dashboard updates | ⚠️ | The core streams over Server-Sent Events; the Vue frontend does not consume it yet |
+| Kiosk display tokens | ✅ | Read-only, viewer-scoped, expiring, revocable credentials for a wall display |
 | Policy engine | ⚠️ | `key_size`, `max_lifetime`, `ca_restriction`; other rule types are not implemented |
 | Discovery | ⚠️ | Single `host:port` scan only. No CIDR, CT logs, or cloud inventory |
 | Notifications | ⚠️ | Generic webhook only. No Slack, Teams, email, or PagerDuty |
@@ -205,6 +206,17 @@ read only from `app_metadata`, never `user_metadata`, which the user can write.
 Accepted signing algorithms are pinned. An invalid token is always rejected;
 there is no development fallback that grants admin.
 
+**Display tokens.** A wall display cannot use the bearer flow — `EventSource`
+cannot set headers — and the obvious workaround, leaving an operator session
+logged in on a machine in a corridor, hands that machine the authority to issue,
+revoke, and export private keys. A display token is a separate credential that
+carries none of it. The role it grants is the constant `viewer`; anything but a
+`GET` is refused on every route; private-key export, token enumeration, and the
+actor-attributed activity feed are refused by path, independently of the role
+gates those routes already carry. Tokens expire, are revocable, and record where
+and when they were last used. Only a SHA-256 is stored, so the raw value exists
+in exactly one response and nowhere else.
+
 **Production mode** refuses anonymous access, an insecure gateway channel, and a
 wildcard CORS origin. These are the settings that look harmless locally and
 travel to production unnoticed.
@@ -219,7 +231,14 @@ travel to production unnoticed.
   a responder as healthy when it should not.
 - `migrations/001_initial_schema.sql` references `auth.users` and `auth.jwt()`,
   which exist only on Supabase. It will not apply to vanilla PostgreSQL. The
-  Go store layer itself is plain `pgx` and has no Supabase dependency.
+  Go store layer itself is plain `pgx` and has no Supabase dependency. Later
+  migrations avoid the dependency.
+- Trusted proxies are not configured, so client IPs are taken from
+  `X-Forwarded-For` whoever sends it. Every recorded IP — audit entries and
+  display-token `last_seen_ip` alike — is therefore a hint, not evidence.
+- Display tokens are not rate-limited. The credential is 256 bits, so guessing
+  is not the concern; a stolen one being used heavily is, and nothing throttles
+  it beyond revocation.
 
 ## Post-quantum
 

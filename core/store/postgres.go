@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -681,6 +682,95 @@ func (s *PostgresStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 
 func (s *PostgresStore) DeletePolicy(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, "DELETE FROM public.policies WHERE id = $1", id)
+	return err
+}
+
+// ── Display Tokens ──────────────────────────────────────
+
+const displayTokenColumns = `id, name, token_hash, expires_at, last_seen_at,
+	host(last_seen_ip), revoked_at, revoked_by, created_by, created_at`
+
+func scanDisplayToken(row pgx.Row) (*DisplayToken, error) {
+	t := &DisplayToken{}
+	err := row.Scan(&t.ID, &t.Name, &t.TokenHash, &t.ExpiresAt, &t.LastSeenAt,
+		&t.LastSeenIP, &t.RevokedAt, &t.RevokedBy, &t.CreatedBy, &t.CreatedAt)
+	return t, err
+}
+
+func (s *PostgresStore) ListDisplayTokens(ctx context.Context) ([]*DisplayToken, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+displayTokenColumns+" FROM public.display_tokens ORDER BY created_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tokens := make([]*DisplayToken, 0)
+	for rows.Next() {
+		t, err := scanDisplayToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
+}
+
+// GetDisplayTokenByHash resolves a presented token.
+//
+// The equality is on the hash rather than on the secret, so the query plan
+// leaks nothing an attacker can steer: to influence the comparison they would
+// already need a preimage of a 256-bit CSPRNG output.
+func (s *PostgresStore) GetDisplayTokenByHash(ctx context.Context, tokenHash string) (*DisplayToken, error) {
+	t, err := scanDisplayToken(s.pool.QueryRow(ctx,
+		"SELECT "+displayTokenColumns+" FROM public.display_tokens WHERE token_hash = $1", tokenHash))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("display token not found")
+	}
+	return t, err
+}
+
+func (s *PostgresStore) CreateDisplayToken(ctx context.Context, t *DisplayToken) error {
+	query := `
+		INSERT INTO public.display_tokens (name, token_hash, expires_at, created_by)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, created_at
+	`
+	return s.pool.QueryRow(ctx, query, t.Name, t.TokenHash, t.ExpiresAt, t.CreatedBy).
+		Scan(&t.ID, &t.CreatedAt)
+}
+
+func (s *PostgresStore) RevokeDisplayToken(ctx context.Context, id string, revokedBy *string) error {
+	// `revoked_at is null` keeps the original revocation time and actor: who
+	// first pulled the credential is the answer an incident review needs, not
+	// whoever clicked the button again afterwards.
+	tag, err := s.pool.Exec(ctx,
+		"UPDATE public.display_tokens SET revoked_at = now(), revoked_by = $2 WHERE id = $1 AND revoked_at is null",
+		id, revokedBy)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		// Either it does not exist or it was already revoked. Confirm which,
+		// so a caller revoking a token that is already dead is not told it
+		// failed.
+		var exists bool
+		if err := s.pool.QueryRow(ctx,
+			"SELECT true FROM public.display_tokens WHERE id = $1", id).Scan(&exists); err != nil {
+			return fmt.Errorf("display token %s not found", id)
+		}
+	}
+	return nil
+}
+
+func (s *PostgresStore) TouchDisplayToken(ctx context.Context, id string, seenAt time.Time, ip string) error {
+	var addr *string
+	if ip != "" {
+		addr = &ip
+	}
+	_, err := s.pool.Exec(ctx,
+		"UPDATE public.display_tokens SET last_seen_at = $2, last_seen_ip = coalesce($3::inet, last_seen_ip) WHERE id = $1",
+		id, seenAt, addr)
 	return err
 }
 

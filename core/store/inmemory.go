@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +20,7 @@ type MemoryStore struct {
 	caAccounts    map[string]*CAAccount
 	targets       map[string]*DeploymentTarget
 	policies      map[string]*Policy
+	displayTokens map[string]*DisplayToken
 	auditLogs     []*AuditLog
 }
 
@@ -187,9 +190,13 @@ func NewMemoryStore() *MemoryStore {
 			accSelfSignedID: accSelfSigned,
 			accACMEID:       accACME,
 		},
-		targets:   make(map[string]*DeploymentTarget),
-		policies:  map[string]*Policy{polID: policy1},
-		auditLogs: []*AuditLog{log1},
+		targets:  make(map[string]*DeploymentTarget),
+		policies: map[string]*Policy{polID: policy1},
+		// Deliberately empty. Every other map here carries sample data so a
+		// first run has something to render, but a seeded credential is a
+		// credential someone forgets to remove.
+		displayTokens: make(map[string]*DisplayToken),
+		auditLogs:     []*AuditLog{log1},
 	}
 }
 
@@ -494,6 +501,97 @@ func (m *MemoryStore) DeletePolicy(ctx context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.policies, id)
+	return nil
+}
+
+// ── Display Tokens ──────────────────────────────────────
+
+func (m *MemoryStore) ListDisplayTokens(ctx context.Context) ([]*DisplayToken, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*DisplayToken, 0, len(m.displayTokens))
+	for _, t := range m.displayTokens {
+		clone := *t
+		out = append(out, &clone)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// GetDisplayTokenByHash finds a token by its hash.
+//
+// The comparison walks every token in constant time rather than indexing a map.
+// A map lookup would return as soon as the first differing byte was found, and
+// with a handful of tokens the difference is measurable; the linear scan costs
+// nothing at this scale. Postgres reaches the same place by comparing a hash
+// rather than the secret itself.
+func (m *MemoryStore) GetDisplayTokenByHash(ctx context.Context, tokenHash string) (*DisplayToken, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var found *DisplayToken
+	want := []byte(tokenHash)
+	for _, t := range m.displayTokens {
+		if subtle.ConstantTimeCompare([]byte(t.TokenHash), want) == 1 {
+			found = t
+		}
+	}
+	if found == nil {
+		return nil, fmt.Errorf("display token not found")
+	}
+	clone := *found
+	return &clone, nil
+}
+
+func (m *MemoryStore) CreateDisplayToken(ctx context.Context, t *DisplayToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, existing := range m.displayTokens {
+		if existing.Name == t.Name {
+			return fmt.Errorf("a display token named %q already exists", t.Name)
+		}
+	}
+	if t.ID == "" {
+		t.ID = uuid.New().String()
+	}
+	t.CreatedAt = time.Now()
+	clone := *t
+	m.displayTokens[t.ID] = &clone
+	return nil
+}
+
+func (m *MemoryStore) RevokeDisplayToken(ctx context.Context, id string, revokedBy *string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	t, ok := m.displayTokens[id]
+	if !ok {
+		return fmt.Errorf("display token %s not found", id)
+	}
+	// Revoking twice is not an error. The caller wants the token dead, and it
+	// is; failing here would only encourage retry loops.
+	if t.RevokedAt == nil {
+		now := time.Now()
+		t.RevokedAt = &now
+		t.RevokedBy = revokedBy
+	}
+	return nil
+}
+
+func (m *MemoryStore) TouchDisplayToken(ctx context.Context, id string, seenAt time.Time, ip string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	t, ok := m.displayTokens[id]
+	if !ok {
+		return fmt.Errorf("display token %s not found", id)
+	}
+	t.LastSeenAt = &seenAt
+	if ip != "" {
+		t.LastSeenIP = &ip
+	}
 	return nil
 }
 

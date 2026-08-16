@@ -52,8 +52,15 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	discHandler := NewDiscoveryHandler(deps.Store, deps.Scanner)
 	policyHandler := NewPolicyHandler(deps.Store)
 	eventsHandler := NewEventsHandler(deps.Store, deps.Broker)
+	displayHandler := NewDisplayTokenHandler(deps.Store)
 
 	v1 := engine.Group("/api/v1")
+	// Display tokens are resolved first, and only take effect when no
+	// Authorization header was sent. The middleware itself refuses anything
+	// that is not a GET and refuses the sensitive read paths outright, so the
+	// read-only property does not depend on every route below getting its role
+	// gate right.
+	v1.Use(middleware.DisplayTokenAuth(deps.Store))
 	v1.Use(deps.Auth.Middleware())
 	{
 		// ── Live event stream ──
@@ -95,6 +102,14 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// ── Discovery ──
 		v1.POST("/discovery/scan", middleware.RequireRole(middleware.RoleOperator), discHandler.ScanEndpoint)
 		v1.POST("/discovery/import", middleware.RequireRole(middleware.RoleOperator), discHandler.Import)
+
+		// ── Display Tokens ──
+		// Admin-only throughout: minting a credential that authenticates to
+		// the API is an administrative act even though what it grants is
+		// read-only.
+		v1.GET("/display-tokens", middleware.RequireRole(middleware.RoleAdmin), displayHandler.List)
+		v1.POST("/display-tokens", middleware.RequireRole(middleware.RoleAdmin), displayHandler.Create)
+		v1.DELETE("/display-tokens/:id", middleware.RequireRole(middleware.RoleAdmin), displayHandler.Revoke)
 
 		// ── Policies ──
 		v1.GET("/policies", policyHandler.List)

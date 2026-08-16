@@ -61,23 +61,54 @@ are recorded to the audit log so they reach the dashboard instead of stdout.
 
 ---
 
-## Next
+## In progress
 
 ### Phase 3 — A monitoring surface a team can leave on a screen
 
 The largest gap between what exists and what a central PKI team needs. The data
 is already being collected; almost none of it reaches a human unprompted.
 
-- **Live updates.** Server-Sent Events from the core so the dashboard reflects
-  reality without a refresh. Polling is the wrong shape for a wall display.
+| Step | | |
+|:---|:---|:---|
+| 0 | Truth pass over the existing dashboard | ✅ |
+| 1 | In-process event broker | ✅ |
+| 2 | `GET /api/v1/events` — Server-Sent Events | ✅ |
+| 3 | Kiosk display tokens | ✅ |
+| 4 | Store filtering: audit log by action, CA filters, an index | |
+| 5 | Frontend event stream and connection indicator | |
+| 6 | CA health view, then fullscreen wall mode | |
+| 7 | Alert delivery: Slack, webhook, SMTP | |
+| 8 | Acknowledgement and ownership | |
+
+**Step 0** was a prerequisite rather than cleanup: the dashboard computed CA
+distribution with `Math.random()` inside a `computed`, fell back to invented
+numbers when the API returned nothing, and bound field names the backend never
+emitted. Two forms had never once worked. Live updates over that would have
+produced a dashboard that flickered *and* lied.
+
+**Steps 1–2** put changes on a stream. The broker drops the oldest event for a
+slow consumer rather than applying backpressure, so a wall display on a flaky
+link can never stall the CA health sweep; a client that falls behind is told to
+resynchronise rather than fed deltas onto a stale base.
+
+**Step 3** made the stream reachable from a screen nobody is sitting at, without
+that screen holding credentials worth stealing.
+
+The rest:
+
+- **A frontend that consumes the stream.** The core streams; nothing in
+  `frontend/src` opens an `EventSource` yet. Connection state has to be a
+  first-class UI element, because a dashboard that stops updating must look
+  broken rather than healthy — a frozen screen showing green is worse than no
+  screen at all.
 - **CA health view.** Every CA, its expiry countdown, chain position, CRL
   freshness, and issuance volume — sorted by urgency, readable across a room.
 - **Chain visualisation.** Root → intermediate → issuing, with health carried up
   the tree, because a healthy issuing CA under an expiring root is not healthy.
-- **Alerting that reaches people.** Slack, Teams, email, PagerDuty. Today
-  `notifications/dispatcher.go` can POST a webhook and nothing calls it. An
-  alert that only lands in an audit table is only marginally better than a log
-  line.
+- **Alerting that reaches people.** Slack, email over SMTP, and a signed generic
+  webhook. Today `notifications/dispatcher.go` can POST a webhook and nothing
+  calls it. An alert that only lands in an audit table is only marginally better
+  than a log line.
 - **Acknowledgement and ownership.** Who owns this CA, who was told, who
   silenced it and until when. Without this, an alerting dashboard becomes
   wallpaper within a month.

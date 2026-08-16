@@ -118,7 +118,9 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 
 	// 6. HTTP router.
 	engine := gin.New()
-	engine.Use(gin.Logger())
+	// Not gin.Logger(): it writes the full request target, and display tokens
+	// travel in the query string because EventSource cannot set a header.
+	engine.Use(middleware.RequestLogger())
 
 	api.SetupRouter(engine, api.RouterDeps{
 		Store:         st,
