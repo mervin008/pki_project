@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/store"
 )
 
@@ -29,7 +30,7 @@ func alertsFrom(t *testing.T, ca *store.CAAuthority, days int) []map[string]any 
 	st := store.NewMemoryStore()
 	t.Cleanup(st.Close)
 
-	m := NewCAMonitor(st)
+	m := NewCAMonitor(st, nil)
 	m.evaluateAlertThresholds(context.Background(), ca, days, time.Now())
 
 	logs, _, err := st.ListAuditLogs(context.Background(), 100, 0)
@@ -119,7 +120,7 @@ func TestAlertIsNotRepeatedAtTheSameThreshold(t *testing.T) {
 	st := store.NewMemoryStore()
 	defer st.Close()
 
-	m := NewCAMonitor(st)
+	m := NewCAMonitor(st, nil)
 	ca := caIn(25, "")
 
 	for i := 0; i < 5; i++ {
@@ -147,7 +148,7 @@ func TestAlertFiresAgainAtATighterThreshold(t *testing.T) {
 	st := store.NewMemoryStore()
 	defer st.Close()
 
-	m := NewCAMonitor(st)
+	m := NewCAMonitor(st, nil)
 	ca := caIn(100, "")
 
 	// Crosses 180, then 90, then 30 as time passes.
@@ -197,7 +198,7 @@ func TestCustomThresholds(t *testing.T) {
 func TestStatusReflectsRemainingLife(t *testing.T) {
 	st := store.NewMemoryStore()
 	defer st.Close()
-	m := NewCAMonitor(st)
+	m := NewCAMonitor(st, nil)
 
 	cases := map[int]string{
 		-5:  "EXPIRED",
@@ -225,10 +226,149 @@ func TestStopIsIdempotent(t *testing.T) {
 	st := store.NewMemoryStore()
 	defer st.Close()
 
-	m := NewCAMonitor(st)
+	m := NewCAMonitor(st, nil)
 	m.Start(time.Hour)
 
 	// A double Stop must not panic on a closed channel.
 	m.Stop()
 	m.Stop()
+}
+
+// ── Event publishing ──────────────────────────────────────
+
+// collect drains a subscription without blocking.
+func collect(sub *events.Subscription) []events.Event {
+	var out []events.Event
+	for {
+		select {
+		case evt, ok := <-sub.Events():
+			if !ok {
+				return out
+			}
+			out = append(out, evt)
+		default:
+			return out
+		}
+	}
+}
+
+func TestThresholdCrossingPublishesAnEvent(t *testing.T) {
+	st := store.NewMemoryStore()
+	defer st.Close()
+
+	broker := events.NewBroker()
+	defer broker.Stop()
+	sub := broker.Subscribe(events.TopicCAExpiryAlert)
+	defer sub.Close()
+
+	m := NewCAMonitor(st, broker)
+	m.evaluateAlertThresholds(context.Background(), caIn(10, ""), 10, time.Now())
+
+	got := collect(sub)
+	if len(got) != 1 {
+		t.Fatalf("published %d events, want 1", len(got))
+	}
+	if got[0].Severity != events.SeverityCritical {
+		t.Errorf("severity = %q, want CRITICAL inside 30 days", got[0].Severity)
+	}
+	if got[0].EntityID != "ca-1" {
+		t.Errorf("entity = %q, want the CA id", got[0].EntityID)
+	}
+
+	payload, ok := got[0].Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("payload type %T, want map", got[0].Payload)
+	}
+	if payload["threshold"] != 14 {
+		t.Errorf("threshold = %v, want the tightest crossed (14)", payload["threshold"])
+	}
+	if payload["days_remaining"] != 10 {
+		t.Errorf("days_remaining = %v, want 10", payload["days_remaining"])
+	}
+}
+
+// "HEALTHY -> WARNING" is only detectable if the prior status is captured
+// before the record is overwritten. Without it the dashboard sees the end
+// state and cannot tell a fresh degradation from a steady one.
+func TestStatusTransitionIsPublished(t *testing.T) {
+	st := store.NewMemoryStore()
+	defer st.Close()
+
+	broker := events.NewBroker()
+	defer broker.Stop()
+	sub := broker.Subscribe(events.TopicCAHealth)
+	defer sub.Close()
+
+	ca := &store.CAAuthority{
+		Name:     "Transitioning CA",
+		CAType:   "ISSUING",
+		Status:   "HEALTHY",
+		NotAfter: time.Now().Add(100 * 24 * time.Hour),
+	}
+	if err := st.CreateCAAuthority(context.Background(), ca); err != nil {
+		t.Fatalf("CreateCAAuthority: %v", err)
+	}
+
+	m := NewCAMonitor(st, broker)
+	if err := m.CheckCA(context.Background(), ca); err != nil {
+		t.Fatalf("CheckCA: %v", err)
+	}
+
+	got := collect(sub)
+	if len(got) != 1 {
+		t.Fatalf("published %d events, want 1 for HEALTHY -> WARNING", len(got))
+	}
+
+	payload := got[0].Payload.(map[string]any)
+	if payload["previous_status"] != "HEALTHY" {
+		t.Errorf("previous_status = %v, want HEALTHY", payload["previous_status"])
+	}
+	if payload["status"] != "WARNING" {
+		t.Errorf("status = %v, want WARNING at 100 days", payload["status"])
+	}
+	if got[0].Severity != events.SeverityWarning {
+		t.Errorf("severity = %q, want WARNING", got[0].Severity)
+	}
+}
+
+// A CA whose status has not moved must stay quiet, or a six-hourly sweep
+// republishes everything and the stream becomes noise.
+func TestUnchangedStatusPublishesNothing(t *testing.T) {
+	st := store.NewMemoryStore()
+	defer st.Close()
+
+	broker := events.NewBroker()
+	defer broker.Stop()
+	sub := broker.Subscribe(events.TopicCAHealth)
+	defer sub.Close()
+
+	ca := &store.CAAuthority{
+		Name:     "Steady CA",
+		CAType:   "ROOT",
+		Status:   "HEALTHY",
+		NotAfter: time.Now().Add(1000 * 24 * time.Hour),
+	}
+	if err := st.CreateCAAuthority(context.Background(), ca); err != nil {
+		t.Fatalf("CreateCAAuthority: %v", err)
+	}
+
+	m := NewCAMonitor(st, broker)
+	for i := 0; i < 3; i++ {
+		if err := m.CheckCA(context.Background(), ca); err != nil {
+			t.Fatalf("CheckCA: %v", err)
+		}
+	}
+
+	if got := collect(sub); len(got) != 0 {
+		t.Fatalf("published %d events for an unchanged CA, want 0", len(got))
+	}
+}
+
+// A nil broker is a supported configuration and must not panic.
+func TestNilBrokerIsSafe(t *testing.T) {
+	st := store.NewMemoryStore()
+	defer st.Close()
+
+	m := NewCAMonitor(st, nil)
+	m.evaluateAlertThresholds(context.Background(), caIn(5, ""), 5, time.Now())
 }

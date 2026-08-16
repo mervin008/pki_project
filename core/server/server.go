@@ -13,6 +13,7 @@ import (
 	"github.com/certpilot/certpilot/core/engine/pki"
 	"github.com/certpilot/certpilot/core/engine/policy"
 	"github.com/certpilot/certpilot/core/engine/renewal"
+	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/pluginmgr"
 	"github.com/certpilot/certpilot/core/server/middleware"
 	"github.com/certpilot/certpilot/core/store"
@@ -28,6 +29,7 @@ type Server struct {
 	store        store.Store
 	pluginMgr    *pluginmgr.Manager
 	caMonitor    *pki.CAMonitor
+	broker       *events.Broker
 	renewalSched *renewal.Scheduler
 	cfg          *config.CoreConfig
 }
@@ -94,9 +96,15 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	}
 
 	// 4. Engines.
-	caMonitor := pki.NewCAMonitor(st)
+	//
+	// The broker fans changes out to the dashboard stream and the notification
+	// dispatcher. Nothing in the publish path can be blocked by a consumer, so
+	// a stalled screen cannot stall the CA health sweep.
+	broker := events.NewBroker()
+
+	caMonitor := pki.NewCAMonitor(st, broker)
 	chainResolver := pki.NewChainResolver(st)
-	renewalExec := renewal.NewExecutor(st, pm, keyring)
+	renewalExec := renewal.NewExecutor(st, pm, keyring, broker)
 	renewalSched := renewal.NewScheduler(st, renewalExec, cfg.Renewal.DefaultLeadDays)
 	policyEng := policy.NewEngine(st)
 	scanner := discovery.NewScanner(st)
@@ -121,6 +129,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		PolicyEngine:  policyEng,
 		Scanner:       scanner,
 		Keyring:       keyring,
+		Broker:        broker,
 		Auth:          authenticator,
 		Config:        cfg,
 	})
@@ -140,6 +149,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		store:        st,
 		pluginMgr:    pm,
 		caMonitor:    caMonitor,
+		broker:       broker,
 		renewalSched: renewalSched,
 		cfg:          cfg,
 	}, nil
@@ -201,6 +211,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("shutting down CertPilot Core")
 	s.renewalSched.Stop()
 	s.caMonitor.Stop()
+	// Before the HTTP shutdown, so in-flight event-stream handlers wake and
+	// return rather than holding the grace period open for its full duration.
+	s.broker.Stop()
 	s.pluginMgr.Close()
 	s.store.Close()
 	return s.httpServer.Shutdown(ctx)

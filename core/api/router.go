@@ -5,6 +5,7 @@ import (
 	"github.com/certpilot/certpilot/core/engine/pki"
 	"github.com/certpilot/certpilot/core/engine/policy"
 	"github.com/certpilot/certpilot/core/engine/renewal"
+	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/pluginmgr"
 	"github.com/certpilot/certpilot/core/server/middleware"
 	"github.com/certpilot/certpilot/core/store"
@@ -28,6 +29,7 @@ type RouterDeps struct {
 	PolicyEngine  *policy.Engine
 	Scanner       *discovery.Scanner
 	Keyring       *secrets.Keyring
+	Broker        *events.Broker
 	Auth          *middleware.Authenticator
 	Config        *config.CoreConfig
 }
@@ -43,7 +45,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		c.JSON(200, gin.H{"status": "ok", "service": "certpilot-core"})
 	})
 
-	certHandler := NewCertificateHandler(deps.Store, deps.PluginMgr, deps.RenewalExec, deps.PolicyEngine, deps.Keyring)
+	certHandler := NewCertificateHandler(deps.Store, deps.PluginMgr, deps.RenewalExec, deps.PolicyEngine, deps.Keyring, deps.Broker)
 	caHandler := NewCAHandler(deps.Store, deps.CAMonitor, deps.ChainResolver)
 	caAccHandler := NewCAAccountHandler(deps.Store, deps.PluginMgr, deps.Keyring)
 	dashHandler := NewDashboardHandler(deps.Store)

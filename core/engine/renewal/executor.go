@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/pluginmgr"
 	"github.com/certpilot/certpilot/core/store"
 	providerv1 "github.com/certpilot/certpilot/pkg/pb/provider/v1"
@@ -19,14 +20,17 @@ type Executor struct {
 	store     store.Store
 	pluginMgr *pluginmgr.Manager
 	keyring   *secrets.Keyring
+	broker    *events.Broker
 }
 
-// NewExecutor creates a new renewal executor.
-func NewExecutor(s store.Store, pm *pluginmgr.Manager, kr *secrets.Keyring) *Executor {
+// NewExecutor creates a new renewal executor. The broker may be nil, in which
+// case no events are published.
+func NewExecutor(s store.Store, pm *pluginmgr.Manager, kr *secrets.Keyring, broker *events.Broker) *Executor {
 	return &Executor{
 		store:     s,
 		pluginMgr: pm,
 		keyring:   kr,
+		broker:    broker,
 	}
 }
 
@@ -148,6 +152,19 @@ func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.
 			cert.CommonName, cert.SerialNumber, notAfter.Format(time.RFC3339), cert.RenewalCount),
 	})
 
+	e.broker.Publish(events.Event{
+		Topic:    events.TopicCertRenewed,
+		Severity: events.SeverityInfo,
+		EntityID: cert.ID,
+		Payload: map[string]any{
+			"common_name":    cert.CommonName,
+			"serial_number":  cert.SerialNumber,
+			"days_remaining": cert.DaysRemaining,
+			"not_after":      notAfter.Format(time.RFC3339),
+			"renewal_count":  cert.RenewalCount,
+		},
+	})
+
 	slog.Info("certificate renewed successfully",
 		"cert_id", cert.ID,
 		"common_name", cert.CommonName,
@@ -174,6 +191,19 @@ func (e *Executor) recordFailure(ctx context.Context, cert *store.Certificate, c
 		EntityType: "certificate",
 		EntityID:   &cert.ID,
 		Details:    fmt.Sprintf(`{"error": %q, "cn": %q}`, errMsg, cert.CommonName),
+	})
+
+	// A failed renewal is a certificate on its way to expiry with nobody
+	// watching, so it is announced at critical severity rather than logged.
+	e.broker.Publish(events.Event{
+		Topic:    events.TopicCertRenewFail,
+		Severity: events.SeverityCritical,
+		EntityID: cert.ID,
+		Payload: map[string]any{
+			"common_name":    cert.CommonName,
+			"days_remaining": cert.DaysRemaining,
+			"error":          errMsg,
+		},
 	})
 
 	return fmt.Errorf("renewal failed for %s: %w", cert.CommonName, cause)

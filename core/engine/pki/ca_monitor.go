@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/store"
 	"github.com/certpilot/certpilot/pkg/x509util"
 )
@@ -21,15 +22,18 @@ import (
 // CAMonitor periodically inspects all registered CA authorities.
 type CAMonitor struct {
 	store      store.Store
+	broker     *events.Broker
 	httpClient *http.Client
 	stopCh     chan struct{}
 	stopOnce   sync.Once
 }
 
-// NewCAMonitor creates a new CA health monitor.
-func NewCAMonitor(s store.Store) *CAMonitor {
+// NewCAMonitor creates a new CA health monitor. The broker may be nil, in which
+// case no events are published.
+func NewCAMonitor(s store.Store, broker *events.Broker) *CAMonitor {
 	return &CAMonitor{
-		store: s,
+		store:  s,
+		broker: broker,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -101,6 +105,12 @@ func (m *CAMonitor) CheckAllCAs(ctx context.Context) error {
 func (m *CAMonitor) CheckCA(ctx context.Context, ca *store.CAAuthority) error {
 	now := time.Now()
 
+	// Remember where this CA started so a status change can be reported as a
+	// transition. Without the prior value "HEALTHY -> WARNING" is invisible:
+	// the record is overwritten in place and the dashboard only ever sees the
+	// end state, with no way to tell a fresh degradation from a steady one.
+	previousStatus := ca.Status
+
 	// 1. Parse CA certificate if PEM is present
 	if ca.CertificatePEM != "" {
 		certInfo, err := x509util.ParseCertificatePEM([]byte(ca.CertificatePEM))
@@ -157,7 +167,42 @@ func (m *CAMonitor) CheckCA(ctx context.Context, ca *store.CAAuthority) error {
 	m.evaluateAlertThresholds(ctx, ca, daysRemaining, now)
 
 	// 6. Persist updates
-	return m.store.UpdateCAAuthority(ctx, ca)
+	if err := m.store.UpdateCAAuthority(ctx, ca); err != nil {
+		return err
+	}
+
+	// 7. Announce a status change. Published after the write so a subscriber
+	// that reacts by re-reading the CA sees the state the event describes.
+	if ca.Status != previousStatus {
+		severity := events.SeverityInfo
+		switch ca.Status {
+		case "CRITICAL", "EXPIRED":
+			severity = events.SeverityCritical
+		case "WARNING":
+			severity = events.SeverityWarning
+		}
+
+		slog.Info("CA status changed",
+			"ca_name", ca.Name, "from", previousStatus, "to", ca.Status,
+			"days_remaining", daysRemaining)
+
+		m.broker.Publish(events.Event{
+			Topic:    events.TopicCAHealth,
+			Severity: severity,
+			EntityID: ca.ID,
+			Payload: map[string]any{
+				"ca_name":         ca.Name,
+				"ca_type":         ca.CAType,
+				"previous_status": previousStatus,
+				"status":          ca.Status,
+				"days_remaining":  daysRemaining,
+				"is_crl_fresh":    ca.IsCRLFresh,
+				"not_after":       ca.NotAfter.Format(time.RFC3339),
+			},
+		})
+	}
+
+	return nil
 }
 
 func (m *CAMonitor) checkCRL(ctx context.Context, crlURL string) (bool, error) {
@@ -269,6 +314,20 @@ func (m *CAMonitor) evaluateAlertThresholds(ctx context.Context, ca *store.CAAut
 			Details: fmt.Sprintf(
 				`{"ca_name": %q, "ca_type": %q, "days_remaining": %d, "threshold": %d, "severity": %q, "not_after": %q}`,
 				ca.Name, ca.CAType, daysRemaining, t, severity, ca.NotAfter.Format(time.RFC3339)),
+		})
+
+		m.broker.Publish(events.Event{
+			Topic:    events.TopicCAExpiryAlert,
+			Severity: severity,
+			EntityID: ca.ID,
+			Payload: map[string]any{
+				"ca_name":        ca.Name,
+				"ca_type":        ca.CAType,
+				"days_remaining": daysRemaining,
+				"threshold":      t,
+				"severity":       severity,
+				"not_after":      ca.NotAfter.Format(time.RFC3339),
+			},
 		})
 
 		ca.LastAlertThreshold = &t

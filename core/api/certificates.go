@@ -7,6 +7,7 @@ import (
 
 	"github.com/certpilot/certpilot/core/engine/policy"
 	"github.com/certpilot/certpilot/core/engine/renewal"
+	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/pluginmgr"
 	"github.com/certpilot/certpilot/core/server/middleware"
 	"github.com/certpilot/certpilot/core/store"
@@ -23,16 +24,18 @@ type CertificateHandler struct {
 	executor  *renewal.Executor
 	policyEng *policy.Engine
 	keyring   *secrets.Keyring
+	broker    *events.Broker
 }
 
 // NewCertificateHandler creates a new handler.
-func NewCertificateHandler(s store.Store, pm *pluginmgr.Manager, exec *renewal.Executor, pe *policy.Engine, kr *secrets.Keyring) *CertificateHandler {
+func NewCertificateHandler(s store.Store, pm *pluginmgr.Manager, exec *renewal.Executor, pe *policy.Engine, kr *secrets.Keyring, broker *events.Broker) *CertificateHandler {
 	return &CertificateHandler{
 		store:     s,
 		pluginMgr: pm,
 		executor:  exec,
 		policyEng: pe,
 		keyring:   kr,
+		broker:    broker,
 	}
 }
 
@@ -250,6 +253,19 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		ActorEmail: &userEmail,
 		Details: fmt.Sprintf(`{"cn": %q, "gateway": %q, "serial": %q, "not_after": %q}`,
 			certRecord.CommonName, gw.Name, certRecord.SerialNumber, notAfter.Format(time.RFC3339)),
+	})
+
+	h.broker.Publish(events.Event{
+		Topic:    events.TopicCertIssued,
+		Severity: events.SeverityInfo,
+		EntityID: certRecord.ID,
+		Payload: map[string]any{
+			"common_name":    certRecord.CommonName,
+			"serial_number":  certRecord.SerialNumber,
+			"days_remaining": certRecord.DaysRemaining,
+			"not_after":      notAfter.Format(time.RFC3339),
+			"gateway":        gw.Name,
+		},
 	})
 
 	if len(violations) > 0 {
