@@ -480,7 +480,7 @@ func (m *MemoryStore) DeleteCAAuthority(ctx context.Context, id string) error {
 func (m *MemoryStore) GetCAChain(ctx context.Context, id string) ([]*CAAuthority, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	var chain []*CAAuthority
+	chain := []*CAAuthority{}
 	currID := id
 	visited := make(map[string]bool)
 

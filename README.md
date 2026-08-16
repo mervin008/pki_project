@@ -264,11 +264,14 @@ travel to production unnoticed.
 - Display tokens are not rate-limited. The credential is 256 bits, so guessing
   is not the concern; a stolen one being used heavily is, and nothing throttles
   it beyond revocation.
-- `PostgresStore` is exercised by review and by the compile checker, not by
-  tests. The store test suite runs against the in-memory implementation, which
-  the two are written to keep in step — filters evaluate the same predicates and
-  the dashboard buckets are defined clause for clause — but nothing yet proves
-  they agree. A container-backed suite is the fix and is not written.
+- `PostgresStore` has now been exercised end to end against a real PostgreSQL 17
+  database — migrations, issuance, renewal with key rotation, CA health sweeps,
+  expiry alerting, filtering, and private key export all verified — but it is
+  still not covered by automated tests. The suite runs against the in-memory
+  implementation. That gap is not theoretical: the manual run turned up four
+  defects the in-memory store could not express, including one that made
+  certificate issuance fail outright. A container-backed suite is the fix and is
+  not written.
 - `/dashboard/activity` is still available to any authenticated reader,
   including `viewer`. Kiosk display tokens are refused it outright, since audit
   entries carry actor identity and a corridor screen should not name who deleted

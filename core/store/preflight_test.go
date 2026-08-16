@@ -1,0 +1,82 @@
+package store
+
+import "testing"
+
+// The RLS rule is the one this check turns on, and both ways of getting it
+// wrong are bad in different ways. Too permissive and the core serves an empty
+// dashboard that looks like a healthy estate; too strict and it refuses to
+// start against a database it can read perfectly well.
+//
+// Verified live against Supabase for the BYPASSRLS case, which is how the
+// documented setup connects (the `postgres` role there has rolbypassrls). The
+// non-owner cases are covered here rather than by creating a login role on a
+// real project.
+func TestRLSBlockedTables(t *testing.T) {
+	tables := func(info tableInfo) map[string]tableInfo {
+		m := map[string]tableInfo{}
+		for _, name := range requiredTables {
+			m[name] = info
+		}
+		return m
+	}
+
+	cases := []struct {
+		name        string
+		info        tableInfo
+		bypassesRLS bool
+		wantBlocked bool
+	}{
+		{
+			name:        "owner of tables with RLS enabled but not forced reads everything",
+			info:        tableInfo{rowSecurity: true, isOwner: true},
+			wantBlocked: false,
+		},
+		{
+			// How the documented Supabase setup connects.
+			name:        "BYPASSRLS reads everything even when RLS is forced",
+			info:        tableInfo{rowSecurity: true, forceRowSecurity: true, isOwner: false},
+			bypassesRLS: true,
+			wantBlocked: false,
+		},
+		{
+			// The failure this check exists for: a plausible-looking, entirely
+			// empty dashboard.
+			name:        "non-owner without BYPASSRLS is filtered",
+			info:        tableInfo{rowSecurity: true, isOwner: false},
+			wantBlocked: true,
+		},
+		{
+			// FORCE applies RLS to the owner too, which is the trap in
+			// "but I connected as the owner".
+			name:        "owner is filtered when RLS is forced",
+			info:        tableInfo{rowSecurity: true, forceRowSecurity: true, isOwner: true},
+			wantBlocked: true,
+		},
+		{
+			name:        "RLS disabled is never blocked, whoever connects",
+			info:        tableInfo{rowSecurity: false, isOwner: false},
+			wantBlocked: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			blocked := rlsBlockedTables(tables(tc.info), tc.bypassesRLS)
+			if tc.wantBlocked && len(blocked) == 0 {
+				t.Error("expected the connection to be refused, but no table was reported blocked")
+			}
+			if !tc.wantBlocked && len(blocked) > 0 {
+				t.Errorf("expected the connection to be allowed, but %v were reported blocked", blocked)
+			}
+		})
+	}
+}
+
+// A table nobody has created yet is the migration check's business. Reporting
+// it here as well would bury "run make migrate" under an RLS message that does
+// not apply.
+func TestRLSCheckIgnoresAbsentTables(t *testing.T) {
+	if blocked := rlsBlockedTables(map[string]tableInfo{}, false); len(blocked) > 0 {
+		t.Errorf("missing tables should not be reported as RLS-blocked, got %v", blocked)
+	}
+}

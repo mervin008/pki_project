@@ -61,6 +61,54 @@ func (s *PostgresStore) Close() {
 
 // ── Certificates ────────────────────────────────────────
 
+// certificateColumns is the read projection for public.certificates, in the
+// order scanCertificate expects.
+//
+// One definition rather than the four identical copies that were here before.
+// They had already drifted once: private_key_encrypted was missing from all of
+// them, so key export answered "no private key is stored" for every certificate
+// while the column held one.
+//
+// The COALESCEs are load-bearing, not decoration. Several of these columns are
+// nullable in the schema but map to non-pointer Go fields — days_remaining and
+// key_size to int, auto_renew to bool, environment and team to string. pgx
+// cannot scan NULL into those, and it fails the whole query rather than the one
+// row, so a single hand-inserted or bulk-imported row with a NULL would take
+// out the entire certificate list. For an inventory product people import into,
+// that is a matter of when.
+const certificateColumns = `id, fingerprint_sha256, common_name,
+		coalesce(sans, '[]'::jsonb), coalesce(serial_number, ''), coalesce(issuer_dn, ''),
+		not_before, not_after, coalesce(days_remaining, 0),
+		coalesce(key_type, ''), coalesce(key_size, 0), status,
+		coalesce(auto_renew, false), coalesce(renewal_lead_days, 0),
+		last_renewal_attempt, renewal_error, coalesce(renewal_count, 0),
+		ca_account_id, ca_authority_id, deployment_target_id, certificate_pem, chain_pem,
+		coalesce(discovered_via, 'MANUAL'), coalesce(environment, ''), coalesce(team, ''),
+		coalesce(tags, '[]'::jsonb), created_by, created_at, updated_at`
+
+// scanCertificate reads one row of certificateColumns.
+func scanCertificate(row pgx.Row) (*Certificate, error) {
+	cert := &Certificate{}
+	var sansJSON, tagsJSON []byte
+	err := row.Scan(
+		&cert.ID, &cert.FingerprintSHA256, &cert.CommonName, &sansJSON, &cert.SerialNumber, &cert.IssuerDN,
+		&cert.NotBefore, &cert.NotAfter, &cert.DaysRemaining, &cert.KeyType, &cert.KeySize, &cert.Status,
+		&cert.AutoRenew, &cert.RenewalLeadDays, &cert.LastRenewalAttempt, &cert.RenewalError, &cert.RenewalCount,
+		&cert.CAAccountID, &cert.CAAuthorityID, &cert.DeploymentTargetID, &cert.CertificatePEM, &cert.ChainPEM,
+		&cert.DiscoveredVia, &cert.Environment, &cert.Team, &tagsJSON, &cert.CreatedBy, &cert.CreatedAt, &cert.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(sansJSON) > 0 {
+		_ = json.Unmarshal(sansJSON, &cert.SANs)
+	}
+	if len(tagsJSON) > 0 {
+		_ = json.Unmarshal(tagsJSON, &cert.Tags)
+	}
+	return cert, nil
+}
+
 func (s *PostgresStore) ListCertificates(ctx context.Context, filter CertificateFilter) ([]*Certificate, int64, error) {
 	where := []string{"1=1"}
 	args := []interface{}{}
@@ -107,11 +155,7 @@ func (s *PostgresStore) ListCertificates(ctx context.Context, filter Certificate
 	}
 
 	query := fmt.Sprintf(`
-		SELECT id, fingerprint_sha256, common_name, sans, serial_number, issuer_dn,
-		       not_before, not_after, days_remaining, key_type, key_size, status,
-		       auto_renew, renewal_lead_days, last_renewal_attempt, renewal_error, renewal_count,
-		       ca_account_id, ca_authority_id, deployment_target_id, certificate_pem, chain_pem,
-		       discovered_via, environment, team, tags, created_by, created_at, updated_at
+		SELECT `+certificateColumns+`
 		FROM public.certificates
 		WHERE %s
 		ORDER BY not_after ASC NULLS LAST
@@ -126,25 +170,11 @@ func (s *PostgresStore) ListCertificates(ctx context.Context, filter Certificate
 	}
 	defer rows.Close()
 
-	var certs []*Certificate
+	certs := []*Certificate{}
 	for rows.Next() {
-		cert := &Certificate{}
-		var sansJSON, tagsJSON []byte
-		err := rows.Scan(
-			&cert.ID, &cert.FingerprintSHA256, &cert.CommonName, &sansJSON, &cert.SerialNumber, &cert.IssuerDN,
-			&cert.NotBefore, &cert.NotAfter, &cert.DaysRemaining, &cert.KeyType, &cert.KeySize, &cert.Status,
-			&cert.AutoRenew, &cert.RenewalLeadDays, &cert.LastRenewalAttempt, &cert.RenewalError, &cert.RenewalCount,
-			&cert.CAAccountID, &cert.CAAuthorityID, &cert.DeploymentTargetID, &cert.CertificatePEM, &cert.ChainPEM,
-			&cert.DiscoveredVia, &cert.Environment, &cert.Team, &tagsJSON, &cert.CreatedBy, &cert.CreatedAt, &cert.UpdatedAt,
-		)
+		cert, err := scanCertificate(rows)
 		if err != nil {
 			return nil, 0, err
-		}
-		if len(sansJSON) > 0 {
-			_ = json.Unmarshal(sansJSON, &cert.SANs)
-		}
-		if len(tagsJSON) > 0 {
-			_ = json.Unmarshal(tagsJSON, &cert.Tags)
 		}
 		certs = append(certs, cert)
 	}
@@ -154,66 +184,30 @@ func (s *PostgresStore) ListCertificates(ctx context.Context, filter Certificate
 
 func (s *PostgresStore) GetCertificate(ctx context.Context, id string) (*Certificate, error) {
 	query := `
-		SELECT id, fingerprint_sha256, common_name, sans, serial_number, issuer_dn,
-		       not_before, not_after, days_remaining, key_type, key_size, status,
-		       auto_renew, renewal_lead_days, last_renewal_attempt, renewal_error, renewal_count,
-		       ca_account_id, ca_authority_id, deployment_target_id, certificate_pem, chain_pem,
-		       discovered_via, environment, team, tags, created_by, created_at, updated_at
+		SELECT ` + certificateColumns + `
 		FROM public.certificates WHERE id = $1
 	`
-	cert := &Certificate{}
-	var sansJSON, tagsJSON []byte
-	err := s.pool.QueryRow(ctx, query, id).Scan(
-		&cert.ID, &cert.FingerprintSHA256, &cert.CommonName, &sansJSON, &cert.SerialNumber, &cert.IssuerDN,
-		&cert.NotBefore, &cert.NotAfter, &cert.DaysRemaining, &cert.KeyType, &cert.KeySize, &cert.Status,
-		&cert.AutoRenew, &cert.RenewalLeadDays, &cert.LastRenewalAttempt, &cert.RenewalError, &cert.RenewalCount,
-		&cert.CAAccountID, &cert.CAAuthorityID, &cert.DeploymentTargetID, &cert.CertificatePEM, &cert.ChainPEM,
-		&cert.DiscoveredVia, &cert.Environment, &cert.Team, &tagsJSON, &cert.CreatedBy, &cert.CreatedAt, &cert.UpdatedAt,
-	)
+	cert, err := scanCertificate(s.pool.QueryRow(ctx, query, id))
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("certificate %s not found", id)
 	}
 	if err != nil {
 		return nil, err
 	}
-	if len(sansJSON) > 0 {
-		_ = json.Unmarshal(sansJSON, &cert.SANs)
-	}
-	if len(tagsJSON) > 0 {
-		_ = json.Unmarshal(tagsJSON, &cert.Tags)
-	}
 	return cert, nil
 }
 
 func (s *PostgresStore) GetCertificateByFingerprint(ctx context.Context, fingerprint string) (*Certificate, error) {
 	query := `
-		SELECT id, fingerprint_sha256, common_name, sans, serial_number, issuer_dn,
-		       not_before, not_after, days_remaining, key_type, key_size, status,
-		       auto_renew, renewal_lead_days, last_renewal_attempt, renewal_error, renewal_count,
-		       ca_account_id, ca_authority_id, deployment_target_id, certificate_pem, chain_pem,
-		       discovered_via, environment, team, tags, created_by, created_at, updated_at
+		SELECT ` + certificateColumns + `
 		FROM public.certificates WHERE fingerprint_sha256 = $1
 	`
-	cert := &Certificate{}
-	var sansJSON, tagsJSON []byte
-	err := s.pool.QueryRow(ctx, query, fingerprint).Scan(
-		&cert.ID, &cert.FingerprintSHA256, &cert.CommonName, &sansJSON, &cert.SerialNumber, &cert.IssuerDN,
-		&cert.NotBefore, &cert.NotAfter, &cert.DaysRemaining, &cert.KeyType, &cert.KeySize, &cert.Status,
-		&cert.AutoRenew, &cert.RenewalLeadDays, &cert.LastRenewalAttempt, &cert.RenewalError, &cert.RenewalCount,
-		&cert.CAAccountID, &cert.CAAuthorityID, &cert.DeploymentTargetID, &cert.CertificatePEM, &cert.ChainPEM,
-		&cert.DiscoveredVia, &cert.Environment, &cert.Team, &tagsJSON, &cert.CreatedBy, &cert.CreatedAt, &cert.UpdatedAt,
-	)
+	cert, err := scanCertificate(s.pool.QueryRow(ctx, query, fingerprint))
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
-	}
-	if len(sansJSON) > 0 {
-		_ = json.Unmarshal(sansJSON, &cert.SANs)
-	}
-	if len(tagsJSON) > 0 {
-		_ = json.Unmarshal(tagsJSON, &cert.Tags)
 	}
 	return cert, nil
 }
@@ -248,7 +242,7 @@ func (s *PostgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 		cert.NotBefore, cert.NotAfter, cert.DaysRemaining, cert.KeyType, cert.KeySize, cert.Status,
 		cert.AutoRenew, cert.RenewalLeadDays, cert.CAAccountID, cert.CAAuthorityID,
 		cert.DeploymentTargetID, cert.PrivateKeyEncrypted, cert.CertificatePEM, cert.ChainPEM,
-		cert.DiscoveredVia, cert.Environment, cert.Team, tagsJSON, cert.CreatedBy,
+		cert.DiscoveredVia, nullIfEmpty(cert.Environment), cert.Team, tagsJSON, cert.CreatedBy,
 	).Scan(&cert.ID, &cert.CreatedAt, &cert.UpdatedAt)
 }
 
@@ -292,10 +286,26 @@ func (s *PostgresStore) UpdateCertificate(ctx context.Context, cert *Certificate
 		cert.NotBefore, cert.NotAfter, cert.DaysRemaining, cert.KeyType, cert.KeySize, cert.Status,
 		cert.AutoRenew, cert.RenewalLeadDays, cert.LastRenewalAttempt, cert.RenewalError,
 		cert.RenewalCount, cert.CAAccountID, cert.CAAuthorityID, cert.DeploymentTargetID,
-		cert.CertificatePEM, cert.ChainPEM, cert.Environment, cert.Team, tagsJSON,
+		cert.CertificatePEM, cert.ChainPEM, nullIfEmpty(cert.Environment), cert.Team, tagsJSON,
 		cert.PrivateKeyEncrypted,
 	)
 	return err
+}
+
+// nullIfEmpty maps Go's zero value for a string to SQL NULL.
+//
+// Needed because several nullable columns carry a CHECK constraint —
+// certificates.environment is `check (environment in ('production', 'staging',
+// 'development'))`. A CHECK passes on NULL and fails on ”, so a field the
+// caller simply did not set is rejected by the database while an absent one is
+// accepted. Issuing a certificate without naming an environment is the ordinary
+// case, and before this it failed outright on PostgreSQL with a constraint
+// violation naming a column the request never mentioned.
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // GetCertificatePrivateKey reads the sealed key for exactly one certificate.
@@ -322,11 +332,7 @@ func (s *PostgresStore) DeleteCertificate(ctx context.Context, id string) error 
 
 func (s *PostgresStore) GetCertificatesDueForRenewal(ctx context.Context, defaultLeadDays int) ([]*Certificate, error) {
 	query := `
-		SELECT id, fingerprint_sha256, common_name, sans, serial_number, issuer_dn,
-		       not_before, not_after, days_remaining, key_type, key_size, status,
-		       auto_renew, renewal_lead_days, last_renewal_attempt, renewal_error, renewal_count,
-		       ca_account_id, ca_authority_id, deployment_target_id, certificate_pem, chain_pem,
-		       discovered_via, environment, team, tags, created_by, created_at, updated_at
+		SELECT ` + certificateColumns + `
 		FROM public.certificates
 		WHERE auto_renew = true
 		  AND status IN ('ISSUED', 'EXPIRING', 'RENEWAL_FAILED')
@@ -338,25 +344,11 @@ func (s *PostgresStore) GetCertificatesDueForRenewal(ctx context.Context, defaul
 	}
 	defer rows.Close()
 
-	var certs []*Certificate
+	certs := []*Certificate{}
 	for rows.Next() {
-		cert := &Certificate{}
-		var sansJSON, tagsJSON []byte
-		err := rows.Scan(
-			&cert.ID, &cert.FingerprintSHA256, &cert.CommonName, &sansJSON, &cert.SerialNumber, &cert.IssuerDN,
-			&cert.NotBefore, &cert.NotAfter, &cert.DaysRemaining, &cert.KeyType, &cert.KeySize, &cert.Status,
-			&cert.AutoRenew, &cert.RenewalLeadDays, &cert.LastRenewalAttempt, &cert.RenewalError, &cert.RenewalCount,
-			&cert.CAAccountID, &cert.CAAuthorityID, &cert.DeploymentTargetID, &cert.CertificatePEM, &cert.ChainPEM,
-			&cert.DiscoveredVia, &cert.Environment, &cert.Team, &tagsJSON, &cert.CreatedBy, &cert.CreatedAt, &cert.UpdatedAt,
-		)
+		cert, err := scanCertificate(rows)
 		if err != nil {
 			return nil, err
-		}
-		if len(sansJSON) > 0 {
-			_ = json.Unmarshal(sansJSON, &cert.SANs)
-		}
-		if len(tagsJSON) > 0 {
-			_ = json.Unmarshal(tagsJSON, &cert.Tags)
 		}
 		certs = append(certs, cert)
 	}
@@ -376,13 +368,19 @@ func caColumns(includePEM bool) string {
 	if includePEM {
 		pem = `certificate_pem`
 	}
-	return `id, name, ca_type, subject_dn, issuer_dn, serial_number,
-		not_before, not_after, days_remaining, key_type, key_size,
-		fingerprint_sha256, ` + pem + `, parent_ca_id, crl_distribution_url,
-		ocsp_responder_url, is_crl_fresh, crl_last_checked, is_ocsp_responsive,
-		ocsp_last_checked, certificates_issued_count, alert_thresholds,
+	// COALESCE for the same reason as certificateColumns: these columns are
+	// nullable in the schema but scan into non-pointer Go fields, and pgx fails
+	// the whole query on a NULL rather than the single row. A CA list that
+	// 500s because one row has a null CRL URL is a blank monitoring screen.
+	return `id, name, ca_type, subject_dn, issuer_dn, coalesce(serial_number, ''),
+		not_before, not_after, coalesce(days_remaining, 0), key_type, key_size,
+		fingerprint_sha256, ` + pem + `, parent_ca_id, coalesce(crl_distribution_url, ''),
+		coalesce(ocsp_responder_url, ''), coalesce(is_crl_fresh, false), crl_last_checked,
+		coalesce(is_ocsp_responsive, false),
+		ocsp_last_checked, coalesce(certificates_issued_count, 0),
+		coalesce(alert_thresholds, '[]'::jsonb),
 		last_alert_sent_at, last_alert_threshold, status, ca_account_id,
-		tags, notes, created_at, updated_at`
+		coalesce(tags, '[]'::jsonb), coalesce(notes, ''), created_at, updated_at`
 }
 
 func scanCAAuthority(row pgx.Row) (*CAAuthority, error) {
@@ -417,7 +415,13 @@ func (s *PostgresStore) ListCAAuthorities(ctx context.Context, filter CAFilter) 
 	}
 	if filter.ExpiringWithinDays > 0 {
 		// Against not_after, not the cached days_remaining — see CAFilter.
-		where = append(where, fmt.Sprintf("not_after <= now() + ($%d || ' days')::interval", argIdx))
+		//
+		// make_interval rather than ($n || ' days')::interval. In the string
+		// form both sides of `||` are untyped, so PostgreSQL resolves the
+		// operator as text || text and reports the parameter as text — and the
+		// driver, holding an int, fails to encode it. The query is not wrong so
+		// much as untypable, and it fails at bind time on every call.
+		where = append(where, fmt.Sprintf("not_after <= now() + make_interval(days => $%d)", argIdx))
 		args = append(args, filter.ExpiringWithinDays)
 		argIdx++
 	}
@@ -439,7 +443,7 @@ func (s *PostgresStore) ListCAAuthorities(ctx context.Context, filter CAFilter) 
 	}
 	defer rows.Close()
 
-	var cas []*CAAuthority
+	cas := []*CAAuthority{}
 	for rows.Next() {
 		ca, err := scanCAAuthority(rows)
 		if err != nil {
@@ -582,7 +586,7 @@ func (s *PostgresStore) GetCAChain(ctx context.Context, id string) ([]*CAAuthori
 	}
 	defer rows.Close()
 
-	var chain []*CAAuthority
+	chain := []*CAAuthority{}
 	for rows.Next() {
 		// Via the shared scanner, which also populates AlertThresholds and
 		// Tags. The hand-written scan this replaced read both columns and then
@@ -611,7 +615,7 @@ func (s *PostgresStore) ListCAAccounts(ctx context.Context) ([]*CAAccount, error
 	}
 	defer rows.Close()
 
-	var accounts []*CAAccount
+	accounts := []*CAAccount{}
 	for rows.Next() {
 		acc := &CAAccount{}
 		err := rows.Scan(
@@ -684,7 +688,7 @@ func (s *PostgresStore) ListDeploymentTargets(ctx context.Context) ([]*Deploymen
 	}
 	defer rows.Close()
 
-	var targets []*DeploymentTarget
+	targets := []*DeploymentTarget{}
 	for rows.Next() {
 		t := &DeploymentTarget{}
 		if err := rows.Scan(&t.ID, &t.Name, &t.TargetType, &t.ConfigEncrypted, &t.LastDeploymentAt, &t.LastDeploymentStatus, &t.CreatedBy, &t.CreatedAt, &t.UpdatedAt); err != nil {
@@ -723,7 +727,7 @@ func (s *PostgresStore) ListPolicies(ctx context.Context) ([]*Policy, error) {
 	}
 	defer rows.Close()
 
-	var policies []*Policy
+	policies := []*Policy{}
 	for rows.Next() {
 		p := &Policy{}
 		var cfgJSON []byte

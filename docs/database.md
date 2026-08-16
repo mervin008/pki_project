@@ -193,3 +193,39 @@ searching for foreign keys into the `auth` schema, and finds none.
 | `insert or update on table … violates foreign key constraint` naming `auth.users` | Migration `005` has not been applied. |
 | `CERTPILOT_KEK is required` | See step 2. |
 | Dashboard shows zeros | Expected on a fresh database. Preflight has already ruled out the two ways this could be a lie. |
+
+---
+
+## What running this for the first time found
+
+Everything above was verified against a live Supabase project (PostgreSQL 17,
+session pooler, `eu-north-1`): all five migrations applied and reapplied
+idempotently, three CAs registered, a certificate issued through the self-signed
+gateway, renewed with key rotation, its private key exported and checked against
+the certificate, six health sweeps run, and a kiosk display token exercised on
+every route it is allowed and refused.
+
+Four defects surfaced that the in-memory store could not express, which is worth
+recording because it is the argument for a container-backed test suite:
+
+1. **Issuance failed outright.** `certificates.environment` is nullable with a
+   `CHECK` constraint. The Go field is a plain `string`, so a request that did
+   not name an environment wrote `''` — and a CHECK passes on NULL but fails on
+   `''`. Every certificate request without an explicit environment was rejected
+   by the database.
+2. **The CA expiry window never worked.** `not_after <= now() + ($1 || ' days')`
+   leaves both sides of `||` untyped, so PostgreSQL resolved it as `text || text`
+   and reported the parameter as text while the driver held an int. Now
+   `make_interval(days => $1)`.
+3. **Empty lists serialized as `null`, not `[]`** — pgx leaves a slice nil when a
+   query returns no rows. The dashboard calls `.map()` on that, so an empty
+   estate would have rendered as a crash rather than as zeros.
+4. **A single NULL could take out an entire list endpoint.** Several nullable
+   columns scan into non-pointer Go fields, and pgx fails the whole query rather
+   than the row. One hand-inserted or bulk-imported certificate with a null
+   `key_size` would have blanked the certificate list. Both read projections now
+   `COALESCE`.
+
+Migration 001 also had to be made rerunnable: `create policy` has no
+`if not exists`, so applying the file to a database that already had the schema
+failed on the first policy and rolled back everything.

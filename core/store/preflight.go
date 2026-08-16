@@ -64,25 +64,13 @@ func Preflight(ctx context.Context, pool *pgxpool.Pool) error {
 	if err != nil {
 		return err
 	}
-	if !bypasses {
-		var blocked []string
-		for _, t := range requiredTables {
-			// A role sees a table's rows in spite of RLS only if it owns the
-			// table (directly or through a role it is a member of) and the
-			// table is not set to FORCE. Anything else is filtered.
-			info := present[t]
-			if info.rowSecurity && (!info.isOwner || info.forceRowSecurity) {
-				blocked = append(blocked, t)
-			}
-		}
-		if len(blocked) > 0 {
-			return fmt.Errorf(
-				"row-level security would silently hide rows in %s from this connection, "+
-					"so the dashboard would show an empty, healthy-looking estate. "+
-					"Connect as the role that owns these tables (on Supabase that is `postgres`), "+
-					"or grant the current role BYPASSRLS",
-				strings.Join(blocked, ", "))
-		}
+	if blocked := rlsBlockedTables(present, bypasses); len(blocked) > 0 {
+		return fmt.Errorf(
+			"row-level security would silently hide rows in %s from this connection, "+
+				"so the dashboard would show an empty, healthy-looking estate. "+
+				"Connect as the role that owns these tables (on Supabase that is `postgres`), "+
+				"or grant the current role BYPASSRLS",
+			strings.Join(blocked, ", "))
 	}
 
 	// Not fatal. A stale schema mostly degrades a feature rather than lying
@@ -90,6 +78,34 @@ func Preflight(ctx context.Context, pool *pgxpool.Pool) error {
 	// to fix something less serious than being offline.
 	warnOnStaleSchema(ctx, pool)
 	return nil
+}
+
+// rlsBlockedTables names the required tables whose rows row-level security
+// would filter out for the connecting role.
+//
+// A role reads a table's rows in spite of RLS only if it has BYPASSRLS, or it
+// owns the table (directly or through a role it is a member of) and the table
+// is not set to FORCE. Anything else is filtered — silently, and to nothing.
+//
+// Split out from Preflight so this decision can be tested without a database.
+// It is the rule the whole check turns on, and getting it inverted would be
+// worse than not having the check: the core would refuse to start against a
+// database it could read perfectly well.
+func rlsBlockedTables(present map[string]tableInfo, bypassesRLS bool) []string {
+	if bypassesRLS {
+		return nil
+	}
+	var blocked []string
+	for _, t := range requiredTables {
+		info, ok := present[t]
+		if !ok {
+			continue // absence is the caller's separate, earlier check
+		}
+		if info.rowSecurity && (!info.isOwner || info.forceRowSecurity) {
+			blocked = append(blocked, t)
+		}
+	}
+	return blocked
 }
 
 type tableInfo struct {

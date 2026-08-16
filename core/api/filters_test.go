@@ -336,3 +336,42 @@ func TestDashboardStatsExposeExpiredAndUnknownCAs(t *testing.T) {
 		t.Errorf("the CA buckets must partition the estate: %d counted, %d total", sum, stats.TotalCAs)
 	}
 }
+
+// A list endpoint with no matches must answer `"data": []`, never `"data": null`.
+//
+// Found against real PostgreSQL, which the in-memory store hid: pgx leaves a
+// slice nil when a query returns no rows, and encoding/json renders a nil slice
+// as null. The dashboard then calls .map() on null and the view throws — so an
+// empty estate would render as a crash rather than as zeros, which is exactly
+// the case a monitoring surface has to get right.
+func TestEmptyListsSerializeAsArraysNotNull(t *testing.T) {
+	r, _ := realRouter(t)
+
+	paths := []string{
+		"/api/v1/pki/authorities?status=NOTHING_MATCHES",
+		"/api/v1/certificates?status=NOTHING_MATCHES",
+		"/api/v1/policies",
+		"/api/v1/ca-accounts",
+		"/api/v1/display-tokens",
+		"/api/v1/dashboard/activity?action=nothing.matches.this",
+		"/api/v1/dashboard/expiring",
+	}
+	for _, path := range paths {
+		w := do(r, http.MethodGet, path, nil, nil)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: want 200, got %d: %s", path, w.Code, w.Body)
+			continue
+		}
+
+		var body struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Errorf("%s: %v", path, err)
+			continue
+		}
+		if string(body.Data) == "null" {
+			t.Errorf("%s: data is null; an empty list must serialize as []", path)
+		}
+	}
+}
