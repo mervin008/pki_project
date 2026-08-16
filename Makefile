@@ -1,5 +1,5 @@
 .PHONY: all build build-core build-gateways test test-coverage lint proto proto-lint \
-        dev-certs generate-kek run-core run-gateway-selfsigned run-gateway-acme run-frontend \
+        dev dev-certs generate-kek run-core run-gateway-selfsigned run-gateway-acme run-frontend \
         clean help
 
 # ── Variables ────────────────────────────────────────────
@@ -56,6 +56,10 @@ dev-certs: build-core
 # ── Run (Development) ───────────────────────────────────
 #
 # Each of these runs in its own terminal. Run `make dev-certs` first.
+
+## Start the local gateway, API, and frontend in one terminal.
+dev:
+	./scripts/dev.sh
 
 run-core:
 	$(GO) run ./core/cmd/ --config=config.dev.yaml
@@ -130,6 +134,7 @@ help:
 	@echo "  make proto                   Generate protobuf Go code"
 	@echo ""
 	@echo "Run (one per terminal)"
+	@echo "  make dev                      Start the complete local development stack"
 	@echo "  make run-core                CertPilot Core        :8080"
 	@echo "  make run-gateway-selfsigned  Self-signed gateway   :9091"
 	@echo "  make run-gateway-acme        ACME gateway          :9092"
