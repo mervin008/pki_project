@@ -51,10 +51,16 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	dashHandler := NewDashboardHandler(deps.Store)
 	discHandler := NewDiscoveryHandler(deps.Store, deps.Scanner)
 	policyHandler := NewPolicyHandler(deps.Store)
+	eventsHandler := NewEventsHandler(deps.Store, deps.Broker)
 
 	v1 := engine.Group("/api/v1")
 	v1.Use(deps.Auth.Middleware())
 	{
+		// ── Live event stream ──
+		// Any authenticated reader may watch; the stream carries CA and
+		// certificate state, never secrets or actor identity.
+		v1.GET("/events", eventsHandler.Stream)
+
 		// ── Dashboard ──
 		v1.GET("/dashboard/stats", dashHandler.Stats)
 		v1.GET("/dashboard/expiring", dashHandler.Expiring)
