@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/certpilot/certpilot/core/engine/pki"
 	"github.com/certpilot/certpilot/core/store"
@@ -141,9 +144,18 @@ func (h *CAHandler) Create(c *gin.Context) {
 		return
 	}
 
-	// Trigger initial health check asynchronously
+	// Run the first health check in the background so CRL and OCSP state is
+	// populated without making the operator wait on network round trips.
+	//
+	// The context must be detached from the request: c.Request.Context() is
+	// cancelled the moment this handler returns, so the check was racing a dead
+	// context and almost always aborted before reaching the CRL endpoint.
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 2*time.Minute)
 	go func() {
-		_ = h.caMonitor.CheckCA(c.Request.Context(), ca)
+		defer cancel()
+		if err := h.caMonitor.CheckCA(checkCtx, ca); err != nil {
+			slog.Warn("initial CA health check failed", "ca_name", ca.Name, "error", err)
+		}
 	}()
 
 	c.JSON(http.StatusCreated, ca)

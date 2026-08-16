@@ -1,121 +1,184 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed } from 'vue'
+import { storeToRefs } from 'pinia'
 import { useApi } from '@/composables/useApi'
-import { Settings as SettingsIcon, Database, Server, Globe, CheckCircle, XCircle } from 'lucide-vue-next'
+import { useAsyncData } from '@/composables/useAsyncData'
+import { useAuthStore } from '@/stores/auth'
+import { useThemeStore } from '@/stores/theme'
+import DataState from '@/components/common/DataState.vue'
+import {
+  Server, Cpu, ShieldCheck, CircleCheck, CircleX, RotateCw, Palette, UserCog,
+} from 'lucide-vue-next'
+import { formatDateTime } from '@/lib/format'
+import type { GatewaySummary, ListResponse } from '@/lib/types'
+
+/**
+ * This page reports live state only.
+ *
+ * It previously rendered a hardcoded table — "localhost:8443", ":50051",
+ * "Supabase (eu-north-1)", "Connection Pool 10 / 20", and a connected
+ * "Vault Provider" for a gateway that does not exist in this repository — built
+ * from a non-reactive array that read a ref before it was ever populated. On a
+ * settings page that is worse than showing nothing, because it invites someone
+ * to trust a port number that was never real.
+ */
 
 const api = useApi()
-const healthStatus = ref<any>(null)
-const loading = ref(true)
+const auth = useAuthStore()
+const theme = useThemeStore()
+const { role, user, isAuthEnabled } = storeToRefs(auth)
+const { currentTheme } = storeToRefs(theme)
 
-async function loadHealth() {
-  loading.value = true
-  try {
-    healthStatus.value = await api.get<any>('/api/v1/health').catch(() => null)
-  } finally {
-    loading.value = false
-  }
+// The health endpoint is /healthz and is unversioned; this page used to call
+// /api/v1/health, which has never existed.
+const health = useAsyncData<{ status: string; service: string }>((s) =>
+  api.get<{ status: string; service: string }>('/healthz', s),
+)
+
+const gateways = useAsyncData<ListResponse<GatewaySummary>>((s) =>
+  api.get<ListResponse<GatewaySummary>>('/api/v1/gateways', s),
+)
+
+const gatewayList = computed(() => gateways.data.value?.data ?? [])
+const loading = computed(() => health.loading.value || gateways.loading.value)
+const loaded = computed(() => health.loaded.value && gateways.loaded.value)
+const error = computed(() => health.error.value ?? gateways.error.value)
+
+const apiReachable = computed(() => health.data.value?.status === 'ok')
+
+function refreshAll() {
+  void health.refresh()
+  void gateways.refresh()
 }
-
-onMounted(() => loadHealth())
-
-const configSections = [
-  {
-    title: 'API Server',
-    icon: Server,
-    items: [
-      { label: 'HTTP Endpoint', value: 'localhost:8443', status: 'connected' },
-      { label: 'gRPC Gateway Port', value: ':50051', status: 'connected' },
-      { label: 'TLS Mode', value: 'Enabled (mTLS)', status: 'connected' },
-    ],
-  },
-  {
-    title: 'Database',
-    icon: Database,
-    items: [
-      { label: 'PostgreSQL', value: 'Supabase (eu-north-1)', status: healthStatus.value ? 'connected' : 'unknown' },
-      { label: 'Connection Pool', value: '10 / 20', status: 'connected' },
-    ],
-  },
-  {
-    title: 'External Integrations',
-    icon: Globe,
-    items: [
-      { label: 'ACME Provider', value: "Let's Encrypt", status: 'connected' },
-      { label: 'Vault Provider', value: 'HashiCorp Vault', status: 'connected' },
-      { label: 'GCP CAS Provider', value: 'Not Configured', status: 'disconnected' },
-    ],
-  },
-]
 </script>
 
 <template>
   <div class="space-y-6">
-    <p class="text-sm text-base-content/60">System configuration and infrastructure health</p>
-
-    <div v-if="loading" class="flex justify-center py-12">
-      <span class="loading loading-spinner loading-lg text-primary"></span>
+    <div class="flex items-center justify-between gap-4 flex-wrap">
+      <p class="text-sm text-base-content/60">Live system state and local preferences</p>
+      <button class="btn btn-ghost btn-sm gap-1.5" :disabled="loading" @click="refreshAll">
+        <RotateCw class="w-3.5 h-3.5" :class="loading && 'animate-spin'" />
+        Refresh
+      </button>
     </div>
 
-    <template v-else>
-      <!-- Health Status -->
-      <div class="card bg-base-100 border border-base-300">
-        <div class="card-body p-5">
-          <h2 class="card-title text-sm font-bold mb-3">
-            <SettingsIcon class="w-4 h-4 text-primary" /> System Health
+    <DataState :loading="loading" :error="error" :loaded="loaded" @retry="refreshAll">
+      <!-- Control plane -->
+      <section class="card bg-base-100 border border-base-300">
+        <div class="card-body p-5 gap-3">
+          <h2 class="card-title text-sm font-bold flex items-center gap-2">
+            <Server class="w-4 h-4" /> Control plane
           </h2>
-          <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-            <div class="flex items-center gap-2">
-              <CheckCircle class="w-4 h-4 text-success" />
-              <div>
-                <div class="font-medium">API Server</div>
-                <div class="text-base-content/60">Running</div>
-              </div>
+          <dl class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+            <div class="flex items-center justify-between gap-3">
+              <dt class="opacity-60">Core API</dt>
+              <dd class="flex items-center gap-1.5">
+                <CircleCheck v-if="apiReachable" class="w-3.5 h-3.5 text-success" />
+                <CircleX v-else class="w-3.5 h-3.5 text-error" />
+                {{ apiReachable ? 'Reachable' : 'Unreachable' }}
+              </dd>
             </div>
-            <div class="flex items-center gap-2">
-              <CheckCircle class="w-4 h-4 text-success" />
-              <div>
-                <div class="font-medium">Database</div>
-                <div class="text-base-content/60">{{ healthStatus ? 'Connected' : 'Checking…' }}</div>
-              </div>
+            <div class="flex items-center justify-between gap-3">
+              <dt class="opacity-60">Service</dt>
+              <dd class="font-mono">{{ health.data.value?.service ?? '—' }}</dd>
             </div>
-            <div class="flex items-center gap-2">
-              <CheckCircle class="w-4 h-4 text-success" />
-              <div>
-                <div class="font-medium">gRPC Gateway</div>
-                <div class="text-base-content/60">Listening</div>
-              </div>
+            <div class="flex items-center justify-between gap-3">
+              <dt class="opacity-60">Last checked</dt>
+              <dd class="font-mono">{{ formatDateTime(health.lastLoadedAt.value?.toISOString()) }}</dd>
             </div>
-            <div class="flex items-center gap-2">
-              <XCircle class="w-4 h-4 text-base-content/30" />
-              <div>
-                <div class="font-medium">Background Jobs</div>
-                <div class="text-base-content/60">Idle</div>
-              </div>
-            </div>
-          </div>
+          </dl>
+          <p class="text-[11px] opacity-50">
+            Database and encryption-key state are not exposed by the API. They are reported in the
+            core's startup logs.
+          </p>
         </div>
-      </div>
+      </section>
 
-      <!-- Configuration Cards -->
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div v-for="section in configSections" :key="section.title" class="card bg-base-100 border border-base-300">
-          <div class="card-body p-5">
-            <div class="flex items-center gap-2 mb-3">
-              <component :is="section.icon" class="w-4 h-4 text-primary" />
-              <h3 class="font-bold text-sm">{{ section.title }}</h3>
-            </div>
-            <div class="space-y-2.5">
-              <div v-for="item in section.items" :key="item.label" class="flex items-center justify-between text-xs">
-                <span class="text-base-content/70">{{ item.label }}</span>
-                <div class="flex items-center gap-1.5">
-                  <span class="font-mono text-[11px]">{{ item.value }}</span>
-                  <span class="w-2 h-2 rounded-full" :class="item.status === 'connected' ? 'bg-success' : item.status === 'disconnected' ? 'bg-error' : 'bg-base-content/30'"></span>
-                </div>
+      <!-- Gateways -->
+      <section class="card bg-base-100 border border-base-300">
+        <div class="card-body p-5 gap-3">
+          <h2 class="card-title text-sm font-bold flex items-center gap-2">
+            <Cpu class="w-4 h-4" /> Gateway plugins
+          </h2>
+          <ul v-if="gatewayList.length" class="divide-y divide-base-300 text-xs">
+            <li
+              v-for="gw in gatewayList" :key="gw.name"
+              class="flex items-center justify-between gap-3 py-2 first:pt-0 last:pb-0"
+            >
+              <div class="min-w-0">
+                <div class="font-medium truncate">{{ gw.name }}</div>
+                <div class="font-mono opacity-60 truncate">{{ gw.addr }} · {{ gw.type }}</div>
               </div>
+              <span
+                class="badge badge-sm shrink-0"
+                :class="gw.is_connected ? 'badge-success' : 'badge-error'"
+              >{{ gw.is_connected ? 'Connected' : 'Disconnected' }}</span>
+            </li>
+          </ul>
+          <p v-else class="text-xs opacity-60">
+            No gateways connected. Configure them under
+            <span class="font-mono">plugins.gateways</span> and start the processes.
+          </p>
+        </div>
+      </section>
+
+      <!-- Access -->
+      <section class="card bg-base-100 border border-base-300">
+        <div class="card-body p-5 gap-3">
+          <h2 class="card-title text-sm font-bold flex items-center gap-2">
+            <UserCog class="w-4 h-4" /> Access
+          </h2>
+          <dl class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+            <div class="flex items-center justify-between gap-3">
+              <dt class="opacity-60">Authentication</dt>
+              <dd>{{ isAuthEnabled ? 'Identity provider' : 'Anonymous (development)' }}</dd>
             </div>
+            <div class="flex items-center justify-between gap-3">
+              <dt class="opacity-60">Signed in as</dt>
+              <dd class="font-mono truncate">{{ user?.email ?? '—' }}</dd>
+            </div>
+            <div class="flex items-center justify-between gap-3">
+              <dt class="opacity-60">Role</dt>
+              <dd><span class="badge badge-sm badge-ghost">{{ role }}</span></dd>
+            </div>
+          </dl>
+          <div
+            v-if="!isAuthEnabled" role="alert"
+            class="alert alert-warning py-2"
+          >
+            <ShieldCheck class="w-4 h-4 shrink-0" />
+            <span class="text-xs">
+              Anonymous access treats every request as admin. The core refuses this outside
+              development mode on a loopback address.
+            </span>
           </div>
         </div>
-      </div>
-    </template>
+      </section>
+
+      <!-- Preferences -->
+      <section class="card bg-base-100 border border-base-300">
+        <div class="card-body p-5 gap-3">
+          <h2 class="card-title text-sm font-bold flex items-center gap-2">
+            <Palette class="w-4 h-4" /> Appearance
+          </h2>
+          <div class="flex items-center justify-between gap-3">
+            <span class="text-xs opacity-60">Theme</span>
+            <div class="join">
+              <button
+                class="btn btn-xs join-item"
+                :class="currentTheme === 'light' ? 'btn-active' : ''"
+                @click="theme.setTheme('light')"
+              >Light</button>
+              <button
+                class="btn btn-xs join-item"
+                :class="currentTheme === 'dark' ? 'btn-active' : ''"
+                @click="theme.setTheme('dark')"
+              >Dark</button>
+            </div>
+          </div>
+          <p class="text-[11px] opacity-50">Stored in this browser only.</p>
+        </div>
+      </section>
+    </DataState>
   </div>
 </template>

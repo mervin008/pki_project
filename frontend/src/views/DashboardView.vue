@@ -1,298 +1,407 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { computed, watch } from 'vue'
+import { storeToRefs } from 'pinia'
 import { useApi } from '@/composables/useApi'
+import { useAsyncData } from '@/composables/useAsyncData'
+import { useThemeStore } from '@/stores/theme'
 import DoughnutChart from '@/components/charts/DoughnutChart.vue'
 import BarChart from '@/components/charts/BarChart.vue'
+import DataState from '@/components/common/DataState.vue'
 import {
-  ShieldCheck, KeyRound, AlertTriangle, XCircle,
-  Building2, CheckCircle, Clock, RotateCw
+  KeyRound, AlertTriangle, XCircle, Building2, ShieldCheck, RotateCw,
 } from 'lucide-vue-next'
+import {
+  caSeverity, certSeverity, severityBadge, severityText, statusLabel,
+  compareSeverity, severityPalette, categoricalPalette,
+} from '@/lib/severity'
+import { formatDaysShort, formatRelative, formatTime } from '@/lib/format'
+import {
+  emptyList, parseDetails,
+  type AuditLog, type CaAuthority, type CaExpiryAlertDetails,
+  type Certificate, type DashboardStats, type ListResponse,
+} from '@/lib/types'
 
 const api = useApi()
-const loading = ref(true)
+const theme = useThemeStore()
+const { currentTheme } = storeToRefs(theme)
 
-const stats = ref({
-  total_certificates: 0,
-  healthy_certs: 0,
-  expiring_soon_certs: 0,
-  expired_certs: 0,
-  total_cas: 0,
-  healthy_cas: 0,
-  warning_cas: 0,
-  critical_cas: 0,
-})
+const stats = useAsyncData<DashboardStats>((s) =>
+  api.get<DashboardStats>('/api/v1/dashboard/stats', s),
+)
+const cas = useAsyncData<ListResponse<CaAuthority>>((s) =>
+  api.get<ListResponse<CaAuthority>>('/api/v1/pki/authorities', s),
+)
+const certs = useAsyncData<ListResponse<Certificate>>((s) =>
+  api.get<ListResponse<Certificate>>('/api/v1/certificates', s),
+)
+const activity = useAsyncData<ListResponse<AuditLog>>((s) =>
+  api.get<ListResponse<AuditLog>>('/api/v1/dashboard/activity', s),
+)
 
-const cas = ref<any[]>([])
-const certificates = ref<any[]>([])
-const activityLogs = ref<any[]>([])
+const sources = [stats, cas, certs, activity]
+const loading = computed(() => sources.some((s) => s.loading.value))
+const loaded = computed(() => sources.every((s) => s.loaded.value))
+// Any failing panel degrades the whole dashboard. Showing three fresh numbers
+// beside one stale one, with nothing to tell them apart, is how a monitoring
+// screen misleads.
+const error = computed(() => sources.map((s) => s.error.value).find(Boolean) ?? null)
+const lastLoadedAt = computed(() => stats.lastLoadedAt.value)
 
-async function loadData() {
-  loading.value = true
-  try {
-    const [statsRes, casRes, certsRes, actRes] = await Promise.all([
-      api.get<any>('/api/v1/dashboard/stats').catch(() => ({})),
-      api.get<any>('/api/v1/pki/authorities').catch(() => ({ data: [] })),
-      api.get<any>('/api/v1/certificates').catch(() => ({ data: [] })),
-      api.get<any>('/api/v1/dashboard/activity').catch(() => ({ data: [] })),
-    ])
-    stats.value = { ...stats.value, ...statsRes }
-    cas.value = casRes.data || []
-    certificates.value = certsRes.data || []
-    activityLogs.value = actRes.data || []
-  } finally {
-    loading.value = false
-  }
+function refreshAll() {
+  sources.forEach((s) => void s.refresh())
 }
 
-// Chart computed data
-const statusChartLabels = computed(() => ['Active', 'Expiring', 'Expired', 'Revoked'])
-const statusChartData = computed(() => {
-  const s = stats.value
-  const revoked = Math.max(0, s.total_certificates - s.healthy_certs - s.expiring_soon_certs - s.expired_certs)
-  return [s.healthy_certs || 47, s.expiring_soon_certs || 8, s.expired_certs || 3, revoked || 2]
+const caList = computed(() => cas.data.value?.data ?? [])
+const certList = computed(() => certs.data.value?.data ?? [])
+const activityList = computed(() => activity.data.value?.data ?? [])
+const summary = computed<DashboardStats>(
+  () =>
+    stats.data.value ?? {
+      total_certificates: 0, healthy_certs: 0, expiring_soon_certs: 0, expired_certs: 0,
+      total_cas: 0, healthy_cas: 0, warning_cas: 0, critical_cas: 0, total_scans: 0,
+    },
+)
+
+// ── Charts ────────────────────────────────────────────────
+// Palettes are resolved from the theme's CSS variables and recomputed when the
+// theme changes, so charts follow the light/dark toggle instead of staying on
+// the hardcoded palette they were born with.
+const sevColors = computed(() => {
+  void currentTheme.value
+  return severityPalette()
 })
-const statusChartColors = ['#36d399', '#fbbd23', '#f87272', '#a78bfa']
+const catColors = computed(() => {
+  void currentTheme.value
+  return categoricalPalette()
+})
 
-const algoChartLabels = computed(() => ['RSA-2048', 'RSA-4096', 'ECDSA P-256', 'ECDSA P-384'])
-const algoChartData = computed(() => [28, 12, 15, 5])
-const algoChartColors = ['#3abff8', '#6366f1', '#22d3ee', '#818cf8']
+const statusChart = computed(() => {
+  const counts = new Map<string, number>()
+  for (const c of certList.value) {
+    counts.set(c.status, (counts.get(c.status) ?? 0) + 1)
+  }
+  const entries = [...counts.entries()].sort((a, b) => b[1] - a[1])
+  return {
+    labels: entries.map(([status]) => statusLabel(status)),
+    data: entries.map(([, count]) => count),
+    colors: entries.map(([status]) => {
+      const palette = sevColors.value
+      switch (certSeverity(status)) {
+        case 'ok': return palette[0]
+        case 'warning': return palette[1]
+        case 'critical': return palette[2]
+        default: return palette[3]
+      }
+    }),
+  }
+})
 
-const expirationLabels = computed(() => {
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+// Derived from the certificates actually held, rather than the constant array
+// this panel used to display.
+const algoChart = computed(() => {
+  const counts = new Map<string, number>()
+  for (const c of certList.value) {
+    const label = c.key_type ? `${c.key_type}${c.key_size ? `-${c.key_size}` : ''}` : 'Unknown'
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+  const entries = [...counts.entries()].sort((a, b) => b[1] - a[1])
+  return {
+    labels: entries.map(([label]) => label),
+    data: entries.map(([, count]) => count),
+  }
+})
+
+// Real forecast: certificates bucketed by the month they expire.
+const expirationChart = computed(() => {
+  const buckets: { label: string; expiring: number; expired: number }[] = []
   const now = new Date()
-  return Array.from({ length: 6 }, (_, i) => months[(now.getMonth() + i) % 12])
-})
-const expirationDatasets = computed(() => [
-  { label: 'Expiring', data: [3, 5, 2, 7, 4, 1], backgroundColor: '#fbbd23' },
-  { label: 'Expired', data: [1, 0, 1, 2, 0, 0], backgroundColor: '#f87272' },
-])
 
-const caDistLabels = computed(() => {
-  if (cas.value.length) return cas.value.slice(0, 5).map((c: any) => c.common_name || c.name || 'CA')
-  return ['Self-Signed Root', 'ACME Issuer', 'Vault Sub-CA', 'GCP CAS']
-})
-const caDistData = computed(() => {
-  if (cas.value.length) return cas.value.slice(0, 5).map(() => Math.floor(Math.random() * 30) + 5)
-  return [25, 18, 12, 5]
-})
-const caDistColors = ['#36d399', '#3abff8', '#fbbd23', '#f472b6', '#a78bfa']
+  for (let i = 0; i < 6; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() + i, 1)
+    buckets.push({
+      label: d.toLocaleDateString(undefined, { month: 'short' }),
+      expiring: 0,
+      expired: 0,
+    })
+  }
 
-const complianceScore = computed(() => {
-  const total = stats.value.total_certificates || 60
-  const healthy = stats.value.healthy_certs || 47
-  if (total === 0) return 100
-  return Math.round((healthy / total) * 100)
+  for (const c of certList.value) {
+    if (!c.not_after) continue
+    const expiry = new Date(c.not_after)
+    if (Number.isNaN(expiry.getTime())) continue
+
+    const monthsOut =
+      (expiry.getFullYear() - now.getFullYear()) * 12 + (expiry.getMonth() - now.getMonth())
+
+    if (monthsOut < 0) {
+      buckets[0].expired++
+    } else if (monthsOut < buckets.length) {
+      buckets[monthsOut].expiring++
+    }
+  }
+
+  return {
+    labels: buckets.map((b) => b.label),
+    datasets: [
+      { label: 'Expiring', data: buckets.map((b) => b.expiring), backgroundColor: sevColors.value[1] },
+      { label: 'Already expired', data: buckets.map((b) => b.expired), backgroundColor: sevColors.value[2] },
+    ],
+  }
 })
 
-function getStatusBadge(status: string) {
-  switch (status?.toLowerCase()) {
-    case 'active': case 'healthy': return 'badge-success'
-    case 'expiring': case 'warning': return 'badge-warning'
-    case 'expired': case 'critical': case 'error': return 'badge-error'
-    default: return 'badge-ghost'
+// Real counts per issuing CA, replacing the Math.random() this panel used to
+// generate — which regenerated on every reactivity tick and would strobe the
+// moment live updates arrive.
+const caDistChart = computed(() => {
+  const byCA = new Map<string, number>()
+  for (const c of certList.value) {
+    const key = c.ca_authority_id ?? c.ca_account_id ?? 'unassigned'
+    byCA.set(key, (byCA.get(key) ?? 0) + 1)
+  }
+
+  const nameFor = (id: string) =>
+    id === 'unassigned' ? 'Unassigned' : caList.value.find((ca) => ca.id === id)?.name ?? id
+
+  const entries = [...byCA.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6)
+  return {
+    labels: entries.map(([id]) => nameFor(id)),
+    data: entries.map(([, count]) => count),
+  }
+})
+
+// ── CA health ─────────────────────────────────────────────
+const casByUrgency = computed(() =>
+  [...caList.value].sort((a, b) => {
+    const bySeverity = compareSeverity(caSeverity(a.status), caSeverity(b.status))
+    return bySeverity !== 0 ? bySeverity : a.days_remaining - b.days_remaining
+  }),
+)
+
+const casNeedingAttention = computed(
+  () => caList.value.filter((ca) => caSeverity(ca.status) !== 'ok').length,
+)
+
+/** Renders an audit entry as a sentence, with CA alerts given their real detail. */
+function describeActivity(log: AuditLog): string {
+  if (log.action === 'ca.expiry_alert') {
+    const d = parseDetails<CaExpiryAlertDetails>(log.details)
+    if (d) return `${d.ca_name} expires in ${d.days_remaining} days (${d.threshold}-day threshold)`
+  }
+  const d = parseDetails<{ cn?: string; ca_name?: string; error?: string }>(log.details)
+  const subject = d?.cn ?? d?.ca_name ?? log.entity_type
+  switch (log.action) {
+    case 'cert.issued': return `Issued ${subject}`
+    case 'cert.renewed': return `Renewed ${subject}`
+    case 'cert.renewal_failed': return `Renewal failed for ${subject}${d?.error ? `: ${d.error}` : ''}`
+    case 'cert.deleted': return `Deleted ${subject}`
+    case 'cert.private_key_exported': return `Private key exported for ${subject}`
+    case 'ca_account.created': return `CA account ${subject} registered`
+    default: return `${log.action} — ${subject}`
   }
 }
 
-function formatDate(d: string) {
-  if (!d) return '—'
-  return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+function activitySeverity(log: AuditLog) {
+  if (log.action === 'ca.expiry_alert') {
+    const d = parseDetails<CaExpiryAlertDetails>(log.details)
+    return d?.severity === 'CRITICAL' ? 'critical' : 'warning'
+  }
+  if (log.action.endsWith('_failed')) return 'critical'
+  if (log.action === 'cert.private_key_exported') return 'warning'
+  return 'ok'
 }
 
-function daysUntil(d: string) {
-  if (!d) return 0
-  return Math.ceil((new Date(d).getTime() - Date.now()) / 86400000)
-}
-
-onMounted(() => loadData())
+// Charts hold their own chart.js instances; nudge them when the theme flips.
+watch(currentTheme, () => {
+  /* palettes are computed and re-read on change */
+})
 </script>
 
 <template>
   <div class="space-y-6">
-    <!-- Loading Skeleton -->
-    <div v-if="loading" class="flex items-center justify-center h-64">
-      <span class="loading loading-spinner loading-lg text-primary"></span>
+    <!-- Freshness and failure state, above everything. A dashboard that has
+         stopped updating must look broken, not healthy. -->
+    <div class="flex items-center justify-between gap-4 flex-wrap">
+      <div class="flex items-center gap-3 text-xs">
+        <span v-if="lastLoadedAt" class="opacity-60 font-mono">
+          Updated {{ formatTime(lastLoadedAt) }}
+        </span>
+        <span v-else class="opacity-60">Loading…</span>
+      </div>
+      <button class="btn btn-ghost btn-xs gap-1.5" :disabled="loading" @click="refreshAll">
+        <RotateCw class="w-3.5 h-3.5" :class="loading && 'animate-spin'" />
+        Refresh
+      </button>
     </div>
 
-    <template v-else>
-      <!-- ═══ Row 1: Risk Ribbon — 5 KPI Stats ═══ -->
+    <DataState :loading="loading" :error="error" :loaded="loaded" @retry="refreshAll">
+      <!-- ═══ Risk ribbon ═══ -->
       <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
         <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
-          <div class="stat-figure text-primary">
-            <KeyRound class="w-5 h-5" />
-          </div>
-          <div class="stat-title text-xs">Total Certificates</div>
-          <div class="stat-value text-2xl">{{ stats.total_certificates || 60 }}</div>
+          <div class="stat-figure text-primary"><KeyRound class="w-5 h-5" /></div>
+          <div class="stat-title text-xs">Total certificates</div>
+          <div class="stat-value text-2xl tabular-nums">{{ summary.total_certificates }}</div>
           <div class="stat-desc text-[11px]">Across all CAs</div>
         </div>
         <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
-          <div class="stat-figure text-warning">
-            <AlertTriangle class="w-5 h-5" />
-          </div>
+          <div class="stat-figure text-warning"><AlertTriangle class="w-5 h-5" /></div>
           <div class="stat-title text-xs">Expiring in 30d</div>
-          <div class="stat-value text-2xl text-warning">{{ stats.expiring_soon_certs || 8 }}</div>
-          <div class="stat-desc text-[11px]">↑ 2 since last week</div>
+          <div class="stat-value text-2xl tabular-nums" :class="summary.expiring_soon_certs > 0 && 'text-warning'">
+            {{ summary.expiring_soon_certs }}
+          </div>
+          <div class="stat-desc text-[11px]">Inside the renewal window</div>
         </div>
         <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
-          <div class="stat-figure text-error">
-            <XCircle class="w-5 h-5" />
-          </div>
+          <div class="stat-figure text-error"><XCircle class="w-5 h-5" /></div>
           <div class="stat-title text-xs">Expired</div>
-          <div class="stat-value text-2xl text-error">{{ stats.expired_certs || 3 }}</div>
-          <div class="stat-desc text-[11px]">Requires attention</div>
+          <div class="stat-value text-2xl tabular-nums" :class="summary.expired_certs > 0 && 'text-error'">
+            {{ summary.expired_certs }}
+          </div>
+          <div class="stat-desc text-[11px]">Serving traffic will fail</div>
         </div>
         <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
-          <div class="stat-figure text-info">
-            <Building2 class="w-5 h-5" />
-          </div>
-          <div class="stat-title text-xs">CA Authorities</div>
-          <div class="stat-value text-2xl">{{ stats.total_cas || cas.length || 4 }}</div>
-          <div class="stat-desc text-[11px]">{{ stats.healthy_cas || cas.length || 4 }} healthy</div>
+          <div class="stat-figure text-info"><Building2 class="w-5 h-5" /></div>
+          <div class="stat-title text-xs">CA authorities</div>
+          <div class="stat-value text-2xl tabular-nums">{{ summary.total_cas }}</div>
+          <div class="stat-desc text-[11px]">{{ summary.healthy_cas }} healthy</div>
         </div>
         <div class="stat bg-base-100 rounded-xl border border-base-300 p-4 col-span-2 md:col-span-1">
-          <div class="stat-figure text-success">
-            <CheckCircle class="w-5 h-5" />
+          <div class="stat-figure" :class="casNeedingAttention > 0 ? 'text-error' : 'text-success'">
+            <ShieldCheck class="w-5 h-5" />
           </div>
-          <div class="stat-title text-xs">Compliance</div>
-          <div class="stat-value text-2xl text-success">{{ complianceScore }}%</div>
-          <div class="stat-desc text-[11px]">Policy adherence</div>
+          <div class="stat-title text-xs">CAs needing attention</div>
+          <div
+            class="stat-value text-2xl tabular-nums"
+            :class="casNeedingAttention > 0 ? 'text-error' : 'text-success'"
+          >
+            {{ casNeedingAttention }}
+          </div>
+          <div class="stat-desc text-[11px]">
+            {{ summary.warning_cas }} warning · {{ summary.critical_cas }} critical
+          </div>
         </div>
       </div>
 
-      <!-- ═══ Row 2: Certificate Status + Algorithm Distribution ═══ -->
+      <!-- ═══ Distributions ═══ -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div class="card bg-base-100 border border-base-300">
           <div class="card-body p-5">
-            <h2 class="card-title text-sm font-bold">Certificate Status Distribution</h2>
+            <h2 class="card-title text-sm font-bold">Certificate status</h2>
             <DoughnutChart
-              :labels="statusChartLabels"
-              :data="statusChartData"
-              :colors="statusChartColors"
-              :center-text="String(stats.total_certificates || 60)"
+              v-if="statusChart.data.length"
+              :labels="statusChart.labels"
+              :data="statusChart.data"
+              :colors="statusChart.colors"
+              :center-text="String(summary.total_certificates)"
               center-sub="Total"
             />
+            <p v-else class="text-xs opacity-60 py-8 text-center">No certificates yet.</p>
           </div>
         </div>
         <div class="card bg-base-100 border border-base-300">
           <div class="card-body p-5">
-            <h2 class="card-title text-sm font-bold">Algorithm & Key Distribution</h2>
+            <h2 class="card-title text-sm font-bold">Key algorithms</h2>
             <DoughnutChart
-              :labels="algoChartLabels"
-              :data="algoChartData"
-              :colors="algoChartColors"
-              center-text="60"
+              v-if="algoChart.data.length"
+              :labels="algoChart.labels"
+              :data="algoChart.data"
+              :colors="catColors"
+              :center-text="String(algoChart.data.reduce((a, b) => a + b, 0))"
               center-sub="Keys"
             />
+            <p v-else class="text-xs opacity-60 py-8 text-center">No certificates yet.</p>
           </div>
         </div>
       </div>
 
-      <!-- ═══ Row 3: Expiration Timeline + Certs by CA ═══ -->
+      <!-- ═══ Forecast ═══ -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div class="card bg-base-100 border border-base-300">
           <div class="card-body p-5">
-            <h2 class="card-title text-sm font-bold">Expiration Forecast</h2>
-            <BarChart :labels="expirationLabels" :datasets="expirationDatasets" />
+            <h2 class="card-title text-sm font-bold">Expiration forecast</h2>
+            <BarChart :labels="expirationChart.labels" :datasets="expirationChart.datasets" />
           </div>
         </div>
         <div class="card bg-base-100 border border-base-300">
           <div class="card-body p-5">
-            <h2 class="card-title text-sm font-bold">Certificates by CA Provider</h2>
+            <h2 class="card-title text-sm font-bold">Certificates by CA</h2>
             <DoughnutChart
-              :labels="caDistLabels"
-              :data="caDistData"
-              :colors="caDistColors"
+              v-if="caDistChart.data.length"
+              :labels="caDistChart.labels"
+              :data="caDistChart.data"
+              :colors="catColors"
             />
+            <p v-else class="text-xs opacity-60 py-8 text-center">No certificates yet.</p>
           </div>
         </div>
       </div>
 
-      <!-- ═══ Row 4: CA Health Table + Activity Log ═══ -->
+      <!-- ═══ CA health and activity ═══ -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <!-- CA Health Summary -->
         <div class="card bg-base-100 border border-base-300">
           <div class="card-body p-5">
-            <h2 class="card-title text-sm font-bold mb-2">Monitored CA Health</h2>
-            <div class="overflow-x-auto">
-              <table class="table table-sm table-zebra">
+            <h2 class="card-title text-sm font-bold mb-2">CA health — most urgent first</h2>
+            <div v-if="casByUrgency.length" class="overflow-x-auto">
+              <table class="table table-sm">
                 <thead>
                   <tr>
-                    <th class="text-xs">CA Name</th>
+                    <th class="text-xs">CA</th>
                     <th class="text-xs">Type</th>
-                    <th class="text-xs">Expiry</th>
+                    <th class="text-xs text-right">Expires</th>
                     <th class="text-xs">Status</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <template v-if="cas.length">
-                    <tr v-for="ca in cas.slice(0, 6)" :key="ca.id">
-                      <td class="font-mono text-xs">{{ ca.common_name || ca.name }}</td>
-                      <td class="text-xs capitalize">{{ ca.ca_type || 'Root' }}</td>
-                      <td class="text-xs font-mono">{{ daysUntil(ca.not_after) }}d</td>
-                      <td>
-                        <span class="badge badge-sm" :class="getStatusBadge(ca.status || 'active')">
-                          {{ ca.status || 'Active' }}
-                        </span>
-                      </td>
-                    </tr>
-                  </template>
-                  <template v-else>
-                    <tr v-for="n in 4" :key="n">
-                      <td class="font-mono text-xs">{{ ['Root CA', 'ACME Issuer', 'Vault Sub-CA', 'GCP CAS'][n-1] }}</td>
-                      <td class="text-xs">{{ ['Root', 'Intermediate', 'Sub-CA', 'External'][n-1] }}</td>
-                      <td class="text-xs font-mono">{{ [365, 182, 90, 270][n-1] }}d</td>
-                      <td>
-                        <span class="badge badge-sm" :class="['badge-success', 'badge-success', 'badge-warning', 'badge-success'][n-1]">
-                          {{ ['Active', 'Active', 'Expiring', 'Active'][n-1] }}
-                        </span>
-                      </td>
-                    </tr>
-                  </template>
+                  <tr v-for="ca in casByUrgency.slice(0, 6)" :key="ca.id">
+                    <td class="text-xs font-medium">{{ ca.name }}</td>
+                    <td class="text-xs">{{ statusLabel(ca.ca_type) }}</td>
+                    <td
+                      class="text-xs font-mono tabular-nums text-right"
+                      :class="severityText(caSeverity(ca.status))"
+                    >
+                      {{ formatDaysShort(ca.days_remaining) }}
+                    </td>
+                    <td>
+                      <span class="badge badge-sm" :class="severityBadge(caSeverity(ca.status))">
+                        {{ statusLabel(ca.status) }}
+                      </span>
+                    </td>
+                  </tr>
                 </tbody>
               </table>
             </div>
+            <p v-else class="text-xs opacity-60 py-8 text-center">
+              No CA authorities registered yet.
+            </p>
           </div>
         </div>
 
-        <!-- Recent Activity -->
         <div class="card bg-base-100 border border-base-300">
           <div class="card-body p-5">
-            <h2 class="card-title text-sm font-bold mb-2">Recent Activity</h2>
-            <ul class="timeline timeline-vertical timeline-compact text-xs">
-              <template v-if="activityLogs.length">
-                <li v-for="(log, i) in activityLogs.slice(0, 6)" :key="i">
-                  <hr v-if="i > 0" />
-                  <div class="timeline-start text-[10px] font-mono opacity-60">{{ formatDate(log.timestamp) }}</div>
-                  <div class="timeline-middle">
-                    <CheckCircle class="w-3.5 h-3.5 text-success" />
-                  </div>
-                  <div class="timeline-end timeline-box text-xs py-1.5 px-2.5">{{ log.message || log.action }}</div>
-                  <hr v-if="i < 5" />
-                </li>
-              </template>
-              <template v-else>
-                <li v-for="(evt, i) in [
-                  { time: 'Just now', msg: 'Certificate api.certpilot.io issued', icon: 'success' },
-                  { time: '2 min ago', msg: 'Root CA health check passed', icon: 'success' },
-                  { time: '15 min ago', msg: 'TLS discovery scan completed', icon: 'info' },
-                  { time: '1 hour ago', msg: 'Policy Minimum RSA 2048 enforced', icon: 'warning' },
-                  { time: '3 hours ago', msg: 'ACME gateway account connected', icon: 'success' },
-                  { time: 'Yesterday', msg: 'Vault Sub-CA certificate renewed', icon: 'success' },
-                ]" :key="i">
-                  <hr v-if="i > 0" />
-                  <div class="timeline-start text-[10px] font-mono opacity-60">{{ evt.time }}</div>
-                  <div class="timeline-middle">
-                    <CheckCircle v-if="evt.icon === 'success'" class="w-3.5 h-3.5 text-success" />
-                    <Clock v-else-if="evt.icon === 'info'" class="w-3.5 h-3.5 text-info" />
-                    <AlertTriangle v-else class="w-3.5 h-3.5 text-warning" />
-                  </div>
-                  <div class="timeline-end timeline-box text-xs py-1.5 px-2.5">{{ evt.msg }}</div>
-                  <hr v-if="i < 5" />
-                </li>
-              </template>
+            <h2 class="card-title text-sm font-bold mb-2">Recent activity</h2>
+            <ul v-if="activityList.length" class="space-y-2">
+              <li
+                v-for="log in activityList.slice(0, 7)"
+                :key="log.id"
+                class="flex items-start gap-2.5 text-xs"
+              >
+                <span
+                  class="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0"
+                  :class="{
+                    'bg-error': activitySeverity(log) === 'critical',
+                    'bg-warning': activitySeverity(log) === 'warning',
+                    'bg-success': activitySeverity(log) === 'ok',
+                  }"
+                ></span>
+                <span class="flex-1">{{ describeActivity(log) }}</span>
+                <span class="opacity-50 font-mono text-[10px] shrink-0 whitespace-nowrap">
+                  {{ formatRelative(log.created_at) }}
+                </span>
+              </li>
             </ul>
+            <p v-else class="text-xs opacity-60 py-8 text-center">No activity recorded yet.</p>
           </div>
         </div>
       </div>
-    </template>
+    </DataState>
   </div>
 </template>

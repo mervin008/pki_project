@@ -39,14 +39,17 @@ export function useApi() {
     return response.json()
   }
 
+  // Every verb accepts an AbortSignal so useAsyncData can cancel a request that
+  // has been superseded — otherwise a slow earlier response can land after a
+  // newer one and roll the view back to stale data.
   return {
-    get: <T>(url: string) => request<T>(url, { method: 'GET' }),
-    post: <T>(url: string, body?: any) =>
-      request<T>(url, { method: 'POST', body: body ? JSON.stringify(body) : undefined }),
-    put: <T>(url: string, body?: any) =>
-      request<T>(url, { method: 'PUT', body: body ? JSON.stringify(body) : undefined }),
-    patch: <T>(url: string, body?: any) =>
-      request<T>(url, { method: 'PATCH', body: body ? JSON.stringify(body) : undefined }),
-    delete: <T>(url: string) => request<T>(url, { method: 'DELETE' }),
+    get: <T>(url: string, signal?: AbortSignal) => request<T>(url, { method: 'GET', signal }),
+    post: <T>(url: string, body?: any, signal?: AbortSignal) =>
+      request<T>(url, { method: 'POST', body: body ? JSON.stringify(body) : undefined, signal }),
+    put: <T>(url: string, body?: any, signal?: AbortSignal) =>
+      request<T>(url, { method: 'PUT', body: body ? JSON.stringify(body) : undefined, signal }),
+    patch: <T>(url: string, body?: any, signal?: AbortSignal) =>
+      request<T>(url, { method: 'PATCH', body: body ? JSON.stringify(body) : undefined, signal }),
+    delete: <T>(url: string, signal?: AbortSignal) => request<T>(url, { method: 'DELETE', signal }),
   }
 }

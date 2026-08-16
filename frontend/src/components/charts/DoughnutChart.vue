@@ -7,16 +7,30 @@ import {
 } from 'chart.js'
 import { Doughnut } from 'vue-chartjs'
 import { computed } from 'vue'
+import { storeToRefs } from 'pinia'
+import { useThemeStore } from '@/stores/theme'
+import { chartTheme } from '@/lib/chartTheme'
 
 ChartJS.register(ArcElement, Tooltip, Legend)
 
-const props = defineProps<{
-  labels: string[]
-  data: number[]
-  colors: string[]
-  centerText?: string
-  centerSub?: string
-}>()
+const { currentTheme } = storeToRefs(useThemeStore())
+
+const props = withDefaults(
+  defineProps<{
+    labels: string[]
+    data: number[]
+    colors: string[]
+    centerText?: string
+    centerSub?: string
+    /**
+     * Animate value changes. Off by default: with live updates arriving, the
+     * chart.js default 1000ms tween restarts on every tick and the chart never
+     * settles.
+     */
+    animate?: boolean
+  }>(),
+  { animate: false },
+)
 
 const chartData = computed(() => ({
   labels: props.labels,
@@ -30,30 +44,39 @@ const chartData = computed(() => ({
   ],
 }))
 
-const chartOptions = computed(() => ({
-  responsive: true,
-  maintainAspectRatio: false,
-  cutout: '68%',
-  plugins: {
-    legend: {
-      display: true,
-      position: 'bottom' as const,
-      labels: {
-        padding: 16,
-        usePointStyle: true,
-        pointStyleWidth: 8,
-        font: { size: 11, family: 'Inter' },
+// Legend and tooltip colours come from the theme rather than a fixed dark
+// palette, so the chart stays legible after the light/dark toggle.
+const chartOptions = computed(() => {
+  const t = chartTheme(currentTheme.value)
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    cutout: '68%',
+    animation: props.animate ? undefined : (false as const),
+    plugins: {
+      legend: {
+        display: true,
+        position: 'bottom' as const,
+        labels: {
+          padding: 16,
+          usePointStyle: true,
+          pointStyleWidth: 8,
+          color: t.text,
+          font: { size: 11, family: 'Inter' },
+        },
+      },
+      tooltip: {
+        backgroundColor: t.tooltipBg,
+        titleColor: t.tooltipText,
+        bodyColor: t.tooltipText,
+        titleFont: { family: 'Inter', size: 12 },
+        bodyFont: { family: 'JetBrains Mono', size: 11 },
+        padding: 10,
+        cornerRadius: 8,
       },
     },
-    tooltip: {
-      backgroundColor: 'rgba(15,23,42,0.9)',
-      titleFont: { family: 'Inter', size: 12 },
-      bodyFont: { family: 'JetBrains Mono', size: 11 },
-      padding: 10,
-      cornerRadius: 8,
-    },
-  },
-}))
+  }
+})
 </script>
 
 <template>
