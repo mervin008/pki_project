@@ -1,58 +1,102 @@
-# CertPilot Configuration (Development)
-# Copy this to config.dev.yaml and fill in your values
+# CertPilot configuration template.
+#
+# Copy to config.dev.yaml (development) or config.yaml (production) and edit.
+# Values of the form ${VAR} are expanded from the environment at load time, so
+# secrets never need to live in this file.
+#
+# Before starting, set CERTPILOT_KEK. Certificate private keys and CA
+# credentials are encrypted with it before they reach the database, and the
+# core refuses to start against a database without one:
+#
+#   make generate-kek
 
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8080
-  mode: "development"  # development | production
+  # development | production
+  #
+  # Production mode refuses several settings that are convenient locally and
+  # dangerous when deployed: anonymous access, an insecure gateway channel, and
+  # a wildcard CORS origin.
+  mode: "development"
+  # Browser origins permitted to call the API. A wildcard is not accepted
+  # alongside credentials, so name the frontend explicitly.
+  allowed_origins:
+    - "http://localhost:5173"
 
-# Supabase
-supabase:
-  url: "https://wlhrdxswnzwpiffvbkez.supabase.co"
-  anon_key: ""       # Your Supabase anon/publishable key
-  service_role_key: "" # Your Supabase service role key (backend only, never expose)
-  jwt_secret: ""      # Supabase JWT secret for token validation
+auth:
+  # Preferred: verify asymmetrically signed tokens against the provider's
+  # published keys. The core then holds nothing capable of minting a token.
+  # Works with any OIDC provider — Keycloak, Okta, Azure AD, Auth0, Authentik.
+  jwks_url: "${CERTPILOT_JWKS_URL}"
+  issuer: "${CERTPILOT_JWT_ISSUER}"
+  audience: "authenticated"
 
-# Gateway plugin settings
+  # Legacy shared-secret verification. Requires the core to hold a key that can
+  # forge admin tokens; use jwks_url instead where the provider supports it.
+  # jwt_secret: "${CERTPILOT_JWT_SECRET}"
+
+  # Claim inside app_metadata carrying the CertPilot role. Roles are read only
+  # from app_metadata, never user_metadata, which the user can write.
+  role_claim: "certpilot_role"
+
+  # Skip authentication entirely and treat every request as admin.
+  # Refused unless mode is development and host is a loopback address.
+  allow_anonymous: true
+
+# Gateway plugins. Each CA provider runs as its own process.
 plugins:
-  # How the core discovers and communicates with gateways
-  discovery_mode: "static"  # static | docker | kubernetes
-  # Static gateway registrations (for local dev)
-  gateways: []
-    # - name: "selfsigned"
-    #   addr: "localhost:9091"
-    #   type: "selfsigned"
-    # - name: "acme-letsencrypt"
-    #   addr: "localhost:9092"
-    #   type: "acme"
+  discovery_mode: "static"
 
-# PKI monitoring
+  # Mutual TLS for the core-to-gateway channel. That channel carries CSRs,
+  # private keys, and CA credentials, so it is authenticated in both directions.
+  #
+  #   make dev-certs
+  tls:
+    cert_file: ".certpilot/pki/core.pem"
+    key_file: ".certpilot/pki/core-key.pem"
+    ca_file: ".certpilot/pki/ca.pem"
+    # Disables TLS on the gateway channel. Development only; refused in
+    # production mode.
+    insecure: false
+
+  gateways:
+    - name: "selfsigned-dev"
+      addr: "localhost:9091"
+      type: "selfsigned"
+      # Name expected in the gateway's certificate. Defaults to the host part
+      # of addr; set it when dialing by IP or through a service alias.
+      server_name: "localhost"
+
+    - name: "letsencrypt-staging"
+      addr: "localhost:9092"
+      type: "acme"
+      server_name: "localhost"
+
+# CA health monitoring, in minutes.
 pki:
-  # How often to check CA health (in minutes)
-  ca_health_check_interval: 360  # 6 hours
-  # How often to check CRL/OCSP (in minutes)
-  crl_ocsp_check_interval: 60   # 1 hour
+  ca_health_check_interval: 360
+  crl_ocsp_check_interval: 60
 
-# Certificate renewal
+# Certificate renewal.
+#
+# Note on lead days: the CA/Browser Forum schedule takes maximum validity to
+# 200 days (March 2026), 100 days (March 2027), and 47 days (March 2029). A
+# fixed 30-day lead stops making sense well before the end of that; where a CA
+# publishes renewal information (RFC 9773), the ACME gateway reports the
+# window it suggests, which is both better timed and what lets a CA drain a
+# mass-revocation event gradually.
 renewal:
-  # How often to scan for certificates needing renewal (in minutes)
   scan_interval: 60
-  # Default lead days before expiry to trigger renewal
   default_lead_days: 30
-  # Retry backoff (in minutes): 60, 240, 720, 1440
   retry_backoff: [60, 240, 720, 1440]
 
-# Notifications
-notifications:
-  channels: []
-    # - type: "slack"
-    #   webhook_url: "https://hooks.slack.com/services/..."
-    # - type: "email"
-    #   smtp_host: "smtp.example.com"
-    #   smtp_port: 587
-    #   from: "certpilot@example.com"
-
-# Logging
 logging:
-  level: "debug"  # debug | info | warn | error
-  format: "text"  # text | json
+  level: "info"
+  format: "text"
+
+# Supabase is one supported deployment target, not a requirement. The core
+# talks to any PostgreSQL database via CERTPILOT_DB_URL or --db.
+supabase:
+  url: "${SUPABASE_URL}"
+  anon_key: "${SUPABASE_ANON_KEY}"

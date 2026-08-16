@@ -1,63 +1,261 @@
-# Getting Started with CertPilot
+# Getting started
 
-CertPilot is an open-source PKI and Certificate Lifecycle Management (CLM) platform built for high reliability, automated renewal, and multi-CA orchestration.
+This walks through running CertPilot locally and issuing a certificate — first
+from the self-signed gateway, then from a real ACME CA.
 
-## Architecture Highlights
+See the [README](../README.md) for what is and is not built yet. In short: the
+core, the gateway architecture, ACME issuance, and the security layer work.
+Deployment, the host agent, and large-scale discovery do not.
 
-1. **Gateway Plugin Model**: Every CA provider (ACME, HashiCorp Vault, GCP CAS, Self-Signed) runs as an isolated binary or Docker container communicating via gRPC.
-2. **Supabase Database & Auth**: Powered by PostgreSQL 17 with database-level Row Level Security (RLS), OIDC/SSO authentication, and Realtime live WebSocket subscriptions.
-3. **Local-First & Containerized**: Run locally with `go run` and `npm run dev`, or deploy everything with Docker Compose.
+## Prerequisites
 
----
+- Go 1.22+
+- Node.js 20+ (frontend only)
+- [buf](https://buf.build) (only if you edit `.proto` files)
 
-## Local Development Setup
+No database and no cloud account are needed to try it. The core falls back to an
+in-memory store seeded with sample data.
 
-### 1. Prerequisites
-- **Go**: 1.22+
-- **Node.js**: 20+
-- **Buf** (optional, for editing protobuf schemas)
+## 1. Generate development keys
 
-### 2. Configure Environment
-Copy `config.example.yaml` to `config.dev.yaml`:
+Two things need key material before anything starts.
+
+```bash
+make dev-certs
+```
+
+This writes mutual-TLS material into `.certpilot/pki/` — a throwaway CA, a
+gateway certificate, and a core certificate. The core-to-gateway channel carries
+certificate signing requests, private keys, and CA credentials, so it is
+authenticated in both directions by default.
+
+```bash
+export CERTPILOT_KEK=$(make -s generate-kek | cut -d= -f2-)
+```
+
+The key encryption key seals certificate private keys and CA credentials before
+they reach the database. Against a real database the core refuses to start
+without one; with the in-memory store it will generate an ephemeral key and warn.
+
+> `.certpilot/` is gitignored. Never commit it: it contains CA and ACME account
+> private keys.
+
+## 2. Configure
+
 ```bash
 cp config.example.yaml config.dev.yaml
 ```
 
-Set your Supabase PostgreSQL connection string:
+The defaults are set up for local development: bound to loopback, anonymous API
+access enabled, mTLS pointed at `.certpilot/pki/`. Production mode refuses all
+three of those, so a development config cannot quietly become a production one.
+
+## 3. Run
+
+Each of these wants its own terminal.
+
 ```bash
-export CERTPILOT_DB_URL="postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres"
+make run-gateway-selfsigned   # :9091
 ```
 
-### 3. Run the Components
-
-**Terminal 1: Start Gateway (Self-Signed)**
 ```bash
-make run-gateway-selfsigned
+make run-core                 # :8080
 ```
 
-**Terminal 2: Start Gateway (ACME - Let's Encrypt)**
 ```bash
-make run-gateway-acme
+make run-frontend             # :5173
 ```
 
-**Terminal 3: Start CertPilot Core Control Plane**
+Confirm the gateway registered over mTLS:
+
 ```bash
+curl -s localhost:8080/api/v1/gateways | jq '.data[] | {name, is_connected}'
+```
+
+## 4. Issue a certificate
+
+Register the gateway as a CA account. The core connects, asks the gateway to
+validate the configuration, and only then seals and stores it:
+
+```bash
+curl -s -X POST localhost:8080/api/v1/ca-accounts \
+  -H 'Content-Type: application/json' -d '{
+    "name": "selfsigned-dev",
+    "provider_type": "selfsigned",
+    "gateway_addr": "localhost:9091",
+    "server_name": "localhost",
+    "config": {"validity_days": 90}
+  }' | jq
+```
+
+Then request a certificate, using the returned account id:
+
+```bash
+curl -s -X POST localhost:8080/api/v1/certificates \
+  -H 'Content-Type: application/json' -d '{
+    "common_name": "test.example.local",
+    "sans": ["www.test.example.local"],
+    "ca_account_id": "<id>",
+    "key_type": "ECDSA",
+    "key_size": 256,
+    "auto_renew": true
+  }' | jq
+```
+
+The response contains the certificate but **not** the private key. Keys are
+never included in list or detail responses; exporting one is a separate
+admin-only call that writes an audit record:
+
+```bash
+curl -s localhost:8080/api/v1/certificates/<id>/private-key | jq -r .private_key_pem
+```
+
+## 5. Issue from a real CA
+
+Start the ACME gateway against Let's Encrypt staging:
+
+```bash
+make run-gateway-acme         # :9092
+```
+
+ACME needs to prove you control the domain. Pick a challenge:
+
+### dns-01 (required for wildcards)
+
+Cloudflare — the token needs Zone:Read and DNS:Edit:
+
+```bash
+curl -s -X POST localhost:8080/api/v1/ca-accounts \
+  -H 'Content-Type: application/json' -d '{
+    "name": "letsencrypt-staging",
+    "provider_type": "acme",
+    "gateway_addr": "localhost:9092",
+    "server_name": "localhost",
+    "config": {
+      "directory_url": "letsencrypt-staging",
+      "email": "you@example.com",
+      "challenge": "dns-01",
+      "dns_provider": "cloudflare",
+      "dns_config": {"api_token": "YOUR_TOKEN"}
+    }
+  }' | jq
+```
+
+For any other DNS provider, use the webhook solver and write a small receiver —
+see [dns-01 solvers](#dns-01-solvers) below.
+
+### http-01
+
+The CA fetches `http://<domain>/.well-known/acme-challenge/<token>` on port 80.
+Either let the gateway bind port 80, or run it on a high port and have your
+existing reverse proxy forward that path to it:
+
+```json
+{
+  "directory_url": "letsencrypt-staging",
+  "email": "you@example.com",
+  "challenge": "http-01",
+  "http01_bind_addr": "127.0.0.1:5002"
+}
+```
+
+The gateway validates whichever configuration you supply before storing it, so a
+wrong token or an unreachable directory is reported immediately rather than
+during a renewal months later.
+
+Move to production by changing `directory_url` to `letsencrypt`. Do that only
+once staging works — Let's Encrypt production rate limits are strict and
+recovering from hitting them takes a week.
+
+## dns-01 solvers
+
+| Provider | `dns_provider` | Required `dns_config` |
+|:---|:---|:---|
+| Cloudflare | `cloudflare` | `api_token` |
+| Anything else | `webhook` | `url`, plus `bearer_token` and/or `signing_secret` |
+
+The webhook solver exists so CertPilot does not have to implement a solver for
+every DNS provider that will ever matter. It POSTs to an endpoint you control:
+
+```json
+{
+  "action": "present",
+  "type": "dns-01",
+  "domain": "example.com",
+  "fqdn": "_acme-challenge.example.com",
+  "value": "the TXT record contents",
+  "token": "acme-challenge-token"
+}
+```
+
+`action` is `present` or `cleanup`. When `signing_secret` is set, the request
+carries `X-CertPilot-Signature`: the hex HMAC-SHA256 of the raw body. Verify it
+before touching a zone. Respond 2xx on success; a non-2xx body is surfaced to
+the operator, so put the actual reason in it.
+
+Your receiver must tolerate two `present` calls for the same FQDN with different
+values — an order covering both `example.com` and `*.example.com` produces
+exactly that, and both TXT records have to coexist.
+
+## Using PostgreSQL
+
+```bash
+export CERTPILOT_DB_URL="postgresql://user:pass@localhost:5432/certpilot"
 make run-core
 ```
 
-**Terminal 4: Start Frontend SPA**
-```bash
-make run-frontend
-```
+Apply migrations in order from `migrations/`. Two caveats:
 
-Open [http://localhost:3000](http://localhost:3000) in your browser!
+- `001_initial_schema.sql` references `auth.users` and `auth.jwt()`, which exist
+  only on Supabase. It will not apply to vanilla PostgreSQL as written. The Go
+  store layer is plain `pgx` and has no Supabase dependency; the schema is the
+  only coupling.
+- With a database configured, `CERTPILOT_KEK` is mandatory. Losing it makes
+  every stored private key and CA credential unrecoverable, so put it in a
+  secret manager, not a shell profile.
 
----
+## Authentication
 
-## Running with Docker Compose
+Development uses `auth.allow_anonymous`, which treats every request as admin and
+is refused unless the server is in development mode on a loopback address.
 
-```bash
-cd deploy
-export CERTPILOT_DB_URL="postgresql://..."
-docker compose up -d
-```
+For anything else, point `auth.jwks_url` at your identity provider — Keycloak,
+Okta, Azure AD, Auth0, Authentik, or Supabase Auth all work. The core then
+verifies asymmetrically signed tokens against published public keys and holds
+nothing capable of minting one.
+
+Roles are read from `app_metadata.certpilot_role` in the token, and only from
+there — `user_metadata` is writable by the user it belongs to, so trusting it
+would let any account promote itself.
+
+| Role | Can do |
+|:---|:---|
+| `admin` | Everything, including deleting records and exporting private keys |
+| `operator` | Issue, renew, and revoke certificates; manage CAs and policies |
+| `auditor` | Read-only, including audit logs |
+| `viewer` | Read-only |
+
+## Troubleshooting
+
+**`invalid TLS configuration`** — run `make dev-certs`, or pass `--insecure` to
+a gateway for local work without TLS.
+
+**`could not connect to the gateway`** — the gateway process is not running, or
+its certificate does not name the host you dialed. Set `server_name` on the CA
+account when connecting by IP or through a service alias.
+
+**`CERTPILOT_KEK is not set`** — expected with a database configured. Run
+`make generate-kek`.
+
+**`the gateway rejected this configuration`** — the response lists exactly what
+is wrong. This is the gateway's `ValidateConfig` doing its job before a bad
+credential becomes a failed renewal.
+
+**ACME `no usable challenge`** — the CA does not offer the challenge type you
+configured. Wildcards require `dns-01`.
+
+## Next
+
+- [API reference](api-reference.md)
+- [Writing a gateway](writing-a-gateway.md)
+- [Roadmap](../ROADMAP.md)

@@ -4,11 +4,13 @@
 // gateway plugin orchestration, and team collaboration.
 //
 // Usage:
-//   go run ./core/cmd/ --config=config.dev.yaml
+//
+//	go run ./core/cmd/ --config=config.dev.yaml
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -20,12 +22,47 @@ import (
 
 	"github.com/certpilot/certpilot/core/server"
 	"github.com/certpilot/certpilot/pkg/config"
+	"github.com/certpilot/certpilot/pkg/grpckit"
+	"github.com/certpilot/certpilot/pkg/secrets"
 )
 
 func main() {
 	configPath := flag.String("config", "config.dev.yaml", "path to configuration YAML file")
 	dbURLFlag := flag.String("db", "", "PostgreSQL database connection URL (or CERTPILOT_DB_URL env var)")
+	generateKEK := flag.Bool("generate-kek", false,
+		"print a new base64 key encryption key for CERTPILOT_KEK and exit")
+	generateDevCerts := flag.String("generate-dev-certs", "",
+		"write development mTLS material for the core-to-gateway channel into this directory and exit")
 	flag.Parse()
+
+	// Setup subcommands run before anything else is initialized, so they work
+	// on a machine with no config and no database.
+	if *generateKEK {
+		key, err := secrets.GenerateKEK()
+		if err != nil {
+			slog.Error("failed to generate key", "error", err)
+			os.Exit(1)
+		}
+		fmt.Printf("CERTPILOT_KEK=%s\n", key)
+		fmt.Fprintln(os.Stderr,
+			"\nStore this in your secret manager. Certificate private keys and CA credentials\n"+
+				"are encrypted with it; losing it makes every stored secret unrecoverable.")
+		return
+	}
+
+	if *generateDevCerts != "" {
+		paths, err := grpckit.GenerateDevPKI(*generateDevCerts, []string{"localhost", "127.0.0.1", "::1"})
+		if err != nil {
+			slog.Error("failed to generate development certificates", "error", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Wrote development mTLS material to %s\n\n", *generateDevCerts)
+		fmt.Printf("  core:     %s / %s\n", paths.ClientCert, paths.ClientKey)
+		fmt.Printf("  gateway:  %s / %s\n", paths.ServerCert, paths.ServerKey)
+		fmt.Printf("  CA:       %s\n\n", paths.CACert)
+		fmt.Fprintln(os.Stderr, "Development use only — the CA key is stored beside the certificates it signs.")
+		return
+	}
 
 	// Setup logging
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -35,14 +72,29 @@ func main() {
 
 	slog.Info("initializing CertPilot Core", "config_file", *configPath)
 
-	// Load configuration
+	// Load configuration.
 	cfg, err := config.LoadCoreConfig(*configPath)
 	if err != nil {
-		slog.Warn("could not load config file, using environment/defaults", "error", err)
+		if !errors.Is(err, os.ErrNotExist) {
+			// A config file that exists but is malformed or unsafe must not be
+			// silently replaced by permissive defaults.
+			slog.Error("configuration is invalid", "path", *configPath, "error", err)
+			os.Exit(1)
+		}
+
+		slog.Warn("no configuration file found; starting with local development defaults",
+			"path", *configPath)
 		cfg = &config.CoreConfig{
-			Server: config.ServerConfig{Host: "0.0.0.0", Port: 8080, Mode: "development"},
+			Server: config.ServerConfig{
+				Host:           "127.0.0.1",
+				Port:           8080,
+				Mode:           "development",
+				AllowedOrigins: []string{"http://localhost:5173"},
+			},
+			Auth:    config.AuthConfig{AllowAnonymous: true, RoleClaim: "certpilot_role"},
 			Renewal: config.RenewalConfig{ScanInterval: 60, DefaultLeadDays: 30},
 			Plugins: config.PluginsConfig{
+				TLS: config.GatewayTLSConfig{Insecure: true},
 				Gateways: []config.GatewayConfig{
 					{Name: "selfsigned", Addr: "localhost:9091", Type: "selfsigned"},
 				},
@@ -60,11 +112,7 @@ func main() {
 	}
 
 	if dbConnStr == "" {
-		slog.Error("no database connection string provided. Set CERTPILOT_DB_URL or DATABASE_URL or pass --db")
-		fmt.Println("\nTo connect to your Supabase PostgreSQL database, provide the connection string:")
-		fmt.Println("  export CERTPILOT_DB_URL=\"postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres\"")
-		fmt.Println("  or pass --db=\"...\"")
-		os.Exit(1)
+		slog.Info("no database connection string provided; using in-memory store with sample seed data")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -99,6 +99,9 @@ message RevokeCertificateRequest {
   // 0=unspecified, 1=keyCompromise, 3=affiliationChanged,
   // 4=superseded, 5=cessationOfOperation
   int32 reason = 3;
+  // Provider-specific configuration as JSON. Required: a gateway cannot
+  // authenticate to the CA without the account credentials.
+  string provider_config = 4;
 }
 
 message RevokeCertificateResponse {
@@ -111,6 +114,9 @@ message RevokeCertificateResponse {
 message GetCertificateStatusRequest {
   string provider_certificate_id = 1;
   bytes certificate_pem = 2;
+  // Provider-specific configuration as JSON. Needed to reach the CA for
+  // renewal information and revocation status.
+  string provider_config = 3;
 }
 
 message GetCertificateStatusResponse {
@@ -118,6 +124,30 @@ message GetCertificateStatusResponse {
   CertStatus status = 1;
   string message = 2;
   google.protobuf.Timestamp expires_at = 3;
+  // Renewal guidance published by the CA (RFC 9773). Absent when the CA does
+  // not support ACME Renewal Information.
+  RenewalWindow renewal_window = 4;
+}
+
+// RenewalWindow carries the CA's own advice about when a certificate should be
+// replaced, as defined by RFC 9773 (ACME Renewal Information).
+//
+// Honouring this is what lets a CA drain a mass-revocation event gradually
+// instead of every client renewing at once, and it lets the CA move renewals
+// off a window it knows is about to become invalid.
+message RenewalWindow {
+  // Start and end bound the window the CA suggests renewing within. A client
+  // should pick a random time inside it rather than renewing at the start.
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end = 2;
+  // ExplanationURL points at a human-readable reason, typically set when the
+  // CA has brought a renewal window forward.
+  string explanation_url = 3;
+  // RenewNow is true when the current time falls inside the suggested window.
+  bool renew_now = 4;
+  // RetryAfterSeconds is how long the CA asks clients to wait before polling
+  // renewal information again.
+  int64 retry_after_seconds = 5;
 }
 
 enum CertStatus {

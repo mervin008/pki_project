@@ -5,12 +5,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
+	"github.com/certpilot/certpilot/pkg/grpckit"
 	commonv1 "github.com/certpilot/certpilot/pkg/pb/common/v1"
 	providerv1 "github.com/certpilot/certpilot/pkg/pb/provider/v1"
-	"github.com/certpilot/certpilot/pkg/grpckit"
 	"google.golang.org/grpc"
 )
 
@@ -29,19 +30,29 @@ type GatewayClient struct {
 
 // Manager manages connections to all configured gateway plugins.
 type Manager struct {
+	// tls is the client identity the core presents to every gateway. The
+	// channel carries CSRs, private keys, and CA credentials, so it is
+	// mutually authenticated unless explicitly disabled for development.
+	tls grpckit.TLSConfig
+
 	mu       sync.RWMutex
 	gateways map[string]*GatewayClient
 }
 
 // NewManager creates a new plugin manager.
-func NewManager() *Manager {
+func NewManager(tls grpckit.TLSConfig) *Manager {
 	return &Manager{
+		tls:      tls,
 		gateways: make(map[string]*GatewayClient),
 	}
 }
 
 // RegisterGateway connects to a gateway plugin and retrieves its capabilities.
-func (m *Manager) RegisterGateway(ctx context.Context, name, addr, gwType string) (*GatewayClient, error) {
+//
+// serverName overrides the name expected in the gateway's certificate, for
+// gateways dialed by IP or through a service alias. Pass "" to derive it from
+// the address.
+func (m *Manager) RegisterGateway(ctx context.Context, name, addr, gwType, serverName string) (*GatewayClient, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -52,7 +63,24 @@ func (m *Manager) RegisterGateway(ctx context.Context, name, addr, gwType string
 
 	slog.Info("connecting to gateway plugin", "name", name, "addr", addr, "type", gwType)
 
-	conn, err := grpckit.Dial(ctx, addr)
+	tlsCfg := m.tls
+	if !tlsCfg.Insecure {
+		tlsCfg.ServerName = serverName
+		if tlsCfg.ServerName == "" {
+			// Default to the host portion of the dial address, which is what
+			// the certificate should name.
+			if host, _, err := net.SplitHostPort(addr); err == nil {
+				tlsCfg.ServerName = host
+			} else {
+				tlsCfg.ServerName = addr
+			}
+		}
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	conn, err := grpckit.Dial(dialCtx, addr, tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial gateway %s at %s: %w", name, addr, err)
 	}
@@ -112,22 +140,35 @@ func (m *Manager) ListGateways() []*GatewayClient {
 
 // HealthCheckAll checks the health of all registered gateways.
 func (m *Manager) HealthCheckAll(ctx context.Context) map[string]*providerv1.HealthCheckResponse {
+	// Snapshot under the read lock, then make the network calls without it.
+	// Holding a lock across a gRPC round trip would stall every issuance for
+	// as long as the slowest gateway takes to answer.
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	results := make(map[string]*providerv1.HealthCheckResponse)
+	snapshot := make(map[string]*GatewayClient, len(m.gateways))
 	for name, gw := range m.gateways {
-		if !gw.IsConnected {
-			continue
+		if gw.IsConnected {
+			snapshot[name] = gw
 		}
-		resp, err := gw.Client.HealthCheck(ctx, &providerv1.HealthCheckRequest{})
+	}
+	m.mu.RUnlock()
+
+	results := make(map[string]*providerv1.HealthCheckResponse, len(snapshot))
+	for name, gw := range snapshot {
+		callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		resp, err := gw.Client.HealthCheck(callCtx, &providerv1.HealthCheckRequest{})
+		cancel()
+
+		m.mu.Lock()
+		gw.LastChecked = time.Now()
 		if err != nil {
 			slog.Warn("gateway health check failed", "name", name, "error", err)
 			gw.IsConnected = false
+			m.mu.Unlock()
 			continue
 		}
 		gw.LastHealth = resp
-		gw.LastChecked = time.Now()
+		m.mu.Unlock()
+
 		results[name] = resp
 	}
 	return results

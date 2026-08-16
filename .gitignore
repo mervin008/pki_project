@@ -1,50 +1,65 @@
-# Binaries
+# ── Build artifacts ──────────────────────────────────────
+/bin/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-certpilot-core
-gateway-*
 
-# Go
+# ── Go ───────────────────────────────────────────────────
 /vendor/
 go.work.sum
 
-# Generated protobuf
+# Generated protobuf code. Regenerate with `make proto`.
 pkg/pb/**/*.go
 !pkg/pb/.gitkeep
 
-# Test
+# ── Test output ──────────────────────────────────────────
 *.test
-*.out
+coverage.out
 coverage.txt
 coverage.html
 
-# IDE
+# ── Local state and secrets ──────────────────────────────
+#
+# .certpilot/ holds development mTLS material — including CA, gateway, and core
+# private keys — and persisted ACME account keys. None of it belongs in version
+# control, and an account key in a public repository lets anyone act as your
+# ACME account.
+.certpilot/
+
+# Key encryption keys, certificates, and anything else key-shaped.
+*.pem
+*.key
+*.p12
+*.pfx
+!deploy/**/*.example.pem
+
+.env
+.env.local
+.env.*.local
+config.dev.yaml
+config.yaml
+
+# ── Frontend ─────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ── Tooling ──────────────────────────────────────────────
+.claude/
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# OS
+# ── OS ───────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Environment
-.env
-.env.local
-.env.*.local
-config.dev.yaml
-
-# Frontend
-frontend/node_modules/
-frontend/dist/
-frontend/.vite/
-
-# Docker
+# ── Docker ───────────────────────────────────────────────
 .docker/
 
-# Logs
+# ── Logs ─────────────────────────────────────────────────
 *.log

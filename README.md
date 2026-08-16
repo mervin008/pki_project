@@ -1,123 +1,273 @@
 # CertPilot
 
-**Open-source PKI & Certificate Lifecycle Management Platform**
+**Open-source PKI and certificate lifecycle management.**
 
-CertPilot gives your team a single pane of glass across all your Certificate Authorities — public and private — with automated certificate renewal, CA health monitoring, discovery, policy enforcement, and team collaboration.
+One place to see every certificate your organisation has — across any CA, public
+or private — with automated renewal, CA health monitoring, policy enforcement,
+and cryptographic posture reporting.
 
-## Why CertPilot?
+> **Status: early development.** The core, the gateway plugin architecture, and
+> the ACME and self-signed gateways work end to end. Deployment to servers, the
+> host agent, network discovery at scale, and the PQC posture reporting are not
+> built yet. The [feature table](#what-works-today) below is accurate; anything
+> not listed there does not exist. Do not run this in production.
 
-Certificate lifetimes are shrinking fast (47 days by 2029). Manual management is dead. Existing open-source tools are great at individual tasks, but there's no unified platform that:
+## Why
 
-- Manages **both certificates AND the CAs themselves** (health, expiry, chain monitoring)
-- Works with **any CA** via a modular gateway plugin system
-- Runs only what you need — each gateway is a **separate container**
-- Provides a **real-time dashboard** with alerting
+Certificate validity is collapsing. The CA/Browser Forum schedule
+([ballot SC-081v3](https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/))
+takes maximum TLS certificate lifetime to **200 days in March 2026, 100 days in
+March 2027, and 47 days in March 2029**, with domain validation reuse falling to
+10 days on the same schedule. At 47 days, ten thousand certificates means
+roughly 670 renewals a day, continuously. Manual tracking stopped being viable
+some time ago; spreadsheet-and-calendar tracking is already broken.
+
+The open-source ecosystem is good at *getting* a certificate — certbot, lego,
+cert-manager, step-ca all do it well. What is missing is everything around it:
+knowing what you already have, where it is installed, whether it complies with
+your policy, and getting the renewed certificate onto the machine that serves
+it. That gap is where the commercial tools live, and it is what CertPilot is
+aimed at.
 
 ## Architecture
 
+Every CA provider runs as its own process — a *gateway* — speaking gRPC to the
+core. You run only the gateways you need, and adding support for a new CA means
+writing a plugin rather than patching the platform.
+
 ```
-┌─────────────────────────────┐
-│        Vue 3 Frontend        │
-└──────────────┬───────────────┘
-               │ HTTP
-┌──────────────▼───────────────┐
-│      CertPilot Core (Go)      │
-│  REST API · PKI Engine         │
-│  Renewal · Discovery · Policy  │
-│  Plugin Manager (gRPC hub)     │
-└──┬───────┬───────┬───────┬────┘
-   │ gRPC  │ gRPC  │ gRPC  │ gRPC
-┌──▼───┐ ┌─▼────┐ ┌▼─────┐ ┌▼────────┐
-│ ACME │ │Vault │ │ GCP  │ │SelfSign │
-│  GW  │ │ GW   │ │  GW  │ │  GW     │
-└──────┘ └──────┘ └──────┘ └─────────┘
+                    ┌──────────────────────────┐
+                    │      Vue 3 Frontend      │
+                    └────────────┬─────────────┘
+                                 │ HTTPS
+                    ┌────────────▼─────────────┐
+                    │     CertPilot Core       │
+                    │  REST API · PKI engine   │
+                    │  Renewal · Policy        │
+                    │  Plugin manager          │
+                    └──┬──────────────────┬────┘
+                       │  mutual TLS      │
+              ┌────────▼──────┐   ┌───────▼────────┐
+              │ ACME gateway  │   │ Self-signed    │
+              │ RFC 8555      │   │ gateway (dev)  │
+              └───────────────┘   └────────────────┘
+                       │
+              Let's Encrypt, ZeroSSL,
+              BuyPass, Google Trust
+              Services, step-ca
 ```
 
-**Each gateway is its own binary/container.** You only run the ones you need.
+The core-to-gateway channel carries certificate signing requests, private keys,
+and CA credentials, so it is **mutually authenticated by default**. Running it
+unauthenticated is possible for local development but has to be asked for
+explicitly.
 
-## Features
+## What works today
 
-### PKI & CA Management
-- 📊 **CA Dashboard** — Health status, days until CA cert expires, certificates issued count
-- 🌳 **Chain Visualization** — Interactive trust chain: Root → Intermediate → Issuing CA
-- 🔍 **CRL/OCSP Monitoring** — Track CRL freshness and OCSP responder availability
-- 🚨 **CA Alerts** — Configurable alerts for CA certificate expiry (365, 180, 90, 30, 14, 7 days)
+| Capability | State | Notes |
+|:---|:---|:---|
+| ACME issuance (RFC 8555) | ✅ | Full order flow: authorize, solve, finalize, download chain |
+| ACME challenges | ✅ | `dns-01` via Cloudflare or a generic webhook; `http-01` via a built-in listener |
+| Wildcard certificates | ✅ | Over `dns-01` |
+| External Account Binding | ✅ | Required by ZeroSSL, Google Trust Services, SSL.com |
+| ACME revocation | ✅ | Real revocation; already-revoked is treated as success |
+| Renewal information (RFC 9773) | ✅ | Reads the CA's suggested renewal window where published |
+| Self-signed gateway | ✅ | Development and testing |
+| Secrets encrypted at rest | ✅ | AES-256-GCM envelope encryption, context-bound, rotatable |
+| Mutual TLS, core ↔ gateway | ✅ | Required by default; `make dev-certs` to get started |
+| OIDC authentication | ✅ | Any provider, via JWKS; legacy shared-secret path also supported |
+| RBAC | ✅ | admin / operator / auditor / viewer, enforced per route |
+| Audit log | ⚠️ | Recorded, but the table is not yet tamper-evident |
+| Automated renewal | ⚠️ | Works; no retry, backoff, or distributed locking yet |
+| CA health monitoring | ⚠️ | Expiry and CRL freshness are real; the OCSP check is not a real OCSP request |
+| Policy engine | ⚠️ | `key_size`, `max_lifetime`, `ca_restriction`; other rule types are not implemented |
+| Discovery | ⚠️ | Single `host:port` scan only. No CIDR, CT logs, or cloud inventory |
+| Notifications | ⚠️ | Generic webhook only. No Slack, Teams, email, or PagerDuty |
+| Deployment to servers | ❌ | Not started |
+| Host agent | ❌ | Not started |
+| PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
+| Vault, GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
 
-### Certificate Lifecycle
-- 🔄 **Auto-Renewal** — Certificates renew automatically before expiry
-- 🔌 **Multi-CA** — Issue from any CA via gateway plugins (ACME, Vault, GCP CAS, DigiCert, etc.)
-- 🔎 **Discovery** — Scan networks and CT logs to find all certificates
-- 📋 **Policy Engine** — Enforce key size, algorithms, CA restrictions, naming rules
-- 🚀 **Deployment** — Push renewed certs to servers, load balancers, CDNs
+## Quick start
 
-### Platform
-- 🔐 **OIDC/SSO + RBAC** — Supabase Auth with any OIDC provider + role-based access control
-- 📡 **Real-time Dashboard** — Live updates via Supabase Realtime
-- 📝 **Audit Trail** — Immutable audit logs for compliance
-- 🔔 **Notifications** — Slack, Teams, Email, PagerDuty, webhooks
-
-## Quick Start
-
-### Prerequisites
-- Go 1.22+
-- Node.js 20+
-- A [Supabase](https://supabase.com) project
-
-### Development
+Requires Go 1.22+ and Node 20+. No database or cloud account needed to try it —
+the core runs with an in-memory store seeded with sample data.
 
 ```bash
-# Clone
 git clone https://github.com/your-org/certpilot.git
 cd certpilot
-
-# Configure
-cp config.example.yaml config.dev.yaml
-# Edit config.dev.yaml with your Supabase URL and keys
-
-# Run Core
-go run core/cmd/main.go --config=config.dev.yaml
-
-# Run a gateway (separate terminal)
-go run gateways/selfsigned/cmd/main.go --port=9091
-
-# Run Frontend (separate terminal)
-cd frontend && npm install && npm run dev
+make dev-certs
 ```
 
-### Docker (Production)
+That writes development mTLS material into `.certpilot/pki/`. Then, in separate
+terminals:
 
 ```bash
-cd deploy
-docker compose up -d
+make run-gateway-selfsigned
 ```
 
-## Supported Gateways
+```bash
+cp config.example.yaml config.dev.yaml
+export CERTPILOT_KEK=$(make -s generate-kek | cut -d= -f2-)
+make run-core
+```
 
-| Gateway | CA | Status |
-|:---|:---|:---|
-| `gateway-acme` | Let's Encrypt, ZeroSSL, BuyPass, Google Trust Services | ✅ Phase 1 |
-| `gateway-selfsigned` | Self-signed (dev/testing) | ✅ Phase 1 |
-| `gateway-vault` | HashiCorp Vault PKI | ✅ Phase 1 |
-| `gateway-gcp-cas` | Google Cloud Certificate Authority Service | 🔜 Phase 2 |
-| `gateway-aws-pca` | AWS Private CA | 🔜 Phase 2 |
-| `gateway-digicert` | DigiCert CertCentral | 🔜 Phase 2 |
-| `gateway-sectigo` | Sectigo Certificate Manager | 🔜 Phase 2 |
+```bash
+make run-frontend
+```
 
-### Writing Your Own Gateway
+The API is on `:8080`, the frontend on `:5173`.
 
-See [docs/writing-a-gateway.md](docs/writing-a-gateway.md) for a guide on building a custom gateway plugin.
+### Issue a certificate
 
-## Tech Stack
+```bash
+curl -X POST localhost:8080/api/v1/ca-accounts -H 'Content-Type: application/json' -d '{
+  "name": "selfsigned-dev",
+  "provider_type": "selfsigned",
+  "gateway_addr": "localhost:9091",
+  "server_name": "localhost",
+  "config": {"validity_days": 90}
+}'
+```
+
+```bash
+curl -X POST localhost:8080/api/v1/certificates -H 'Content-Type: application/json' -d '{
+  "common_name": "test.example.local",
+  "sans": ["www.test.example.local"],
+  "ca_account_id": "<id from above>",
+  "key_type": "ECDSA",
+  "key_size": 256
+}'
+```
+
+### Against a real CA
+
+Point the ACME gateway at Let's Encrypt staging and configure `dns-01`:
+
+```bash
+make run-gateway-acme
+```
+
+```bash
+curl -X POST localhost:8080/api/v1/ca-accounts -H 'Content-Type: application/json' -d '{
+  "name": "letsencrypt-staging",
+  "provider_type": "acme",
+  "gateway_addr": "localhost:9092",
+  "server_name": "localhost",
+  "config": {
+    "directory_url": "letsencrypt-staging",
+    "email": "you@example.com",
+    "challenge": "dns-01",
+    "dns_provider": "cloudflare",
+    "dns_config": {"api_token": "YOUR_CLOUDFLARE_TOKEN"}
+  }
+}'
+```
+
+The gateway validates this configuration before it is stored, so a wrong token
+surfaces immediately rather than during a renewal at 3am.
+
+## Security model
+
+Read this before deploying anything.
+
+**Private keys.** The best outcome is that CertPilot never sees one. Supply a
+CSR with a certificate request and the key stays wherever it was generated. When
+no CSR is supplied the gateway generates a key, and that key is sealed with
+AES-256-GCM before it reaches the database. Keys are never included in list or
+detail responses; exporting one is a separate admin-only endpoint that writes an
+audit record.
+
+**Key encryption.** Set `CERTPILOT_KEK` to a base64 32-byte key
+(`make generate-kek`). Values are sealed under a per-record data key which is
+itself wrapped by the KEK, so rotation is incremental: put the new key in
+`CERTPILOT_KEK`, list the old one in `CERTPILOT_KEK_RETIRED`, and re-seal at
+leisure. Ciphertexts are bound to the field they belong to, so a blob cannot be
+moved from one column to another. The core refuses to start against a database
+without a KEK.
+
+**Transport.** Core-to-gateway is mutual TLS 1.3 with both ends verified against
+a shared CA. gRPC reflection is off by default.
+
+**Authentication.** Prefer `auth.jwks_url` — the core then verifies
+asymmetrically signed tokens and holds nothing capable of minting one. Roles are
+read only from `app_metadata`, never `user_metadata`, which the user can write.
+Accepted signing algorithms are pinned. An invalid token is always rejected;
+there is no development fallback that grants admin.
+
+**Production mode** refuses anonymous access, an insecure gateway channel, and a
+wildcard CORS origin. These are the settings that look harmless locally and
+travel to production unnoticed.
+
+### Known gaps
+
+- The audit log is an ordinary table. It is not yet hash-chained, so a database
+  writer can rewrite history.
+- Renewal has no retry, backoff, or distributed lock. Two core replicas will
+  renew the same certificate concurrently.
+- The OCSP responder check is an HTTP GET, not an RFC 6960 request, and reports
+  a responder as healthy when it should not.
+- `migrations/001_initial_schema.sql` references `auth.users` and `auth.jwt()`,
+  which exist only on Supabase. It will not apply to vanilla PostgreSQL. The
+  Go store layer itself is plain `pgx` and has no Supabase dependency.
+
+## Post-quantum
+
+The plan here is deliberately not "issue ML-DSA certificates", because for
+public TLS that is not currently possible: the CA/Browser Forum has not updated
+the Baseline Requirements to permit ML-DSA, and in February 2026 Google stated
+Chrome has no near-term plan to accept post-quantum algorithms in traditional
+X.509 certificates in its root store — it is pursuing
+[Merkle Tree Certificates](https://datatracker.ietf.org/wg/plants/about/)
+instead. Meanwhile the urgent quantum risk, harvest-now-decrypt-later, is
+already addressed by hybrid key exchange that browsers deploy today.
+
+So the work is **crypto-agility posture**: knowing where your cryptography
+lives, how exposed it is, and what breaks when the algorithms change.
+
+[Migration 002](migrations/002_crypto_agility.sql) lays the groundwork. It
+removes the `key_type IN ('RSA','ECDSA','Ed25519')` constraints that would
+otherwise block PQC entirely, replaces them with an extensible algorithm table
+covering ML-DSA, SLH-DSA, Falcon and composite schemes, and adds tables for
+observed TLS posture. The reporting built on top — CBOM export, readiness
+scoring, hybrid key exchange visibility — is not implemented yet.
+
+ML-DSA issuance will land first in the private-CA gateways (Vault, step-ca, AWS
+Private CA), where it is usable today.
+
+## Writing a gateway
+
+A gateway implements one gRPC service,
+[`CertificateProviderService`](proto/provider/v1/provider.proto): issue, renew,
+revoke, status, CA info, capabilities, health, and config validation. See
+[docs/writing-a-gateway.md](docs/writing-a-gateway.md), and
+[`gateways/selfsigned`](gateways/selfsigned) for the smallest complete example.
+
+## Development
+
+```bash
+make test        # all modules
+make test-race   # under the race detector
+make lint        # go vet and gofmt
+make proto       # regenerate protobuf code
+make help        # everything else
+```
+
+The repository is a Go workspace of four modules: `pkg` (shared), `core`, and
+one per gateway. Tooling iterates over them, since a single `./...` from the
+root does not cover a workspace.
+
+## Tech stack
 
 | Layer | Technology |
 |:---|:---|
 | Backend | Go |
 | Frontend | Vue 3, TypeScript, Vite, Pinia |
-| Database | Supabase (PostgreSQL 17) |
-| Auth | Supabase Auth (OIDC/SSO + email/password) |
-| Plugin Communication | gRPC (protobuf) |
-| Containerization | Docker |
+| Database | PostgreSQL 17 (Supabase supported, not required) |
+| Auth | OIDC via JWKS |
+| Plugin transport | gRPC over mutual TLS |
+| Packaging | Docker |
 
 ## License
 
-[Apache License 2.0](LICENSE)
+[Apache 2.0](LICENSE)
