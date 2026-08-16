@@ -21,6 +21,14 @@ export default defineConfig({
         target: 'http://127.0.0.1:8080',
         changeOrigin: true,
       },
+      // The liveness probe is unversioned and so does not match /api. Without
+      // it here, Vite answers with index.html and the caller's response.json()
+      // fails on the leading '<' — which surfaces as an "invalid JSON" error on
+      // the Settings page rather than as the unreachable API it actually is.
+      '/healthz': {
+        target: 'http://127.0.0.1:8080',
+        changeOrigin: true,
+      },
     },
   },
 })

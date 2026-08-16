@@ -1,6 +1,10 @@
 package store
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 // The RLS rule is the one this check turns on, and both ways of getting it
 // wrong are bad in different ways. Too permissive and the core serves an empty
@@ -78,5 +82,29 @@ func TestRLSBlockedTables(t *testing.T) {
 func TestRLSCheckIgnoresAbsentTables(t *testing.T) {
 	if blocked := rlsBlockedTables(map[string]tableInfo{}, false); len(blocked) > 0 {
 		t.Errorf("missing tables should not be reported as RLS-blocked, got %v", blocked)
+	}
+}
+
+// PostgreSQL's inet type does not scan into a Go *string, and pgx fails the
+// whole query rather than the offending row — so one audit entry recorded with
+// a client IP took out the entire activity feed. Writing works either way,
+// which is what made it invisible until the API read back what it had written.
+//
+// The fix is to select host(ip_address). This guards it, because the in-memory
+// store cannot express the failure and nothing else here would notice a revert.
+func TestInetColumnsAreReadThroughHost(t *testing.T) {
+	source, err := os.ReadFile("postgres.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A bare column name inside a comma-separated list is a select projection.
+	// The INSERT that writes it ends the list with `ip_address)`, so it does
+	// not match and is correctly left alone.
+	for _, column := range []string{"ip_address", "last_seen_ip"} {
+		if strings.Contains(string(source), ", "+column+",") {
+			t.Errorf("%s is selected directly; it is an inet column and must be read as host(%s)",
+				column, column)
+		}
 	}
 }

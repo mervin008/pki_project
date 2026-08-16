@@ -923,7 +923,14 @@ func (s *PostgresStore) ListAuditLogs(ctx context.Context, filter AuditLogFilter
 	}
 
 	query := fmt.Sprintf(`
-		SELECT id, action, entity_type, entity_id, actor_id, actor_email, details, ip_address, created_at
+		-- host(ip_address), not ip_address. The column is inet and AuditLog.IPAddress
+		-- is a *string, which pgx cannot scan an inet into — it fails the whole
+		-- query, so one entry recorded with a client IP took out the entire
+		-- activity feed. Writing works either way, which is why this only showed
+		-- up on reading back what the API itself had written. host() renders the
+		-- address without any netmask suffix; display_tokens already does the
+		-- same for last_seen_ip.
+		SELECT id, action, entity_type, entity_id, actor_id, actor_email, details, host(ip_address), created_at
 		FROM public.audit_logs WHERE %s ORDER BY created_at DESC LIMIT $%d OFFSET $%d
 	`, whereClause, argIdx, argIdx+1)
 	args = append(args, limit, offset)
