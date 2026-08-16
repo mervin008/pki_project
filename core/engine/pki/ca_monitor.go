@@ -10,6 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/certpilot/certpilot/core/store"
@@ -20,6 +22,8 @@ import (
 type CAMonitor struct {
 	store      store.Store
 	httpClient *http.Client
+	stopCh     chan struct{}
+	stopOnce   sync.Once
 }
 
 // NewCAMonitor creates a new CA health monitor.
@@ -29,7 +33,50 @@ func NewCAMonitor(s store.Store) *CAMonitor {
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		stopCh: make(chan struct{}),
 	}
+}
+
+// Start runs a health check across every CA on the given interval.
+//
+// An expiring issuing CA is the highest-consequence failure in a PKI: it does
+// not take down one service, it takes down everything that CA signs, and no
+// amount of certificate automation helps once the CA above it has expired. So
+// the sweep runs on a timer rather than waiting for someone to open the
+// dashboard and press a button.
+func (m *CAMonitor) Start(interval time.Duration) {
+	if interval <= 0 {
+		interval = 6 * time.Hour
+	}
+
+	slog.Info("starting CA health monitor", "interval", interval)
+
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+
+		// Run immediately, so a freshly started core reports real CA state
+		// rather than whatever was last persisted.
+		if err := m.CheckAllCAs(context.Background()); err != nil {
+			slog.Error("initial CA health check failed", "error", err)
+		}
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := m.CheckAllCAs(context.Background()); err != nil {
+					slog.Error("CA health check failed", "error", err)
+				}
+			case <-m.stopCh:
+				return
+			}
+		}
+	}()
+}
+
+// Stop halts the monitor. It is safe to call more than once.
+func (m *CAMonitor) Stop() {
+	m.stopOnce.Do(func() { close(m.stopCh) })
 }
 
 // CheckAllCAs runs a full health check across all CA authorities.
@@ -107,7 +154,7 @@ func (m *CAMonitor) CheckCA(ctx context.Context, ca *store.CAAuthority) error {
 	}
 
 	// 5. Check alert thresholds
-	m.evaluateAlertThresholds(ca, daysRemaining, now)
+	m.evaluateAlertThresholds(ctx, ca, daysRemaining, now)
 
 	// 6. Persist updates
 	return m.store.UpdateCAAuthority(ctx, ca)
@@ -169,7 +216,14 @@ func (m *CAMonitor) checkOCSP(ctx context.Context, ocspURL string) bool {
 	return resp.StatusCode < 500
 }
 
-func (m *CAMonitor) evaluateAlertThresholds(ca *store.CAAuthority, daysRemaining int, now time.Time) {
+// evaluateAlertThresholds fires an alert the first time a CA crosses each
+// configured threshold.
+//
+// Crossings are recorded to the audit log, not just to the process log. A
+// monitoring team watches a dashboard, not stdout, and an alert nobody sees is
+// the same as no alert — which is how CAs expire in organisations that believed
+// they were monitoring them.
+func (m *CAMonitor) evaluateAlertThresholds(ctx context.Context, ca *store.CAAuthority, daysRemaining int, now time.Time) {
 	var thresholds []int
 	if ca.AlertThresholds != "" {
 		_ = json.Unmarshal([]byte(ca.AlertThresholds), &thresholds)
@@ -178,18 +232,47 @@ func (m *CAMonitor) evaluateAlertThresholds(ca *store.CAAuthority, daysRemaining
 		thresholds = []int{365, 180, 90, 30, 14, 7}
 	}
 
+	// Ascending, so the first threshold the CA has crossed is also the
+	// tightest one. A CA 10 days from expiry should report "14 days", not
+	// "365 days" — the urgency is the point of the alert. Configuration order
+	// is not guaranteed, hence the sort.
+	sort.Ints(thresholds)
+
 	for _, t := range thresholds {
-		if daysRemaining <= t {
-			if ca.LastAlertThreshold == nil || *ca.LastAlertThreshold != t {
-				slog.Warn("CA threshold alert triggered",
-					"ca_name", ca.Name,
-					"days_remaining", daysRemaining,
-					"threshold", t,
-				)
-				ca.LastAlertThreshold = &t
-				ca.LastAlertSentAt = &now
-			}
-			break
+		if daysRemaining > t {
+			continue
 		}
+
+		// Already alerted at this threshold or a tighter one — do not repeat
+		// until the situation actually worsens.
+		if ca.LastAlertThreshold != nil && *ca.LastAlertThreshold <= t {
+			return
+		}
+
+		severity := "WARNING"
+		if daysRemaining <= 30 {
+			severity = "CRITICAL"
+		}
+
+		slog.Warn("CA expiry threshold crossed",
+			"ca_name", ca.Name,
+			"ca_type", ca.CAType,
+			"days_remaining", daysRemaining,
+			"threshold", t,
+			"severity", severity,
+		)
+
+		_ = m.store.CreateAuditLog(ctx, &store.AuditLog{
+			Action:     "ca.expiry_alert",
+			EntityType: "ca_authority",
+			EntityID:   &ca.ID,
+			Details: fmt.Sprintf(
+				`{"ca_name": %q, "ca_type": %q, "days_remaining": %d, "threshold": %d, "severity": %q, "not_after": %q}`,
+				ca.Name, ca.CAType, daysRemaining, t, severity, ca.NotAfter.Format(time.RFC3339)),
+		})
+
+		ca.LastAlertThreshold = &t
+		ca.LastAlertSentAt = &now
+		return
 	}
 }

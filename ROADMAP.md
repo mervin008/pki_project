@@ -1,190 +1,170 @@
 # Roadmap
 
-What is built, what is next, and why in that order. Replaces the original
-`plan.md`, whose ordering was right but whose timeline compressed roughly six
-months of work into what read like a fortnight.
+## Who this is for
 
-The [README](README.md) has the authoritative capability table. This document
-covers sequence and reasoning.
+A **central PKI team inside an organisation** — the group that owns the private
+CA hierarchy, answers for every certificate the company serves, and gets paged
+when something expires.
 
-## The forcing function
+That audience determines the design more than any other decision here:
+
+- **The dashboard is the product surface, not a convenience.** A central PKI
+  team runs a wall display. They need CA health, expiry countdowns, and chain
+  state visible without asking for it. An answer that requires someone to run a
+  command is an answer nobody sees at 2am on a Sunday.
+- **CA expiry is the catastrophic failure, not certificate expiry.** An expired
+  leaf certificate breaks one service. An expired issuing CA breaks everything
+  it ever signed, all at once, and no amount of certificate automation helps
+  once it has happened. CA monitoring is therefore load-bearing.
+- **Any CA, public and private.** These teams run internal PKI *and* buy public
+  certificates. A tool that handles only one half doubles their tooling instead
+  of halving it.
+- **The API and CLI serve automation, not humans.** They matter, but they are
+  not how the team perceives the state of their estate.
+
+## Forcing function
 
 CA/Browser Forum [ballot SC-081v3](https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/)
-takes maximum TLS certificate validity to **200 days (March 2026)**,
-**100 days (March 2027)**, and **47 days (March 2029)**, with domain validation
-reuse falling to 10 days over the same period.
+takes maximum TLS validity to **200 days in March 2026, 100 days in March 2027,
+and 47 days in March 2029**, with domain validation reuse dropping to 10 days.
 
-At 47 days, renewing at the one-third mark means every certificate renews about
-every 15 days. Ten thousand certificates is roughly 670 renewals a day — one
-every two minutes, continuously. That number is what determines the architecture
-of phases 3 through 5.
+At 47 days, ten thousand certificates means roughly 670 renewals a day. Anything
+that requires a human in the loop stops working well before then.
+
+---
 
 ## Done
 
-### Phase 0 — Accurate claims
+**Phase 0 — Honest foundations**
+Accurate README, algorithm constraints removed from the schema, secrets kept out
+of version control.
 
-The README described features that did not exist. Corrected, along with removing
-a stray file, fixing `.gitignore` so private key material cannot be committed,
-and removing the live Supabase project reference from the example config.
+**Phase 1 — Security floor**
+- `pkg/secrets`: AES-256-GCM envelope encryption, per-record data keys,
+  context-bound ciphertexts, incremental key rotation
+- Mutual TLS on the core-to-gateway channel, with one-command dev setup
+- OIDC via JWKS, pinned algorithms, no development auth fallback
+- Private keys sealed at rest, never serialized, admin-only audited export
+- RBAC enforced per route
 
-### Phase 1 — Security floor
+**Phase 2 — An ACME gateway that issues certificates**
+- Full RFC 8555 order flow
+- `dns-01` via Cloudflare and a generic signed webhook; `http-01` via a built-in
+  listener
+- Persistent ACME account keys, External Account Binding
+- Real revocation
+- RFC 9773 renewal information
 
-- **`pkg/secrets`** — AES-256-GCM envelope encryption. Per-record data keys
-  wrapped by a KEK, ciphertexts bound to their field via additional
-  authenticated data, incremental key rotation via `CERTPILOT_KEK_RETIRED`.
-- **Mutual TLS** on the core-to-gateway channel, required by default, reflection
-  off, with `make dev-certs` so enabling it is one command rather than a reason
-  to disable it.
-- **Authentication** — the dev-mode fallback that granted admin on an *invalid*
-  token is gone. JWKS verification, pinned signing algorithms, expiry required,
-  roles read only from `app_metadata`.
-- **Key persistence** — issued certificates now store their private key, sealed.
-  Previously the core never read `private_key_pem` from the gateway, so every
-  certificate it issued was unusable.
-- **Fail closed** — a policy engine that cannot be consulted blocks issuance; a
-  gateway returning anything other than a certificate produces an error rather
-  than a record marked `ISSUED`.
-- **Config validation** — production mode refuses anonymous access, an insecure
-  gateway channel, and wildcard CORS.
-
-### Phase 2 — Working ACME
-
-Full RFC 8555: authorize, solve, finalize, download chain. Plus persistent
-account keys (the previous code registered a new ACME account on every
-issuance), External Account Binding for ZeroSSL and Google Trust Services, real
-revocation, `dns-01` via Cloudflare or a generic signed webhook, `http-01` via a
-built-in listener, and wildcards.
-
-**RFC 9773 (ARI)** is implemented — certificate identifier derivation, window
-parsing, and randomised selection within the window. Renewing at window start
-would relocate a thundering herd rather than disperse it.
-
-ARI matters more than it first appears. In March 2026 Let's Encrypt ran a
-mass-revocation simulation across three million production certificates and
-found 94% of clients were not listening. It is the mechanism by which the
-ecosystem survives a revocation event, and it costs about two hundred lines.
-
-### Phase 6a — PQC groundwork
-
-[Migration 002](migrations/002_crypto_agility.sql) removes the
-`key_type IN ('RSA','ECDSA','Ed25519')` constraints that would otherwise block
-post-quantum work entirely, replaces them with an extensible `key_algorithms`
-table covering ML-DSA, SLH-DSA, Falcon and composite schemes, and adds tables
-for observed TLS posture. Done early because it is a five-minute change now and
-a migration against live data later.
+**Phase 2.5 — CA monitoring actually runs**
+The health sweep is now scheduled rather than manual, and threshold crossings
+are recorded to the audit log so they reach the dashboard instead of stdout.
 
 ---
 
 ## Next
 
-### Phase 3 — A renewal engine that survives 47-day certificates
+### Phase 3 — A monitoring surface a team can leave on a screen
 
-The current scheduler renews serially in a bare loop on `context.Background()`:
-no timeout, no retry, no backoff, no concurrency limit, no distributed lock. One
-hung gateway blocks every remaining renewal, and two core replicas will renew
-the same certificate simultaneously.
+The largest gap between what exists and what a central PKI team needs. The data
+is already being collected; almost none of it reaches a human unprompted.
 
-- Durable job queue, backed by the PostgreSQL that is already a dependency
-- Leader election via advisory lock
-- Exponential backoff with jitter; per-CA rate limiting
-- Idempotency keys, so a retry cannot double-issue
-- Consume ARI windows for scheduling rather than a fixed lead time
+- **Live updates.** Server-Sent Events from the core so the dashboard reflects
+  reality without a refresh. Polling is the wrong shape for a wall display.
+- **CA health view.** Every CA, its expiry countdown, chain position, CRL
+  freshness, and issuance volume — sorted by urgency, readable across a room.
+- **Chain visualisation.** Root → intermediate → issuing, with health carried up
+  the tree, because a healthy issuing CA under an expiring root is not healthy.
+- **Alerting that reaches people.** Slack, Teams, email, PagerDuty. Today
+  `notifications/dispatcher.go` can POST a webhook and nothing calls it. An
+  alert that only lands in an audit table is only marginally better than a log
+  line.
+- **Acknowledgement and ownership.** Who owns this CA, who was told, who
+  silenced it and until when. Without this, an alerting dashboard becomes
+  wallpaper within a month.
+- **Expiry timeline.** What breaks in the next 7 / 30 / 90 days, grouped by team
+  and environment.
+
+### Phase 4 — A renewal engine that survives 47-day certificates
+
+- Durable job queue with leader election (Postgres advisory locks)
+- Exponential backoff with jitter, per-CA rate limiting, idempotency keys
+- Renewal scheduled from the CA's ARI window where published, lead time otherwise
 - Post-renewal verification: re-scan the endpoint and confirm the new
   certificate is actually being served
 
-Also here: hash-chain the audit log, so "immutable" is true rather than
-aspirational.
+### Phase 5 — Discovery that finds what nobody told you about
 
-### Phase 4 — Discovery that finds things
+- CIDR expansion with a worker pool
+- **CT log monitoring** — the highest-signal, cheapest addition available, and
+  the only way to find certificates issued outside the team's knowledge
+- Cloud inventory: ACM, GCP, Azure Key Vault, Kubernetes secrets
+- Record full TLS handshake details during the scan, which is what the
+  post-quantum posture work is built on
 
-Discovery is currently one function scanning one `host:port`, and results are
-never persisted.
+### Phase 6 — Deployment, then the agent
 
-- CIDR expansion with a bounded worker pool
-- **CT log monitoring** — the highest-signal, cheapest addition available,
-  because it surfaces certificates nobody knew had been issued
-- Cloud inventory: ACM, GCP, Azure Key Vault
-- Kubernetes secrets
-- **Record the TLS handshake** — negotiated group, cipher suite, protocol
-  version. The scanner already completes a handshake; capturing what it
-  negotiated is what makes the posture reporting in phase 6 possible
-- Persist to `discovery_scans` and `discovery_results`, which means adding
-  discovery methods to the store interface
+Renewal that does not reach the server is only half the job, and this is where
+the commercial tools earn their price.
 
-### Phase 5 — The agent
+- Agentless deployers first: Kubernetes, ACM, Azure Key Vault, F5, generic webhook
+- Then the agent: one binary that enrols over mTLS, inventories certificate
+  stores (filesystem, Java keystore, Windows store, nginx/Apache/HAProxy, IIS),
+  **generates keys locally so private keys never traverse the network**,
+  submits CSRs, installs renewals, and runs a reload hook
 
-The largest piece, and the one that decides whether this is a real product.
+Local key generation is what makes this architecturally safer than the
+incumbents rather than merely cheaper.
 
-Getting a certificate is a solved problem. What nobody has, open source, is
-*"renew four thousand certificates across nginx boxes, F5s, Java keystores,
-three Kubernetes clusters, ACM and IIS without an outage."* Keyfactor's moat is
-its orchestrator agent. CertPilot currently has zero lines of one.
+### Phase 7 — More CAs
 
-A single Go binary that:
+HashiCorp Vault PKI first — it is what most organisations running private PKI
+already have. Then Microsoft AD CS, AWS Private CA, Google Cloud CAS, EJBCA,
+DigiCert, Sectigo.
 
-- Enrolls over mTLS with a bootstrap token
-- Inventories certificate stores — filesystem, Java keystore, Windows
-  certificate store, nginx/apache/haproxy configuration, IIS
-- **Generates keys locally and submits CSRs, so private keys never traverse the
-  network.** This is the architectural argument for choosing CertPilot over the
-  incumbents rather than merely a cheaper version of them
-- Installs renewed certificates and runs a reload hook
+One gateway that genuinely works beats five stubs.
 
-Plus agentless deployers for Kubernetes, ACM, Azure Key Vault, F5, and a generic
-webhook.
+### Phase 8 — Cryptographic posture
 
-### Phase 6 — Crypto-agility posture
-
-The schema is ready; the reporting is not.
-
-- **CBOM export** (CycloneDX 1.6) generated from the inventory
-- **Quantum-readiness scoring** per certificate and endpoint, mapped against
-  CNSA 2.0 and NIST migration deadlines
-- **Hybrid key exchange reporting** — *"142 of your endpoints do not negotiate
-  X25519MLKEM768"* is a sentence no open-source tool can currently produce
-- **ML-DSA and composite issuance** in the private-CA gateways, where it is
-  usable today
-
-On the deliberate omission: this is not "issue ML-DSA certificates for public
-TLS", because that is not currently possible. The CA/Browser Forum has not
-updated the Baseline Requirements to permit ML-DSA, and in February 2026 Google
-stated Chrome has no near-term plan to accept post-quantum algorithms in
-traditional X.509 certificates in its root store — it is pursuing
+Deliberately **not** "issue ML-DSA certificates". For public TLS that is not yet
+possible: the CA/Browser Forum has not updated the Baseline Requirements, and in
+February 2026 Google stated Chrome has no near-term plan to accept post-quantum
+algorithms in traditional X.509 certificates in its root store, pursuing
 [Merkle Tree Certificates](https://datatracker.ietf.org/wg/plants/about/)
-instead, and Let's Encrypt has committed to that direction.
+instead. The urgent quantum risk — harvest-now-decrypt-later — is already
+addressed by hybrid key exchange that browsers ship today.
 
-Meanwhile the quantum risk with an actual deadline — harvest-now-decrypt-later —
-is already addressed by hybrid key exchange that browsers deploy by default.
-Signature forgery cannot be applied retroactively, so PQC signatures are a
-migration problem, not an emergency.
+The useful work is knowing where your cryptography lives and what breaks when it
+changes:
 
-MTC is tracked as a research spike, not a roadmap item. Being the open-source
-tool that already models cryptographic posture when it lands is a better
-position than betting early on a moving specification.
+- **CBOM export** (CycloneDX 1.6) from the existing inventory
+- **Quantum-readiness scoring** per certificate and endpoint, mapped to CNSA 2.0
+- **Hybrid key exchange visibility** — "142 of your endpoints do not negotiate
+  X25519MLKEM768" is a sentence no open-source tool can produce today
+- **ML-DSA and composite issuance in the private-CA gateways**, where it is
+  legal and usable now
+
+[Migration 002](migrations/002_crypto_agility.sql) already lays the schema.
 
 ---
 
-## Deliberately not doing yet
+## Known gaps
 
-**More gateways.** One that genuinely works beats five stubs. ACME plus Vault
-covers the large majority of real deployments; the plugin contract should earn
-the rest from contributors.
+Tracked honestly rather than quietly:
 
-**More frontend.** The Vue app is already further along than the backend
-justifies. A CLM tool wins on its engine.
+- Audit log is an ordinary table — not hash-chained, so a database writer can
+  rewrite history
+- Renewal has no retry, backoff, or distributed lock; two replicas will renew
+  the same certificate concurrently
+- The OCSP responder check is an HTTP GET, not an RFC 6960 request, and reports
+  responders as healthy that are not
+- `migrations/001_initial_schema.sql` references `auth.users` and `auth.jwt()`
+  and applies only to Supabase. The Go store layer is plain `pgx` with no
+  Supabase dependency; the schema is the only coupling
+- Policy is evaluated on issuance only, not renewal; `key_type`, `naming`, and
+  `approval_required` rule types are accepted by the schema but not implemented
 
-**Moving off PostgreSQL.** `001_initial_schema.sql` is coupled to Supabase
-through `auth.users` and `auth.jwt()`, which needs fixing — but the Go store
-layer is plain `pgx` and already portable.
+## Deliberately out of scope
 
-## Also outstanding
-
-- The OCSP responder check issues a plain GET rather than an RFC 6960 request,
-  and reports responders as healthy when it should not
-- Policy `key_type`, `naming`, and `approval_required` rule types are accepted
-  by the schema but not implemented
-- Policy is evaluated on issuance only, never on renewal
-- Notifications are a bare webhook POST that nothing calls
-- A CLI (`certpilot list --expiring 30`, `certpilot renew <id>`,
-  `certpilot scan 10.0.0.0/24`) would likely do more for adoption than any
-  further UI work
+- **Being a CA.** EJBCA, step-ca, and Vault do that well. CertPilot manages CAs;
+  it does not become one.
+- **Replacing cert-manager inside Kubernetes.** Integrate with it instead.

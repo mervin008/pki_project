@@ -184,6 +184,14 @@ func (s *Server) Start() error {
 	}
 	s.renewalSched.Start(scanInterval)
 
+	// An expiring CA takes down everything it signs, so this sweep has to run
+	// on a timer rather than waiting for someone to open the dashboard.
+	caInterval := time.Duration(s.cfg.PKI.CAHealthCheckInterval) * time.Minute
+	if caInterval <= 0 {
+		caInterval = 6 * time.Hour
+	}
+	s.caMonitor.Start(caInterval)
+
 	slog.Info("CertPilot Core HTTP API listening", "addr", s.httpServer.Addr, "mode", s.cfg.Server.Mode)
 	return s.httpServer.ListenAndServe()
 }
@@ -192,6 +200,7 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("shutting down CertPilot Core")
 	s.renewalSched.Stop()
+	s.caMonitor.Stop()
 	s.pluginMgr.Close()
 	s.store.Close()
 	return s.httpServer.Shutdown(ctx)

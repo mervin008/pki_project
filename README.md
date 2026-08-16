@@ -2,9 +2,17 @@
 
 **Open-source PKI and certificate lifecycle management.**
 
-One place to see every certificate your organisation has — across any CA, public
-or private — with automated renewal, CA health monitoring, policy enforcement,
-and cryptographic posture reporting.
+Built for the **central PKI team** — the group that owns the CA hierarchy and
+answers for every certificate the organisation serves. One place to watch every
+CA and certificate across any authority, public or private, with automated
+renewal, CA health monitoring, policy enforcement, and cryptographic posture
+reporting.
+
+The dashboard is the point. A central PKI team runs a wall display: CA health
+and expiry countdowns have to be visible without anyone asking. An expiring
+issuing CA is the failure that takes down everything it ever signed, so the
+health sweep runs on a timer and threshold crossings are recorded where a human
+will see them.
 
 > **Status: early development.** The core, the gateway plugin architecture, and
 > the ACME and self-signed gateways work end to end. Deployment to servers, the
@@ -79,7 +87,9 @@ explicitly.
 | RBAC | ✅ | admin / operator / auditor / viewer, enforced per route |
 | Audit log | ⚠️ | Recorded, but the table is not yet tamper-evident |
 | Automated renewal | ⚠️ | Works; no retry, backoff, or distributed locking yet |
-| CA health monitoring | ⚠️ | Expiry and CRL freshness are real; the OCSP check is not a real OCSP request |
+| CA health monitoring | ⚠️ | Scheduled sweep, expiry thresholds, and CRL freshness are real; the OCSP check is not a real OCSP request |
+| CA expiry alerting | ⚠️ | Threshold crossings recorded to the audit log; no Slack/email/PagerDuty delivery yet |
+| Live dashboard updates | ❌ | The UI polls. Server-Sent Events are Phase 3 |
 | Policy engine | ⚠️ | `key_size`, `max_lifetime`, `ca_restriction`; other rule types are not implemented |
 | Discovery | ⚠️ | Single `host:port` scan only. No CIDR, CT logs, or cloud inventory |
 | Notifications | ⚠️ | Generic webhook only. No Slack, Teams, email, or PagerDuty |
@@ -267,6 +277,12 @@ root does not cover a workspace.
 | Auth | OIDC via JWKS |
 | Plugin transport | gRPC over mutual TLS |
 | Packaging | Docker |
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md). The next milestone is a monitoring surface a team
+can leave on a screen: live updates, a CA health wall view, chain visualisation,
+and alerting that actually reaches people.
 
 ## License
 
