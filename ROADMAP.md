@@ -63,7 +63,7 @@ are recorded to the audit log so they reach the dashboard instead of stdout.
 
 ## In progress
 
-### Phase 3 — A monitoring surface a team can leave on a screen
+### Phase 3 — A monitoring surface a team can leave on a screen ✅
 
 The largest gap between what exists and what a central PKI team needs. The data
 is already being collected; almost none of it reaches a human unprompted.
@@ -78,7 +78,7 @@ is already being collected; almost none of it reaches a human unprompted.
 | 5 | Frontend event stream and connection indicator | ✅ |
 | 6 | CA health view, then fullscreen wall mode | ✅ |
 | 7 | Alert delivery: Slack, webhook, SMTP | ✅ |
-| 8 | Acknowledgement and ownership | |
+| 8 | Acknowledgement and ownership | ✅ |
 
 **Step 0** was a prerequisite rather than cleanup: the dashboard computed CA
 distribution with `Math.random()` inside a `computed`, fell back to invented
@@ -144,18 +144,30 @@ channel that looks configured and silently drops everything is worse than none;
 and both outcomes are audited, because "we tried and Slack refused" and "we never
 tried" look identical from outside and only one means the configuration is wrong.
 
+**Step 8** answered the two questions the dashboard could not: who owns this CA,
+and has anyone already looked at it. Without the second, an alerting dashboard
+becomes wallpaper within a month — the same red row every morning, no way to tell
+whether it is being handled, and the team stops reading it.
+
+One rule governs it, and it is the one most likely to be "simplified" later:
+**silencing suppresses delivery, never display.** An acknowledged CA stays
+exactly where it was in the urgency order, marked with who acknowledged it and
+why. Silencing buys quiet in Slack, not a clean screen. Two consequences follow.
+An acknowledgement is bound to the threshold it was granted at, so someone who
+silenced a CA at 30 days has not silenced the 7-day page — that is a materially
+different situation and the earlier "yes, we know" answered a different question.
+And the acknowledgement lookup fails *open*: a database blip must not turn into
+an alert nobody received, because the cost of a duplicate notification is an
+annoyed engineer and the cost of a suppressed one is an expired CA.
+
+With that, phase 3 is complete.
+
 The rest:
 
 - **Chain visualisation.** Each CA now states its position and lineage, and a
   malformed hierarchy is flagged rather than hidden. The tree itself — root →
   intermediate → issuing drawn as a tree, with health carried up it, because a
   healthy issuing CA under an expiring root is not healthy — is not drawn yet.
-- **Acknowledgement and ownership.** Who owns this CA, who was told, who
-  silenced it and until when. Without this, an alerting dashboard becomes
-  wallpaper within a month. The CA health view has deliberately left both
-  columns out rather than filling them with placeholders: `last_alert_threshold`
-  records what CertPilot *sent*, not what anyone *saw*, and labelling it
-  "acknowledged" would misreport the one thing the view exists for.
 - **Expiry timeline.** What breaks in the next 7 / 30 / 90 days, grouped by team
   and environment.
 

@@ -56,6 +56,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	eventsHandler := NewEventsHandler(deps.Store, deps.Broker)
 	displayHandler := NewDisplayTokenHandler(deps.Store)
 	notifHandler := NewNotificationHandler(deps.Store, deps.Keyring, deps.Dispatcher)
+	ackHandler := NewAcknowledgementHandler(deps.Store)
 
 	v1 := engine.Group("/api/v1")
 	// Display tokens are resolved first, and only take effect when no
@@ -94,6 +95,12 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/pki/authorities/:id/check", middleware.RequireRole(middleware.RoleOperator), caHandler.CheckHealth)
 		v1.DELETE("/pki/authorities/:id", middleware.RequireRole(middleware.RoleAdmin), caHandler.Delete)
 		v1.GET("/pki/tree", caHandler.HierarchyTree)
+		// Acknowledgement is an operator action: it is a statement that a
+		// human has looked, and it needs a human's name against it.
+		v1.POST("/pki/authorities/:id/acknowledge", middleware.RequireRole(middleware.RoleOperator), ackHandler.Acknowledge)
+		v1.DELETE("/pki/authorities/:id/acknowledge", middleware.RequireRole(middleware.RoleOperator), ackHandler.Withdraw)
+		v1.GET("/pki/authorities/:id/acknowledgements", ackHandler.History)
+		v1.PUT("/pki/authorities/:id/owner", middleware.RequireRole(middleware.RoleOperator), ackHandler.SetOwner)
 
 		// ── CA Accounts & Gateways ──
 		v1.GET("/ca-accounts", caAccHandler.List)

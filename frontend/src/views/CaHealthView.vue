@@ -2,8 +2,9 @@
 import { computed, onMounted, ref } from 'vue'
 import {
   AlertTriangle, CircleCheck, CircleHelp, CircleX, Link2Off,
-  RotateCw, Search, ShieldCheck,
+  RotateCw, Search, ShieldCheck, UserRound,
 } from 'lucide-vue-next'
+import { useApi } from '@/composables/useApi'
 import { useCasStore } from '@/stores/cas'
 import { useEventStream } from '@/composables/useEventStream'
 import DataState from '@/components/common/DataState.vue'
@@ -12,7 +13,8 @@ import {
   statusLabel, type Severity,
 } from '@/lib/severity'
 import { describeChainPosition, describeLineage, resolveChains } from '@/lib/chain'
-import { formatDate, formatDateTime, formatTime } from '@/lib/format'
+import { formatDate, formatDateTime, formatRelative, formatTime } from '@/lib/format'
+import type { CaAuthority } from '@/lib/types'
 
 /**
  * CA health — the page a central PKI team leaves open.
@@ -23,15 +25,19 @@ import { formatDate, formatDateTime, formatTime } from '@/lib/format'
  * expire* — so it is one line per CA, worst first, with the remaining-days count
  * as the largest thing on the row.
  *
- * Two columns the plan calls for are absent because the data behind them does
- * not exist yet: **owner** (`owner_team` / `owner_email`) and **acknowledgement**
- * both arrive with the schema change in step 8. Rendering a column of dashes, or
- * worse borrowing `last_alert_threshold` and labelling it "acknowledged", would
- * misreport the one thing this view is for. `last_alert_threshold` is de-dupe
- * suppression — it records that CertPilot *sent* something, not that a human
- * *saw* it — so it is shown, labelled as exactly that.
+ * `last_alert_threshold` and acknowledgement are shown side by side and are
+ * deliberately not conflated. The first is de-dupe suppression — it records that
+ * CertPilot *sent* something. The second records that a human *saw* it. Labelling
+ * the former as the latter would misreport the one thing this view is for.
+ *
+ * The rule that governs acknowledgement here, and the one most likely to be
+ * "improved" away later: **acknowledging never removes a row.** An acknowledged
+ * CA stays exactly where it was in the urgency order, marked. Filtering it out
+ * would hide the problem, which is how CAs expire in organisations that believed
+ * they were monitoring them.
  */
 
+const api = useApi()
 const cas = useCasStore()
 const stream = useEventStream()
 
@@ -132,6 +138,58 @@ const lastUpdatedAt = computed(() =>
   stream.status.value === 'live' ? (stream.lastEventAt.value ?? cas.lastUpdatedAt) : cas.lastUpdatedAt,
 )
 
+// ── Acknowledging ─────────────────────────────────────────
+
+const acting = ref<string | null>(null)
+const actionError = ref<string | null>(null)
+/** Which row has its acknowledge form open. */
+const acknowledging = ref<string | null>(null)
+const ackNote = ref('')
+const ackSilenceDays = ref(0)
+
+function openAcknowledge(ca: CaAuthority) {
+  acknowledging.value = ca.id
+  ackNote.value = ''
+  ackSilenceDays.value = 0
+  actionError.value = null
+}
+
+async function acknowledge(ca: CaAuthority) {
+  acting.value = ca.id
+  actionError.value = null
+  try {
+    await api.post(`/api/v1/pki/authorities/${ca.id}/acknowledge`, {
+      note: ackNote.value,
+      silence_days: Number(ackSilenceDays.value) || 0,
+    })
+    acknowledging.value = null
+    await cas.refresh()
+  } catch (err) {
+    actionError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    acting.value = null
+  }
+}
+
+async function withdraw(ca: CaAuthority) {
+  acting.value = ca.id
+  actionError.value = null
+  try {
+    await api.delete(`/api/v1/pki/authorities/${ca.id}/acknowledge`)
+    await cas.refresh()
+  } catch (err) {
+    actionError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    acting.value = null
+  }
+}
+
+/** True while an explicit silence is in force. */
+function isSilenced(ca: CaAuthority): boolean {
+  const until = ca.acknowledgement?.silence_until
+  return !!until && new Date(until) > new Date()
+}
+
 const worst = computed<Severity>(() => {
   let peak: Severity = 'ok'
   for (const ca of cas.authorities) {
@@ -161,6 +219,11 @@ const worst = computed<Severity>(() => {
           Refresh
         </button>
       </div>
+    </div>
+
+    <div v-if="actionError" role="alert" class="alert alert-error py-2">
+      <CircleX class="w-4 h-4 shrink-0" />
+      <span class="text-xs break-words">{{ actionError }}</span>
     </div>
 
     <DataState :loading="cas.loading" :error="cas.error" :loaded="cas.loaded" @retry="cas.refresh()">
@@ -269,6 +332,21 @@ const worst = computed<Severity>(() => {
               </div>
 
               <div class="w-32">
+                <div class="opacity-60">Owner</div>
+                <div v-if="ca.owner_team || ca.owner_email" class="font-medium truncate">
+                  <span v-if="ca.owner_team">{{ ca.owner_team }}</span>
+                  <a
+                    v-else
+                    :href="`mailto:${ca.owner_email}`"
+                    class="link"
+                  >{{ ca.owner_email }}</a>
+                </div>
+                <!-- Distinct from a blank cell: an unowned CA is a real and
+                     worrying state, not a rendering gap. -->
+                <div v-else class="text-warning">Nobody</div>
+              </div>
+
+              <div class="w-40">
                 <div class="opacity-60">Last alert</div>
                 <div
                   v-if="ca.last_alert_sent_at"
@@ -280,6 +358,76 @@ const worst = computed<Severity>(() => {
                 <div v-else class="opacity-50">None sent</div>
               </div>
             </div>
+          </div>
+
+          <!-- Acknowledgement.
+               Shown beneath the row rather than replacing anything in it: the CA
+               is still exactly as urgent as it was, and this says who is on it. -->
+          <div
+            v-if="ca.acknowledgement"
+            class="mx-3 mb-3 px-3 py-2 rounded-lg bg-base-200/60 text-[11px] flex items-start gap-2 flex-wrap"
+          >
+            <UserRound class="w-3.5 h-3.5 shrink-0 mt-0.5 opacity-60" />
+            <div class="min-w-0 flex-1">
+              <span class="font-semibold">
+                Acknowledged by {{ ca.acknowledgement.acknowledged_by_email || 'an operator' }}
+              </span>
+              <span class="opacity-60"> {{ formatRelative(ca.acknowledgement.acknowledged_at) }}</span>
+              <template v-if="ca.acknowledgement.note">
+                — {{ ca.acknowledgement.note }}
+              </template>
+              <div class="opacity-70 mt-0.5">
+                <template v-if="isSilenced(ca)">
+                  Alerts are silenced until
+                  {{ formatDateTime(ca.acknowledgement.silence_until) }}<template
+                    v-if="ca.acknowledgement.threshold"
+                  >, for the {{ ca.acknowledgement.threshold }}-day threshold only — a tighter one
+                    alerts again</template>.
+                </template>
+                <template v-else>Alerts are still being delivered.</template>
+              </div>
+            </div>
+            <button
+              class="btn btn-ghost btn-xs"
+              :disabled="acting === ca.id"
+              @click="withdraw(ca)"
+            >
+              Withdraw
+            </button>
+          </div>
+
+          <!-- Acknowledge -->
+          <div v-else-if="acknowledging === ca.id" class="mx-3 mb-3 px-3 py-2 rounded-lg bg-base-200/60 space-y-2">
+            <input
+              v-model="ackNote"
+              placeholder="What is being done? e.g. replacement issued, cutover Thursday"
+              class="input input-bordered input-xs w-full"
+            />
+            <div class="flex items-center gap-2 flex-wrap">
+              <label class="text-[11px] opacity-70">Silence alerts for</label>
+              <select v-model.number="ackSilenceDays" class="select select-bordered select-xs">
+                <option :value="0">not at all — keep alerting</option>
+                <option :value="1">1 day</option>
+                <option :value="7">7 days</option>
+                <option :value="30">30 days</option>
+                <option :value="90">90 days (maximum)</option>
+              </select>
+              <button
+                class="btn btn-primary btn-xs"
+                :disabled="acting === ca.id"
+                @click="acknowledge(ca)"
+              >
+                Acknowledge
+              </button>
+              <button class="btn btn-ghost btn-xs" @click="acknowledging = null">Cancel</button>
+              <span class="text-[11px] opacity-60">
+                This never hides the CA — it stays on this page and on the wall display.
+              </span>
+            </div>
+          </div>
+
+          <div v-else-if="caSeverity(ca.status) !== 'ok'" class="mx-3 mb-3">
+            <button class="btn btn-ghost btn-xs" @click="openAcknowledge(ca)">Acknowledge</button>
           </div>
         </article>
 

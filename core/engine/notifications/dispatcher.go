@@ -226,6 +226,10 @@ func (d *Dispatcher) handle(evt events.Event) {
 	alert := AlertFromEvent(evt)
 	severity := normalizeSeverity(evt.Severity)
 
+	if d.silenced(evt, alert) {
+		return
+	}
+
 	for _, ch := range channels {
 		if !ch.Accepts(evt.Topic, severity) {
 			continue
@@ -244,6 +248,77 @@ func (d *Dispatcher) handle(evt events.Event) {
 			d.deliver(ch, alert)
 		}(ch)
 	}
+}
+
+// silenced reports whether an operator has explicitly asked for quiet.
+//
+// **This suppresses delivery only.** The event has already been published to the
+// broker by the time it reaches here, so the dashboard, the wall display, and
+// the audit log are entirely unaffected — an acknowledged CA still shows, marked
+// as acknowledged and by whom. Hiding a problem because someone clicked a button
+// is how CAs expire in organisations that believed they were monitoring them.
+// What acknowledgement buys is quiet in Slack, not a clean screen.
+//
+// A silence is bound to the threshold it was granted at. Someone who silenced a
+// CA at 30 days answered a different question from the one asked at 7, so a
+// tighter threshold pages regardless — see AlertAcknowledgement.IsActive.
+func (d *Dispatcher) silenced(evt events.Event, alert Alert) bool {
+	if evt.EntityID == "" {
+		return false
+	}
+
+	entityType := store.AckEntityCAAuthority
+	if strings.HasPrefix(evt.Topic, "cert.") {
+		entityType = store.AckEntityCertificate
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ack, err := d.store.GetActiveAcknowledgement(ctx, entityType, evt.EntityID)
+	if err != nil {
+		// Fail open. A database blip must not turn into an alert nobody
+		// received: the cost of a duplicate notification is an annoyed
+		// engineer, and the cost of a suppressed one is an expired CA.
+		slog.Warn("could not check for an acknowledgement; delivering anyway",
+			"entity_id", evt.EntityID, "topic", evt.Topic, "error", err)
+		return false
+	}
+
+	if !ack.SuppressesDelivery(time.Now(), thresholdOf(alert)) {
+		return false
+	}
+
+	slog.Info("alert suppressed by an acknowledgement",
+		"entity_id", evt.EntityID, "topic", evt.Topic,
+		"acknowledged_by", derefString(ack.AcknowledgedByEmail),
+		"silence_until", ack.SilenceUntil)
+	return true
+}
+
+// thresholdOf recovers the threshold an expiry alert was raised at.
+//
+// Read back from the rendered field rather than the raw payload so there is one
+// place that knows how a threshold is spelled; a mismatch here would silently
+// widen a silence to cover alerts it was never granted for.
+func thresholdOf(alert Alert) *int {
+	for _, f := range alert.Fields {
+		if f.Label != "Threshold crossed" {
+			continue
+		}
+		var days int
+		if _, err := fmt.Sscanf(f.Value, "%d-day threshold", &days); err == nil {
+			return &days
+		}
+	}
+	return nil
+}
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // deliver sends one alert to one channel, retrying, and records the outcome.

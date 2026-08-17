@@ -33,10 +33,86 @@ type CAAuthority struct {
 	LastAlertThreshold      *int       `json:"last_alert_threshold,omitempty"`
 	Status                  string     `json:"status"` // HEALTHY, WARNING, CRITICAL, EXPIRED, UNKNOWN
 	CAAccountID             *string    `json:"ca_account_id,omitempty"`
-	Tags                    string     `json:"tags,omitempty"`
-	Notes                   string     `json:"notes,omitempty"`
-	CreatedAt               time.Time  `json:"created_at"`
-	UpdatedAt               time.Time  `json:"updated_at"`
+	// OwnerTeam and OwnerEmail say who to call. Free text: team names and
+	// distribution lists do not live in CertPilot, and a foreign key to
+	// something it does not own would mean either an import step or a wrong
+	// answer on a row someone is reading at 2am.
+	OwnerTeam  *string `json:"owner_team,omitempty"`
+	OwnerEmail *string `json:"owner_email,omitempty"`
+	Tags       string  `json:"tags,omitempty"`
+	Notes      string  `json:"notes,omitempty"`
+	// Acknowledgement is the current acknowledgement, when the caller asked for
+	// it to be resolved. Not a stored column — see AlertAcknowledgement.
+	Acknowledgement *AlertAcknowledgement `json:"acknowledgement,omitempty"`
+	CreatedAt       time.Time             `json:"created_at"`
+	UpdatedAt       time.Time             `json:"updated_at"`
+}
+
+// Entity types an acknowledgement can cover.
+const (
+	AckEntityCAAuthority = "ca_authority"
+	AckEntityCertificate = "certificate"
+)
+
+// AlertAcknowledgement records that a human has seen an alert and, optionally,
+// that delivery should stay quiet for a while.
+//
+// The rule this type exists to enforce: **silencing suppresses delivery, never
+// display.** An acknowledged CA still appears on the dashboard and in the wall
+// view, marked as acknowledged and by whom. Hiding a problem because someone
+// clicked a button is how CAs expire in organisations that believed they were
+// monitoring them.
+type AlertAcknowledgement struct {
+	ID         string `json:"id"`
+	EntityType string `json:"entity_type"`
+	EntityID   string `json:"entity_id"`
+	// Threshold is the expiry threshold, in days, that this acknowledgement
+	// covers. Nil means it is not tied to one.
+	//
+	// This is the field that makes acknowledgement safe rather than dangerous.
+	// Acknowledging a CA at 30 days must not silence its 7-day alert: the
+	// situation has materially worsened, and the earlier "yes, we know" was an
+	// answer to a different question.
+	Threshold           *int       `json:"threshold,omitempty"`
+	AcknowledgedBy      *string    `json:"acknowledged_by,omitempty"`
+	AcknowledgedByEmail *string    `json:"acknowledged_by_email,omitempty"`
+	AcknowledgedAt      time.Time  `json:"acknowledged_at"`
+	Note                string     `json:"note,omitempty"`
+	SilenceUntil        *time.Time `json:"silence_until,omitempty"`
+	RevokedAt           *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy           *string    `json:"revoked_by,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
+}
+
+// IsActive reports whether this acknowledgement still stands at the given
+// instant, for an alert at the given threshold.
+//
+// `currentThreshold` is the threshold the alert is being raised at. A nil value
+// means the caller is asking about the entity generally rather than about one
+// alert.
+func (a *AlertAcknowledgement) IsActive(now time.Time, currentThreshold *int) bool {
+	if a == nil || a.RevokedAt != nil {
+		return false
+	}
+	// A tighter threshold than the one acknowledged is a new situation, not a
+	// repeat of the acknowledged one.
+	if a.Threshold != nil && currentThreshold != nil && *currentThreshold < *a.Threshold {
+		return false
+	}
+	return true
+}
+
+// SuppressesDelivery reports whether an alert should stay out of Slack and
+// email right now.
+//
+// Deliberately distinct from IsActive: acknowledging without silencing is the
+// common case — the alert stops being *new*, but still goes out — and only an
+// explicit `silence_until` in the future stops delivery.
+func (a *AlertAcknowledgement) SuppressesDelivery(now time.Time, currentThreshold *int) bool {
+	if !a.IsActive(now, currentThreshold) {
+		return false
+	}
+	return a.SilenceUntil != nil && a.SilenceUntil.After(now)
 }
 
 // CAAccount represents a Gateway Connection configuration.

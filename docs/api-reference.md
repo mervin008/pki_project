@@ -394,6 +394,74 @@ POST /api/v1/discovery/import  Import a discovered certificate     (operator)
 > Single endpoint only. CIDR ranges, CT log monitoring, and cloud inventory are
 > not implemented, and results are not yet persisted to `discovery_scans`.
 
+## Ownership and acknowledgement
+
+```
+PUT    /api/v1/pki/authorities/:id/owner             Set the owning team    (operator)
+POST   /api/v1/pki/authorities/:id/acknowledge       Acknowledge            (operator)
+DELETE /api/v1/pki/authorities/:id/acknowledge       Withdraw               (operator)
+GET    /api/v1/pki/authorities/:id/acknowledgements  History
+```
+
+**Silencing suppresses delivery, never display.** An acknowledged CA still
+appears on `/pki/authorities`, on the CA health view, and on the wall display,
+with its status unchanged and an `acknowledgement` object attached. Nothing here
+removes a row. Hiding a problem because someone clicked a button is how CAs
+expire in organisations that believed they were monitoring them.
+
+### Acknowledging
+
+```json
+{"note": "replacement issued, cutover Thursday", "silence_days": 7, "threshold": 14}
+```
+
+| Field | |
+|:---|:---|
+| `note` | Why. The most useful field: it turns a red row from an unanswered alarm into a status, and stops the next person re-investigating |
+| `silence_days` | Suppress **delivery** for this many days. `0` (the default) acknowledges without silencing — the alert stops being new and still goes out. Capped at 90 |
+| `threshold` | The expiry threshold in days this covers. Defaults to the CA's current `last_alert_threshold` |
+
+There is no indefinite silence. A permanent one is indistinguishable from
+deleting the alert, and the CA goes on expiring while the team believes it is
+monitored.
+
+**An acknowledgement is bound to its threshold.** Silencing a CA at 30 days does
+not silence its 7-day alert: the situation has materially worsened, and the
+earlier "yes, we know" answered a different question. The same rule governs
+display — a CA that has since crossed a tighter threshold stops showing as
+acknowledged, because the annotation would otherwise become the false
+reassurance the feature exists to prevent.
+
+The response states what was and was not changed, because "acknowledged" is
+ambiguous and the ambiguity is the dangerous part:
+
+```json
+{
+  "data": {"id": "…", "threshold": 7, "silence_until": "2026-08-24T09:48:18Z", "note": "…"},
+  "note": "This certificate authority still appears on the dashboard and the wall display, now marked as acknowledged. Delivery is suppressed until 24 August 2026 09:48 CEST, but only for the 7-day threshold: if it crosses a tighter one, it alerts again."
+}
+```
+
+Withdrawal marks rather than deletes: a CA acknowledged in error and then
+un-acknowledged is something an incident review wants to see, not a row that
+quietly disappeared. `GET …/acknowledgements` returns the full history, newest
+first, revoked entries included.
+
+If the acknowledgement lookup fails, the alert is **delivered anyway**. The cost
+of a duplicate notification is an annoyed engineer; the cost of a suppressed one
+is an expired CA.
+
+### Ownership
+
+```json
+{"owner_team": "Platform Security", "owner_email": "pki@example.com"}
+```
+
+Both are free text — team names and distribution lists do not live in CertPilot.
+Send an empty string to clear either: ownership moving to nobody is a real state,
+and one worth seeing on the dashboard rather than silently keeping the old team's
+name. A CA with no owner renders as "Nobody", not as a blank cell.
+
 ## Notification channels
 
 ```

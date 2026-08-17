@@ -78,6 +78,28 @@ type Store interface {
 	// as a side effect of recording that a message went out.
 	MarkNotificationChannelSent(ctx context.Context, id string, sentAt time.Time) error
 
+	// ── Alert Acknowledgements ──────────────────────────────
+
+	// CreateAcknowledgement records that a human has seen an alert.
+	CreateAcknowledgement(ctx context.Context, ack *AlertAcknowledgement) error
+	// GetActiveAcknowledgement returns the newest un-revoked acknowledgement
+	// for an entity, or nil when there is none.
+	//
+	// Returns the record regardless of threshold, because whether it still
+	// applies is a decision only the caller can make — it depends on which
+	// threshold the alert is being raised at, and AlertAcknowledgement.IsActive
+	// is where that comparison lives.
+	GetActiveAcknowledgement(ctx context.Context, entityType, entityID string) (*AlertAcknowledgement, error)
+	// ListAcknowledgements returns the history for an entity, newest first,
+	// including revoked ones. Who acknowledged what and when is what an
+	// incident review reads.
+	ListAcknowledgements(ctx context.Context, entityType, entityID string) ([]*AlertAcknowledgement, error)
+	// GetActiveAcknowledgements resolves acknowledgements for many entities in
+	// one query, so the CA list does not issue one per row.
+	GetActiveAcknowledgements(ctx context.Context, entityType string, entityIDs []string) (map[string]*AlertAcknowledgement, error)
+	// RevokeAcknowledgement withdraws one, keeping the record that it was made.
+	RevokeAcknowledgement(ctx context.Context, id string, revokedBy *string) error
+
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)

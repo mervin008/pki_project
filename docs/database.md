@@ -73,8 +73,9 @@ make migrate
   applied  003_display_tokens.sql
   applied  004_monitoring_queries.sql
   applied  005_identity_decoupling.sql
+  applied  006_ownership_and_acknowledgement.sql
 
-Applied 5 migration(s).
+Applied 6 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so
@@ -88,7 +89,7 @@ while the others still read the old shape. Run it as a job, an init container, o
 by hand.
 
 If you would rather paste the SQL into the Supabase SQL editor, apply the files
-in numeric order. `004` adds columns to a table `001` creates.
+in numeric order. `004` and `006` add columns to tables `001` creates.
 
 ### Migration 005 is not optional
 

@@ -380,6 +380,7 @@ func caColumns(includePEM bool) string {
 		ocsp_last_checked, coalesce(certificates_issued_count, 0),
 		coalesce(alert_thresholds, '[]'::jsonb),
 		last_alert_sent_at, last_alert_threshold, status, ca_account_id,
+		owner_team, owner_email,
 		coalesce(tags, '[]'::jsonb), coalesce(notes, ''), created_at, updated_at`
 }
 
@@ -393,6 +394,7 @@ func scanCAAuthority(row pgx.Row) (*CAAuthority, error) {
 		&ca.OCSPResponderURL, &ca.IsCRLFresh, &ca.CRLLastChecked, &ca.IsOCSPResponsive,
 		&ca.OCSPLastChecked, &ca.CertificatesIssuedCount, &alertsJSON,
 		&ca.LastAlertSentAt, &ca.LastAlertThreshold, &ca.Status, &ca.CAAccountID,
+		&ca.OwnerTeam, &ca.OwnerEmail,
 		&tagsJSON, &ca.Notes, &ca.CreatedAt, &ca.UpdatedAt,
 	)
 	if err != nil {
@@ -481,15 +483,15 @@ func (s *PostgresStore) CreateCAAuthority(ctx context.Context, ca *CAAuthority) 
 			name, ca_type, subject_dn, issuer_dn, serial_number, not_before, not_after,
 			days_remaining, key_type, key_size, fingerprint_sha256, certificate_pem,
 			parent_ca_id, crl_distribution_url, ocsp_responder_url, ca_account_id,
-			status, notes
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			status, notes, owner_team, owner_email
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		RETURNING id, created_at, updated_at
 	`
 	return s.pool.QueryRow(ctx, query,
 		ca.Name, ca.CAType, ca.SubjectDN, ca.IssuerDN, ca.SerialNumber, ca.NotBefore, ca.NotAfter,
 		ca.DaysRemaining, ca.KeyType, ca.KeySize, ca.FingerprintSHA256, ca.CertificatePEM,
 		ca.ParentCAID, ca.CRLDistributionURL, ca.OCSPResponderURL, ca.CAAccountID,
-		ca.Status, ca.Notes,
+		ca.Status, ca.Notes, ca.OwnerTeam, ca.OwnerEmail,
 	).Scan(&ca.ID, &ca.CreatedAt, &ca.UpdatedAt)
 }
 
@@ -520,7 +522,8 @@ func (s *PostgresStore) UpdateCAAuthority(ctx context.Context, ca *CAAuthority) 
 			crl_last_checked = $17, is_ocsp_responsive = $18, ocsp_last_checked = $19,
 			certificates_issued_count = $20, alert_thresholds = $21,
 			last_alert_sent_at = $22, last_alert_threshold = $23,
-			status = $24, ca_account_id = $25, tags = $26, notes = $27, updated_at = now()
+			status = $24, ca_account_id = $25, tags = $26, notes = $27,
+			owner_team = $28, owner_email = $29, updated_at = now()
 		WHERE id = $1
 	`
 	_, err := s.pool.Exec(ctx, query,
@@ -532,6 +535,7 @@ func (s *PostgresStore) UpdateCAAuthority(ctx context.Context, ca *CAAuthority) 
 		ca.CertificatesIssuedCount, jsonbOrNil(ca.AlertThresholds),
 		ca.LastAlertSentAt, ca.LastAlertThreshold,
 		ca.Status, ca.CAAccountID, jsonbOrNil(ca.Tags), ca.Notes,
+		ca.OwnerTeam, ca.OwnerEmail,
 	)
 	return err
 }
@@ -1109,4 +1113,118 @@ func (s *PostgresStore) GetDashboardStats(ctx context.Context) (*DashboardStats,
 	_ = s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM public.discovery_scans").Scan(&stats.TotalScans)
 
 	return stats, nil
+}
+
+// ── Alert Acknowledgements ──────────────────────────────
+
+const acknowledgementColumns = `id, entity_type, entity_id, threshold,
+	acknowledged_by, acknowledged_by_email, acknowledged_at, coalesce(note, ''),
+	silence_until, revoked_at, revoked_by, created_at`
+
+func scanAcknowledgement(row pgx.Row) (*AlertAcknowledgement, error) {
+	a := &AlertAcknowledgement{}
+	err := row.Scan(&a.ID, &a.EntityType, &a.EntityID, &a.Threshold,
+		&a.AcknowledgedBy, &a.AcknowledgedByEmail, &a.AcknowledgedAt, &a.Note,
+		&a.SilenceUntil, &a.RevokedAt, &a.RevokedBy, &a.CreatedAt)
+	return a, err
+}
+
+func (s *PostgresStore) CreateAcknowledgement(ctx context.Context, ack *AlertAcknowledgement) error {
+	query := `
+		INSERT INTO public.alert_acknowledgements
+			(entity_type, entity_id, threshold, acknowledged_by, acknowledged_by_email,
+			 note, silence_until)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, acknowledged_at, created_at
+	`
+	return s.pool.QueryRow(ctx, query,
+		ack.EntityType, ack.EntityID, ack.Threshold, ack.AcknowledgedBy,
+		ack.AcknowledgedByEmail, nullIfEmpty(strings.TrimSpace(ack.Note)), ack.SilenceUntil,
+	).Scan(&ack.ID, &ack.AcknowledgedAt, &ack.CreatedAt)
+}
+
+func (s *PostgresStore) GetActiveAcknowledgement(ctx context.Context, entityType, entityID string) (*AlertAcknowledgement, error) {
+	a, err := scanAcknowledgement(s.pool.QueryRow(ctx,
+		"SELECT "+acknowledgementColumns+` FROM public.alert_acknowledgements
+		 WHERE entity_type = $1 AND entity_id = $2 AND revoked_at IS NULL
+		 ORDER BY acknowledged_at DESC LIMIT 1`, entityType, entityID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Not an error. "Nobody has acknowledged this" is the normal answer,
+		// and making callers distinguish it from a failure invites them to
+		// treat a real failure as "not acknowledged" and alert anyway.
+		return nil, nil
+	}
+	return a, err
+}
+
+func (s *PostgresStore) ListAcknowledgements(ctx context.Context, entityType, entityID string) ([]*AlertAcknowledgement, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+acknowledgementColumns+` FROM public.alert_acknowledgements
+		 WHERE entity_type = $1 AND entity_id = $2
+		 ORDER BY acknowledged_at DESC`, entityType, entityID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*AlertAcknowledgement, 0)
+	for rows.Next() {
+		a, err := scanAcknowledgement(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// GetActiveAcknowledgements resolves many entities in one round trip.
+//
+// DISTINCT ON rather than a correlated subquery per row: the CA list calls this
+// once for the whole estate, and the per-row form is how a dashboard ends up
+// issuing one query per CA on every refresh.
+func (s *PostgresStore) GetActiveAcknowledgements(ctx context.Context, entityType string, entityIDs []string) (map[string]*AlertAcknowledgement, error) {
+	out := make(map[string]*AlertAcknowledgement, len(entityIDs))
+	if len(entityIDs) == 0 {
+		return out, nil
+	}
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT ON (entity_id) `+acknowledgementColumns+`
+		 FROM public.alert_acknowledgements
+		 WHERE entity_type = $1 AND entity_id = ANY($2) AND revoked_at IS NULL
+		 ORDER BY entity_id, acknowledged_at DESC`, entityType, entityIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		a, err := scanAcknowledgement(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[a.EntityID] = a
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) RevokeAcknowledgement(ctx context.Context, id string, revokedBy *string) error {
+	// `revoked_at IS NULL` keeps the first withdrawal's time and actor, for the
+	// same reason as RevokeDisplayToken: who first pulled it is what a review
+	// needs, not whoever clicked again afterwards.
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE public.alert_acknowledgements SET revoked_at = now(), revoked_by = $2
+		 WHERE id = $1 AND revoked_at IS NULL`, id, revokedBy)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		var exists bool
+		if err := s.pool.QueryRow(ctx,
+			"SELECT true FROM public.alert_acknowledgements WHERE id = $1", id).Scan(&exists); err != nil {
+			return fmt.Errorf("acknowledgement %s not found", id)
+		}
+	}
+	return nil
 }

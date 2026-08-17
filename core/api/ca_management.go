@@ -61,7 +61,47 @@ func (h *CAHandler) List(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	h.attachAcknowledgements(c.Request.Context(), cas)
 	c.JSON(http.StatusOK, gin.H{"data": cas, "total": len(cas)})
+}
+
+// attachAcknowledgements resolves who has already looked at each CA.
+//
+// Resolved for the whole page in one query rather than one per row. It is
+// attached to the *list* on purpose: acknowledgement has to be visible wherever
+// the CA is, because an acknowledged CA still appears — that is the difference
+// between "someone is handling this" and a row silently disappearing.
+//
+// A failure here degrades to showing no acknowledgements rather than failing the
+// request. Losing the annotation costs a reader some context; losing the CA list
+// costs them the dashboard.
+func (h *CAHandler) attachAcknowledgements(ctx context.Context, cas []*store.CAAuthority) {
+	if len(cas) == 0 {
+		return
+	}
+
+	ids := make([]string, 0, len(cas))
+	for _, ca := range cas {
+		ids = append(ids, ca.ID)
+	}
+
+	acks, err := h.store.GetActiveAcknowledgements(ctx, store.AckEntityCAAuthority, ids)
+	if err != nil {
+		slog.Warn("could not resolve CA acknowledgements", "error", err)
+		return
+	}
+
+	now := time.Now()
+	for _, ca := range cas {
+		ack := acks[ca.ID]
+		// Checked against the CA's *current* threshold: an acknowledgement made
+		// at 30 days does not describe a CA that has since crossed 7. Showing it
+		// as still acknowledged would be the exact false reassurance this
+		// feature is supposed to avoid creating.
+		if ack.IsActive(now, ca.LastAlertThreshold) {
+			ca.Acknowledgement = ack
+		}
+	}
 }
 
 // Get handles GET /api/v1/pki/authorities/:id.
@@ -72,6 +112,7 @@ func (h *CAHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	h.attachAcknowledgements(c.Request.Context(), []*store.CAAuthority{ca})
 	c.JSON(http.StatusOK, ca)
 }
 

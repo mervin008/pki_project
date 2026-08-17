@@ -30,7 +30,11 @@ type MemoryStore struct {
 	policies      map[string]*Policy
 	displayTokens map[string]*DisplayToken
 	notifChannels map[string]*NotificationChannel
-	auditLogs     []*AuditLog
+	// acks is append-only, newest last. Who acknowledged what and when is the
+	// record an incident review reads, so an acknowledgement is never
+	// overwritten by the next one.
+	acks      []*AlertAcknowledgement
+	auditLogs []*AuditLog
 }
 
 // clone returns a shallow copy of a stored record.
@@ -904,4 +908,105 @@ func (m *MemoryStore) GetDashboardStats(ctx context.Context) (*DashboardStats, e
 
 func strPtr(s string) *string {
 	return &s
+}
+
+// ── Alert Acknowledgements ──────────────────────────────
+
+func (m *MemoryStore) CreateAcknowledgement(ctx context.Context, ack *AlertAcknowledgement) error {
+	if ack.EntityType != AckEntityCAAuthority && ack.EntityType != AckEntityCertificate {
+		return fmt.Errorf("unknown acknowledgement entity type %q", ack.EntityType)
+	}
+	if ack.EntityID == "" {
+		return fmt.Errorf("an acknowledgement needs an entity id")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if ack.ID == "" {
+		ack.ID = uuid.New().String()
+	}
+	now := time.Now()
+	if ack.AcknowledgedAt.IsZero() {
+		ack.AcknowledgedAt = now
+	}
+	ack.CreatedAt = now
+
+	m.acks = append(m.acks, clone(ack))
+	return nil
+}
+
+func (m *MemoryStore) GetActiveAcknowledgement(ctx context.Context, entityType, entityID string) (*AlertAcknowledgement, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.newestActive(entityType, entityID), nil
+}
+
+// newestActive walks backwards, so the first un-revoked match is the newest.
+// Callers must hold the lock.
+func (m *MemoryStore) newestActive(entityType, entityID string) *AlertAcknowledgement {
+	for i := len(m.acks) - 1; i >= 0; i-- {
+		a := m.acks[i]
+		if a.EntityType == entityType && a.EntityID == entityID && a.RevokedAt == nil {
+			return clone(a)
+		}
+	}
+	return nil
+}
+
+func (m *MemoryStore) ListAcknowledgements(ctx context.Context, entityType, entityID string) ([]*AlertAcknowledgement, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Copies, not the stored pointers. Returning the live records is the defect
+	// ListAuditLogs shipped with: a caller holding them races every later write.
+	out := make([]*AlertAcknowledgement, 0)
+	for i := len(m.acks) - 1; i >= 0; i-- {
+		if a := m.acks[i]; a.EntityType == entityType && a.EntityID == entityID {
+			out = append(out, clone(a))
+		}
+	}
+	return out, nil
+}
+
+func (m *MemoryStore) GetActiveAcknowledgements(ctx context.Context, entityType string, entityIDs []string) (map[string]*AlertAcknowledgement, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	wanted := make(map[string]bool, len(entityIDs))
+	for _, id := range entityIDs {
+		wanted[id] = true
+	}
+
+	out := make(map[string]*AlertAcknowledgement, len(entityIDs))
+	for i := len(m.acks) - 1; i >= 0; i-- {
+		a := m.acks[i]
+		if a.EntityType != entityType || a.RevokedAt != nil || !wanted[a.EntityID] {
+			continue
+		}
+		if _, seen := out[a.EntityID]; !seen {
+			out[a.EntityID] = clone(a)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemoryStore) RevokeAcknowledgement(ctx context.Context, id string, revokedBy *string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, a := range m.acks {
+		if a.ID != id {
+			continue
+		}
+		// Already revoked stays as it was: who first withdrew it is the answer
+		// a review needs, not whoever pressed the button again.
+		if a.RevokedAt == nil {
+			now := time.Now()
+			a.RevokedAt = &now
+			a.RevokedBy = revokedBy
+		}
+		return nil
+	}
+	return fmt.Errorf("acknowledgement %s not found", id)
 }

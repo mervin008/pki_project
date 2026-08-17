@@ -93,11 +93,12 @@ explicitly.
 | OIDC authentication | ✅ | Any provider, via JWKS; legacy shared-secret path also supported |
 | RBAC | ✅ | admin / operator / auditor / viewer, enforced per route |
 | Audit log | ⚠️ | Recorded, but the table is not yet tamper-evident |
+| Ownership and acknowledgement | ✅ | Who owns a CA, who acknowledged an alert and why. Silencing suppresses delivery only — an acknowledged CA never leaves the dashboard |
 | Automated renewal | ⚠️ | Works; no retry, backoff, or distributed locking yet |
 | CA health monitoring | ⚠️ | Scheduled sweep, expiry thresholds, and CRL freshness are real; the OCSP check is not a real OCSP request |
 | CA expiry alerting | ✅ | Threshold crossings are delivered to Slack, a signed webhook, or email over SMTP, with per-channel severity and topic filters |
 | Live dashboard updates | ✅ | Server-Sent Events end to end. The client tracks data age independently, so a dead feed degrades the surface instead of freezing it on green |
-| CA health view | ✅ | Every CA by urgency: expiry countdown, chain position, CRL freshness, issuance volume. Owner and acknowledgement columns are not built yet |
+| CA health view | ✅ | Every CA by urgency: expiry countdown, chain position, CRL freshness, issuance volume, owner, and acknowledgement state |
 | Wall display mode | ✅ | `/display` — fullscreen, no chrome, readable across a room, authenticated by a kiosk token in the launch URL |
 | Kiosk display tokens | ✅ | Read-only, viewer-scoped, expiring, revocable credentials for a wall display |
 | CA hierarchy tree | ⚠️ | Position and lineage are shown per CA and a malformed hierarchy is flagged; the tree is not drawn as a tree |
@@ -323,6 +324,13 @@ signature covers `<unix-seconds>.<raw body>` and travels in
 produces a signature that never expires, so one captured delivery could be
 replayed forever and the receiver would have no way to tell.
 
+**Acknowledgement.** Acknowledging a CA records who looked and why; it never
+removes the CA from the dashboard or the wall display, and never changes its
+status. Silencing suppresses *delivery* only, is capped at 90 days — there is no
+indefinite option, because a permanent silence is indistinguishable from deleting
+the alert — and is bound to the expiry threshold it was granted at, so a CA that
+crosses a tighter one pages regardless of who acknowledged the last.
+
 **Production mode** refuses anonymous access, an insecure gateway channel, and a
 wildcard CORS origin. These are the settings that look harmless locally and
 travel to production unnoticed.
@@ -361,10 +369,6 @@ travel to production unnoticed.
   including `viewer`. Kiosk display tokens are refused it outright, since audit
   entries carry actor identity and a corridor screen should not name who deleted
   what — but a signed-in viewer is a person, and is not restricted.
-- Nobody owns a CA yet. `owner_team` and `owner_email` are not on
-  `ca_authorities`, and there is no acknowledgement record, so the CA health view
-  cannot say who to call or whether anyone has already looked. Both are the next
-  schema change; the view leaves the columns out rather than showing placeholders.
 - After the core has been down for a while, a wall display can take up to 30
   seconds to notice it is back — the reconnect backoff is capped there so a floor
   of displays does not stampede a core the instant it restarts.
@@ -435,10 +439,11 @@ frame parsing, CA chain resolution, and the display-token client.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). The monitoring surface is now live end to end — a
-streaming dashboard, a CA health view, and a wall display. What remains of that
-milestone is alerting that actually reaches people (Slack, SMTP, signed
-webhooks) and knowing who owns each CA and whether anyone has acknowledged it.
+See [ROADMAP.md](ROADMAP.md). The monitoring milestone is complete: a streaming
+dashboard, a CA health view, a wall display, alert delivery to Slack / SMTP /
+signed webhooks, and ownership with acknowledgement. Next is a renewal engine
+that survives 47-day certificates — durable job queue, leader election, backoff,
+and post-renewal verification.
 
 ## License
 

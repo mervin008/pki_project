@@ -436,3 +436,194 @@ func auditCount(t *testing.T, s store.Store, action string) int {
 	}
 	return len(logs)
 }
+
+// ── Acknowledgement and silencing ───────────────────────
+
+func ptrInt(v int) *int { return &v }
+
+func ackFor(t *testing.T, s store.Store, entityID string, threshold *int, silenceFor time.Duration) *store.AlertAcknowledgement {
+	t.Helper()
+	ack := &store.AlertAcknowledgement{
+		EntityType: store.AckEntityCAAuthority,
+		EntityID:   entityID,
+		Threshold:  threshold,
+		Note:       "handled",
+	}
+	if silenceFor != 0 {
+		until := time.Now().Add(silenceFor)
+		ack.SilenceUntil = &until
+	}
+	if err := s.CreateAcknowledgement(context.Background(), ack); err != nil {
+		t.Fatalf("CreateAcknowledgement: %v", err)
+	}
+	return ack
+}
+
+func expiryEvent(broker *events.Broker, entityID string, days, threshold int) {
+	broker.PublishTopic(events.TopicCAExpiryAlert, events.SeverityCritical, entityID, map[string]any{
+		"ca_name": "Corporate Issuing CA", "ca_type": "ISSUING",
+		"days_remaining": days, "threshold": threshold,
+	})
+}
+
+// An explicit silence keeps the alert out of Slack. Note what is *not* asserted
+// here: anything about the dashboard. The event has already reached the broker
+// by the time the dispatcher sees it, so display is untouched by construction —
+// the API tests cover that the row is still shown, marked.
+func TestAnExplicitSilenceSuppressesDelivery(t *testing.T) {
+	rec := newRecorder(t)
+	s := store.NewMemoryStore()
+	broker := events.NewBroker()
+	defer broker.Stop()
+
+	ch := addChannel(t, s, webhookChannel("ops", rec.srv.URL, "INFO", nil))
+	sealPlain(t, s, ch, `{"url":"`+rec.srv.URL+`","allow_insecure_http":true}`)
+	ackFor(t, s, "ca-1", ptrInt(14), time.Hour)
+
+	d := newTestDispatcher(t, s, broker)
+	d.Start()
+
+	expiryEvent(broker, "ca-1", 12, 14)
+	time.Sleep(300 * time.Millisecond)
+
+	if got := rec.count(); got != 0 {
+		t.Errorf("a silenced alert was delivered %d times", got)
+	}
+}
+
+// Acknowledging is not silencing. The common case is "yes, we have seen it" —
+// the alert stops being new on the dashboard, and still goes out.
+func TestAcknowledgingWithoutSilencingStillDelivers(t *testing.T) {
+	rec := newRecorder(t)
+	s := store.NewMemoryStore()
+	broker := events.NewBroker()
+	defer broker.Stop()
+
+	ch := addChannel(t, s, webhookChannel("ops", rec.srv.URL, "INFO", nil))
+	sealPlain(t, s, ch, `{"url":"`+rec.srv.URL+`","allow_insecure_http":true}`)
+	ackFor(t, s, "ca-1", ptrInt(14), 0) // acknowledged, not silenced
+
+	d := newTestDispatcher(t, s, broker)
+	d.Start()
+
+	expiryEvent(broker, "ca-1", 12, 14)
+	waitFor(t, 3*time.Second, "the alert to be delivered", func() bool { return rec.count() == 1 })
+}
+
+// The property that makes silencing safe rather than dangerous. Someone who
+// silenced a CA at 14 days answered a different question from the one asked at
+// 7, so the tighter alert must page regardless.
+func TestASilenceDoesNotCoverATighterThreshold(t *testing.T) {
+	rec := newRecorder(t)
+	s := store.NewMemoryStore()
+	broker := events.NewBroker()
+	defer broker.Stop()
+
+	ch := addChannel(t, s, webhookChannel("ops", rec.srv.URL, "INFO", nil))
+	sealPlain(t, s, ch, `{"url":"`+rec.srv.URL+`","allow_insecure_http":true}`)
+	ackFor(t, s, "ca-1", ptrInt(14), time.Hour)
+
+	d := newTestDispatcher(t, s, broker)
+	d.Start()
+
+	// Still inside the silenced threshold: quiet.
+	expiryEvent(broker, "ca-1", 12, 14)
+	time.Sleep(250 * time.Millisecond)
+	if got := rec.count(); got != 0 {
+		t.Fatalf("the 14-day alert was delivered despite the silence (%d)", got)
+	}
+
+	// The CA has since crossed 7 days. That is a new situation.
+	expiryEvent(broker, "ca-1", 5, 7)
+	waitFor(t, 3*time.Second, "the tighter alert to page", func() bool { return rec.count() == 1 })
+}
+
+// A silence covers the entity it was granted for and nothing else.
+func TestASilenceIsScopedToItsEntity(t *testing.T) {
+	rec := newRecorder(t)
+	s := store.NewMemoryStore()
+	broker := events.NewBroker()
+	defer broker.Stop()
+
+	ch := addChannel(t, s, webhookChannel("ops", rec.srv.URL, "INFO", nil))
+	sealPlain(t, s, ch, `{"url":"`+rec.srv.URL+`","allow_insecure_http":true}`)
+	ackFor(t, s, "ca-1", nil, time.Hour)
+
+	d := newTestDispatcher(t, s, broker)
+	d.Start()
+
+	expiryEvent(broker, "ca-2", 5, 7)
+	waitFor(t, 3*time.Second, "the unrelated CA to alert", func() bool { return rec.count() == 1 })
+}
+
+func TestAnExpiredSilenceStopsSuppressing(t *testing.T) {
+	rec := newRecorder(t)
+	s := store.NewMemoryStore()
+	broker := events.NewBroker()
+	defer broker.Stop()
+
+	ch := addChannel(t, s, webhookChannel("ops", rec.srv.URL, "INFO", nil))
+	sealPlain(t, s, ch, `{"url":"`+rec.srv.URL+`","allow_insecure_http":true}`)
+	ackFor(t, s, "ca-1", ptrInt(14), -time.Minute) // already lapsed
+
+	d := newTestDispatcher(t, s, broker)
+	d.Start()
+
+	expiryEvent(broker, "ca-1", 12, 14)
+	waitFor(t, 3*time.Second, "delivery once the silence has lapsed", func() bool { return rec.count() == 1 })
+}
+
+func TestWithdrawingASilenceResumesDelivery(t *testing.T) {
+	rec := newRecorder(t)
+	s := store.NewMemoryStore()
+	broker := events.NewBroker()
+	defer broker.Stop()
+
+	ch := addChannel(t, s, webhookChannel("ops", rec.srv.URL, "INFO", nil))
+	sealPlain(t, s, ch, `{"url":"`+rec.srv.URL+`","allow_insecure_http":true}`)
+	ack := ackFor(t, s, "ca-1", ptrInt(14), time.Hour)
+
+	d := newTestDispatcher(t, s, broker)
+	d.Start()
+
+	expiryEvent(broker, "ca-1", 12, 14)
+	time.Sleep(250 * time.Millisecond)
+	if rec.count() != 0 {
+		t.Fatal("the silence did not take effect")
+	}
+
+	if err := s.RevokeAcknowledgement(context.Background(), ack.ID, nil); err != nil {
+		t.Fatalf("RevokeAcknowledgement: %v", err)
+	}
+
+	expiryEvent(broker, "ca-1", 12, 14)
+	waitFor(t, 3*time.Second, "delivery to resume", func() bool { return rec.count() == 1 })
+}
+
+// Fail open. A database blip must not turn into an alert nobody received: the
+// cost of a duplicate notification is an annoyed engineer, and the cost of a
+// suppressed one is an expired CA.
+func TestAFailedAcknowledgementLookupStillDelivers(t *testing.T) {
+	rec := newRecorder(t)
+	broker := events.NewBroker()
+	defer broker.Stop()
+
+	base := store.NewMemoryStore()
+	s := &ackLookupFails{Store: base}
+
+	ch := addChannel(t, base, webhookChannel("ops", rec.srv.URL, "INFO", nil))
+	sealPlain(t, base, ch, `{"url":"`+rec.srv.URL+`","allow_insecure_http":true}`)
+
+	d := newTestDispatcher(t, s, broker)
+	d.Start()
+
+	expiryEvent(broker, "ca-1", 5, 7)
+	waitFor(t, 3*time.Second, "delivery despite the failed lookup", func() bool { return rec.count() == 1 })
+}
+
+// ackLookupFails is a store whose acknowledgement lookup is broken.
+type ackLookupFails struct{ store.Store }
+
+func (a *ackLookupFails) GetActiveAcknowledgement(context.Context, string, string) (*store.AlertAcknowledgement, error) {
+	return nil, fmt.Errorf("the acknowledgement table is unreachable")
+}

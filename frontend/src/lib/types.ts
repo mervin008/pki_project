@@ -41,10 +41,46 @@ export interface CaAuthority {
   last_alert_threshold?: number
   status: CaStatus
   ca_account_id?: string | null
+  /** Who to call. Free text — team names do not live in CertPilot. */
+  owner_team?: string | null
+  owner_email?: string | null
+  /**
+   * The acknowledgement that currently applies, when one does.
+   *
+   * Resolved server-side against the CA's *current* threshold, so an
+   * acknowledgement made at 30 days is absent once the CA has crossed 7 —
+   * showing it as still acknowledged would be the false reassurance this
+   * feature exists to avoid creating.
+   */
+  acknowledgement?: AlertAcknowledgement | null
   tags?: string
   notes?: string
   created_at: string
   updated_at: string
+}
+
+/**
+ * core/store/models.go — AlertAcknowledgement.
+ *
+ * A record that a human has looked. **Silencing suppresses delivery, never
+ * display**: an acknowledged CA still appears everywhere it appeared before,
+ * marked. Nothing in the UI may filter a row out on the strength of this.
+ */
+export interface AlertAcknowledgement {
+  id: string
+  entity_type: 'ca_authority' | 'certificate'
+  entity_id: string
+  /** The expiry threshold in days this covers. A tighter one alerts again. */
+  threshold?: number | null
+  acknowledged_by?: string
+  acknowledged_by_email?: string
+  acknowledged_at: string
+  note?: string
+  /** Delivery is suppressed until this instant. Absent means not silenced. */
+  silence_until?: string | null
+  revoked_at?: string | null
+  revoked_by?: string | null
+  created_at: string
 }
 
 /** core/store/models.go — Certificate */
