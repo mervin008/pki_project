@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, watch } from 'vue'
+import { computed, onUnmounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useApi } from '@/composables/useApi'
 import { useAsyncData } from '@/composables/useAsyncData'
+import { useEventStream } from '@/composables/useEventStream'
 import { useThemeStore } from '@/stores/theme'
+import { useCasStore } from '@/stores/cas'
 import DoughnutChart from '@/components/charts/DoughnutChart.vue'
 import BarChart from '@/components/charts/BarChart.vue'
 import DataState from '@/components/common/DataState.vue'
@@ -12,25 +14,25 @@ import {
 } from 'lucide-vue-next'
 import {
   caSeverity, certSeverity, severityBadge, severityText, statusLabel,
-  compareSeverity, severityPalette, categoricalPalette,
+  severityPalette, categoricalPalette,
 } from '@/lib/severity'
 import { formatDaysShort, formatRelative, formatTime } from '@/lib/format'
 import {
-  emptyList, parseDetails,
-  type AuditLog, type CaAuthority, type CaExpiryAlertDetails,
-  type Certificate, type DashboardStats, type ListResponse,
+  parseDetails,
+  type AuditLog, type CaExpiryAlertDetails,
+  type Certificate, type ListResponse,
 } from '@/lib/types'
 
 const api = useApi()
 const theme = useThemeStore()
 const { currentTheme } = storeToRefs(theme)
+const stream = useEventStream()
 
-const stats = useAsyncData<DashboardStats>((s) =>
-  api.get<DashboardStats>('/api/v1/dashboard/stats', s),
-)
-const cas = useAsyncData<ListResponse<CaAuthority>>((s) =>
-  api.get<ListResponse<CaAuthority>>('/api/v1/pki/authorities', s),
-)
+// CAs and the headline totals come from the shared store, which the event
+// stream keeps current. PkiOverview reads the same records, so the two pages can
+// no longer disagree about the state of the estate.
+const casStore = useCasStore()
+
 const certs = useAsyncData<ListResponse<Certificate>>((s) =>
   api.get<ListResponse<Certificate>>('/api/v1/certificates', s),
 )
@@ -38,30 +40,47 @@ const activity = useAsyncData<ListResponse<AuditLog>>((s) =>
   api.get<ListResponse<AuditLog>>('/api/v1/dashboard/activity', s),
 )
 
-const sources = [stats, cas, certs, activity]
-const loading = computed(() => sources.some((s) => s.loading.value))
-const loaded = computed(() => sources.every((s) => s.loaded.value))
+const fetched = [certs, activity]
+const loading = computed(() => casStore.loading || fetched.some((s) => s.loading.value))
+const loaded = computed(() => casStore.loaded && fetched.every((s) => s.loaded.value))
 // Any failing panel degrades the whole dashboard. Showing three fresh numbers
 // beside one stale one, with nothing to tell them apart, is how a monitoring
 // screen misleads.
-const error = computed(() => sources.map((s) => s.error.value).find(Boolean) ?? null)
-const lastLoadedAt = computed(() => stats.lastLoadedAt.value)
+const error = computed(
+  () => casStore.error ?? fetched.map((s) => s.error.value).find(Boolean) ?? null,
+)
+
+// Prefer the live feed's clock. While the stream is up the figures are newer
+// than the last REST round trip, and saying otherwise would understate how
+// current the screen is; once it drops, the store's timestamp is the honest one.
+const lastLoadedAt = computed(() =>
+  stream.status.value === 'live' && stream.lastEventAt.value
+    ? stream.lastEventAt.value
+    : casStore.lastUpdatedAt,
+)
 
 function refreshAll() {
-  sources.forEach((s) => void s.refresh())
+  void casStore.refresh()
+  fetched.forEach((s) => void s.refresh())
 }
 
-const caList = computed(() => cas.data.value?.data ?? [])
+// Certificate-level events change this page's own panels, not just the store's.
+// Reconcile them here rather than polling. refresh() aborts any request it
+// supersedes, so a burst of issuance collapses into one round trip.
+const stopListening = stream.onEvent((event) => {
+  if (event.topic.startsWith('cert.')) {
+    void certs.refresh()
+    void activity.refresh()
+  }
+})
+// Unregistered on unmount: the stream outlives this view, and a handler left
+// behind would keep refetching for a page that is no longer on screen.
+onUnmounted(stopListening)
+
+const caList = computed(() => casStore.authorities)
 const certList = computed(() => certs.data.value?.data ?? [])
 const activityList = computed(() => activity.data.value?.data ?? [])
-const summary = computed<DashboardStats>(
-  () =>
-    stats.data.value ?? {
-      total_certificates: 0, healthy_certs: 0, expiring_soon_certs: 0, expired_certs: 0,
-      total_cas: 0, healthy_cas: 0, warning_cas: 0, critical_cas: 0,
-      expired_cas: 0, unknown_cas: 0, total_scans: 0,
-    },
-)
+const summary = computed(() => casStore.summary)
 
 // ── Charts ────────────────────────────────────────────────
 // Palettes are resolved from the theme's CSS variables and recomputed when the
@@ -171,16 +190,10 @@ const caDistChart = computed(() => {
 })
 
 // ── CA health ─────────────────────────────────────────────
-const casByUrgency = computed(() =>
-  [...caList.value].sort((a, b) => {
-    const bySeverity = compareSeverity(caSeverity(a.status), caSeverity(b.status))
-    return bySeverity !== 0 ? bySeverity : a.days_remaining - b.days_remaining
-  }),
-)
-
-const casNeedingAttention = computed(
-  () => caList.value.filter((ca) => caSeverity(ca.status) !== 'ok').length,
-)
+// The urgency order lives in the store, so this panel and the CA page cannot
+// rank the same estate differently.
+const casByUrgency = computed(() => casStore.byUrgency)
+const casNeedingAttention = computed(() => casStore.needingAttention)
 
 /**
  * The breakdown behind that count, worst first, omitting empty buckets.

@@ -1,4 +1,4 @@
-.PHONY: all build build-core build-gateways test test-coverage lint proto proto-lint \
+.PHONY: all build build-core build-gateways test test-frontend test-coverage lint proto proto-lint \
         dev dev-certs generate-kek run-core run-gateway-selfsigned run-gateway-acme run-frontend \
         clean help
 
@@ -105,6 +105,12 @@ test-race:
 		(cd $$m && $(GO) test ./... -race) || exit 1; \
 	done
 
+## Typecheck the frontend and check the hand-rolled SSE parser.
+## Needs Node 22.18+ — the check imports TypeScript directly, using Node's own
+## type stripping rather than adding a test runner to the dependency tree.
+test-frontend:
+	cd frontend && npx vue-tsc --noEmit && node scripts/check-sse.mjs
+
 test-coverage:
 	@for m in $(MODULES); do \
 		(cd $$m && $(GO) test ./... -coverprofile=coverage.out && $(GO) tool cover -func=coverage.out | tail -1); \
@@ -147,11 +153,12 @@ help:
 	@echo "  make run-core                CertPilot Core        :8080"
 	@echo "  make run-gateway-selfsigned  Self-signed gateway   :9091"
 	@echo "  make run-gateway-acme        ACME gateway          :9092"
-	@echo "  make run-frontend            Vue frontend          :5173"
+	@echo "  make run-frontend            Vue frontend          :3000"
 	@echo ""
 	@echo "Check"
 	@echo "  make test                    Run all tests"
 	@echo "  make test-race               Run all tests under the race detector"
+	@echo "  make test-frontend           Typecheck the UI and check the SSE parser"
 	@echo "  make lint                    go vet and gofmt"
 	@echo ""
 	@echo "Clean"

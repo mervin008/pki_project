@@ -1,40 +1,39 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useApi } from '@/composables/useApi'
-import { useAsyncData } from '@/composables/useAsyncData'
+import { useCasStore } from '@/stores/cas'
 import DataState from '@/components/common/DataState.vue'
 import {
   ShieldCheck, Plus, ChevronDown, ChevronRight, Lock, Server, Stamp,
   RotateCw, CircleCheck, CircleX,
 } from 'lucide-vue-next'
 import {
-  caSeverity, compareSeverity, severityBadge, severityBorder, severityText, statusLabel,
+  caSeverity, severityBadge, severityBorder, severityText, statusLabel,
 } from '@/lib/severity'
 import { formatDate, formatDateTime, formatDays, truncate } from '@/lib/format'
-import type { CaAuthority, ListResponse } from '@/lib/types'
+import type { CaAuthority } from '@/lib/types'
 
 const api = useApi()
 
-const cas = useAsyncData<ListResponse<CaAuthority>>((s) =>
-  api.get<ListResponse<CaAuthority>>('/api/v1/pki/authorities', s),
-)
+// Shared with the dashboard and kept current by the event stream, so a CA that
+// goes critical while this page is open reorders itself without a reload — and
+// the two pages cannot show different states of the same estate.
+const cas = useCasStore()
 
-const authorities = computed(() => cas.data.value?.data ?? [])
-
+const authorities = computed(() => cas.authorities)
 // Most urgent first — an expiring issuing CA takes down everything it signed,
 // so it must never be below the fold.
-const byUrgency = computed(() =>
-  [...authorities.value].sort((a, b) => {
-    const bySeverity = compareSeverity(caSeverity(a.status), caSeverity(b.status))
-    return bySeverity !== 0 ? bySeverity : a.days_remaining - b.days_remaining
-  }),
-)
+const byUrgency = computed(() => cas.byUrgency)
 
-const countByType = (type: string) =>
-  computed(() => authorities.value.filter((ca) => ca.ca_type === type).length)
-const rootCount = countByType('ROOT')
-const intermediateCount = countByType('INTERMEDIATE')
-const issuingCount = countByType('ISSUING')
+const rootCount = computed(() => cas.countByType.ROOT ?? 0)
+const intermediateCount = computed(() => cas.countByType.INTERMEDIATE ?? 0)
+const issuingCount = computed(() => cas.countByType.ISSUING ?? 0)
+
+// Re-validate on entry. The store usually already holds live data, so this only
+// matters when the stream never came up.
+onMounted(() => {
+  if (!cas.loaded) void cas.refresh()
+})
 
 const expandedCa = ref<string | null>(null)
 function toggleExpand(id: string) {
@@ -123,8 +122,8 @@ async function checkNow(ca: CaAuthority) {
         Certificate authorities under management, most urgent first
       </p>
       <div class="flex items-center gap-2">
-        <button class="btn btn-ghost btn-sm gap-1.5" :disabled="cas.loading.value" @click="cas.refresh()">
-          <RotateCw class="w-3.5 h-3.5" :class="cas.loading.value && 'animate-spin'" />
+        <button class="btn btn-ghost btn-sm gap-1.5" :disabled="cas.loading" @click="cas.refresh()">
+          <RotateCw class="w-3.5 h-3.5" :class="cas.loading && 'animate-spin'" />
           Refresh
         </button>
         <button class="btn btn-primary btn-sm gap-2" @click="showImport = true">
@@ -139,9 +138,9 @@ async function checkNow(ca: CaAuthority) {
     </div>
 
     <DataState
-      :loading="cas.loading.value"
-      :error="cas.error.value"
-      :loaded="cas.loaded.value"
+      :loading="cas.loading"
+      :error="cas.error"
+      :loaded="cas.loaded"
       @retry="cas.refresh()"
     >
       <div class="grid grid-cols-2 md:grid-cols-4 gap-3">

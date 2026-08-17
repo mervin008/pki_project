@@ -18,3 +18,26 @@
     font-family: 'JetBrains Mono', monospace;
   }
 }
+
+@layer components {
+  /*
+   * Applied to the main content area when the live feed has gone stale.
+   *
+   * The failure this product exists to prevent is a CA expiring while everyone
+   * believed they were watching. A dashboard that keeps showing confident green
+   * after it has stopped receiving data produces exactly that belief, so when
+   * the feed dies the content stops looking like a live readout: the colour
+   * drains and it recedes. Readable, deliberately not reassuring.
+   */
+  .surface-stale {
+    filter: grayscale(0.85) opacity(0.65);
+  }
+
+  /* Honour a reduced-motion preference, but keep the degradation visible —
+     the point is the change in appearance, not the transition. */
+  @media (prefers-reduced-motion: reduce) {
+    .surface-stale {
+      transition: none;
+    }
+  }
+}

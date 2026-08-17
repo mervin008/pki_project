@@ -1,12 +1,22 @@
 <script setup lang="ts">
-import { onMounted, watch } from 'vue'
+import { computed, onMounted, onUnmounted, watch } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { useThemeStore } from '@/stores/theme'
+import { useCasStore } from '@/stores/cas'
+import { useAlertsStore } from '@/stores/alerts'
+import { useEventStream } from '@/composables/useEventStream'
 import Sidebar from '@/components/layout/Sidebar.vue'
 import TopBar from '@/components/layout/TopBar.vue'
+import StreamStatusBanner from '@/components/common/StreamStatusBanner.vue'
 
 const authStore = useAuthStore()
 const themeStore = useThemeStore()
+const casStore = useCasStore()
+// Instantiated here, not lazily in a view: both stores register handlers on the
+// event stream, and a store created only when its page is first opened would
+// have missed everything that happened before then.
+useAlertsStore()
+const stream = useEventStream()
 
 function applyDataTheme() {
   document.documentElement.setAttribute('data-theme', themeStore.currentTheme)
@@ -15,9 +25,22 @@ function applyDataTheme() {
 onMounted(() => {
   authStore.init()
   applyDataTheme()
+  // One connection for the whole app. The snapshot it delivers on connect is
+  // what populates the stores, so the initial REST fetch is a fallback for the
+  // case where the stream cannot be established at all.
+  stream.connect()
+  void casStore.refresh()
 })
 
+onUnmounted(() => stream.disconnect())
+
 watch(() => themeStore.currentTheme, applyDataTheme)
+
+// When the feed is stale every figure on the page is last-known-good. Draining
+// the colour out of the content says so at a glance and from a distance, which
+// a small chip in the toolbar cannot do. The banner explains it; this makes it
+// impossible to read the screen as normal.
+const surfaceIsStale = computed(() => stream.status.value === 'stale')
 </script>
 
 <template>
@@ -25,7 +48,8 @@ watch(() => themeStore.currentTheme, applyDataTheme)
     <Sidebar />
     <div class="flex-1 flex flex-col min-w-0">
       <TopBar />
-      <main class="flex-1 p-6 overflow-y-auto">
+      <StreamStatusBanner />
+      <main class="flex-1 p-6 overflow-y-auto transition-all" :class="{ 'surface-stale': surfaceIsStale }">
         <router-view />
       </main>
     </div>

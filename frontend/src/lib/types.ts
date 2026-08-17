@@ -182,6 +182,94 @@ export interface ProviderCapabilities {
   description: string
 }
 
+// ── Live event stream ─────────────────────────────────────
+//
+// Shapes carried by GET /api/v1/events. Keep in sync with core/api/events.go
+// and core/events/broker.go.
+
+/**
+ * The per-CA payload in a stream snapshot — core/api/events.go `caSummary`.
+ *
+ * Deliberately a subset of CaAuthority: the snapshot is re-sent on every
+ * connect and every resynchronise, so it omits `certificate_pem` and the other
+ * kilobyte fields a dashboard never draws.
+ */
+export interface CaSummary {
+  id: string
+  name: string
+  ca_type: CaType
+  status: CaStatus
+  days_remaining: number
+  not_after: string
+  is_crl_fresh: boolean
+  has_crl: boolean
+  certificates_issued_count: number
+  last_alert_threshold?: number
+  parent_ca_id?: string | null
+}
+
+/** The `snapshot` event — complete current state, sent on connect. */
+export interface StreamSnapshot {
+  stats: DashboardStats
+  cas: CaSummary[]
+  /** Server clock, so a client can detect skew before judging its own staleness. */
+  server_time: string
+  last_event_id: number
+}
+
+/** Topics published by the core — core/events/broker.go. */
+export type StreamTopic =
+  | 'ca.health'
+  | 'ca.expiry_alert'
+  | 'cert.issued'
+  | 'cert.renewed'
+  | 'cert.renewal_failed'
+  | 'cert.expiring'
+  | 'gateway.status'
+
+/** One published change — core/events/broker.go `Event`. */
+export interface StreamEvent {
+  id: number
+  /** Typed loosely: an unrecognised topic must render, not crash the feed. */
+  topic: StreamTopic | string
+  severity: 'INFO' | 'WARNING' | 'CRITICAL'
+  entity_id?: string
+  payload?: Record<string, unknown>
+  timestamp: string
+}
+
+/** Payload of `ca.health` — core/engine/pki/ca_monitor.go */
+export interface CaHealthPayload {
+  ca_name: string
+  ca_type: CaType
+  previous_status: CaStatus
+  status: CaStatus
+  days_remaining: number
+  is_crl_fresh: boolean
+  not_after: string
+}
+
+/** Payload of `ca.expiry_alert` — core/engine/pki/ca_monitor.go */
+export interface CaExpiryAlertPayload {
+  ca_name: string
+  ca_type: CaType
+  days_remaining: number
+  threshold: number
+  severity: 'WARNING' | 'CRITICAL'
+  not_after: string
+}
+
+/** Payload of the `cert.*` topics. Fields vary by topic; all are optional. */
+export interface CertEventPayload {
+  common_name?: string
+  serial_number?: string
+  days_remaining?: number
+  not_after?: string
+  gateway?: string
+  renewal_count?: number
+  error?: string
+}
+
 /** Most list endpoints wrap results this way. `GET /dashboard/stats` does not. */
 export interface ListResponse<T> {
   data: T[]
