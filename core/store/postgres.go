@@ -1232,7 +1232,8 @@ func (s *PostgresStore) RevokeAcknowledgement(ctx context.Context, id string, re
 // ── Discovery ───────────────────────────────────────────
 
 const discoveryScanColumns = `id, scan_type, coalesce(targets, '[]'::jsonb), status,
-		coalesce(results_count, 0), coalesce(unmanaged_count, 0), coalesce(managed_count, 0),
+		coalesce(target_count, 0), coalesce(results_count, 0),
+		coalesce(unmanaged_count, 0), coalesce(managed_count, 0),
 		coalesce(unreachable_count, 0), started_at, completed_at, coalesce(error, ''),
 		triggered_by, actor_email, created_at`
 
@@ -1241,7 +1242,7 @@ func scanDiscoveryScan(row pgx.Row) (*DiscoveryScan, error) {
 	var targetsJSON []byte
 	err := row.Scan(
 		&scan.ID, &scan.ScanType, &targetsJSON, &scan.Status,
-		&scan.ResultsCount, &scan.UnmanagedCount, &scan.ManagedCount,
+		&scan.TargetCount, &scan.ResultsCount, &scan.UnmanagedCount, &scan.ManagedCount,
 		&scan.UnreachableCount, &scan.StartedAt, &scan.CompletedAt, &scan.Error,
 		&scan.TriggeredBy, &scan.ActorEmail, &scan.CreatedAt,
 	)
@@ -1269,10 +1270,11 @@ func (s *PostgresStore) CreateDiscoveryScan(ctx context.Context, scan *Discovery
 	}
 	return s.pool.QueryRow(ctx, `
 		INSERT INTO public.discovery_scans
-			(scan_type, targets, status, started_at, triggered_by, actor_email)
-		VALUES ($1, $2, $3, $4, $5, $6)
+			(scan_type, targets, target_count, status, started_at, triggered_by, actor_email)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING id, created_at`,
-		scan.ScanType, targetsJSON, scan.Status, scan.StartedAt, scan.TriggeredBy, scan.ActorEmail).
+		scan.ScanType, targetsJSON, scan.TargetCount, scan.Status, scan.StartedAt,
+		scan.TriggeredBy, scan.ActorEmail).
 		Scan(&scan.ID, &scan.CreatedAt)
 }
 

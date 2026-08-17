@@ -71,12 +71,14 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 		ChainResolver: pki.NewChainResolver(st),
 		RenewalExec:   renewal.NewExecutor(st, pm, keyring, broker),
 		PolicyEngine:  policy.NewEngine(st),
-		Scanner:       discovery.NewScanner(st),
-		Keyring:       keyring,
-		Broker:        broker,
-		Dispatcher:    dispatcher,
-		Auth:          auth,
-		Config:        cfg,
+		// A real broker on the scanner: background scans publish their findings
+		// themselves, so a scanner without one would silently drop them.
+		Scanner:    discovery.NewScanner(st, discovery.WithBroker(broker), discovery.WithDialTimeout(3*time.Second)),
+		Keyring:    keyring,
+		Broker:     broker,
+		Dispatcher: dispatcher,
+		Auth:       auth,
+		Config:     cfg,
 	})
 
 	t.Cleanup(func() {

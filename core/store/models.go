@@ -340,6 +340,11 @@ const (
 	ScanRunning   = "RUNNING"
 	ScanCompleted = "COMPLETED"
 	ScanFailed    = "FAILED"
+	// ScanCancelled is distinct from ScanFailed on purpose. A scan somebody
+	// stopped deliberately reached what it reached; recording that as a failure
+	// would make the history lie about which runs went wrong, and the history
+	// is what tells you whether scanning is working.
+	ScanCancelled = "CANCELLED"
 )
 
 // Whether CertPilot already knows about a discovered certificate.
@@ -402,9 +407,15 @@ type DiscoveryScan struct {
 	// Targets is what was asked for, as given. Kept verbatim so a scan can be
 	// repeated and so an unexpected result can be traced back to the input
 	// that produced it.
-	Targets      []string `json:"targets"`
-	Status       string   `json:"status"`
-	ResultsCount int      `json:"results_count"`
+	Targets []string `json:"targets"`
+	Status  string   `json:"status"`
+	// TargetCount is how many endpoints the run set out to reach, once the
+	// targets expanded — `10.0.0.0/24` is 254 of them. Without it a running
+	// scan can say how many endpoints have answered but not out of how many,
+	// and a scan whose end nobody can see is one people cancel out of doubt
+	// rather than intent.
+	TargetCount  int `json:"target_count"`
+	ResultsCount int `json:"results_count"`
 	// The three counts partition ResultsCount. UnmanagedCount is the headline:
 	// it is the number a PKI team reads first and the only one that implies
 	// work.

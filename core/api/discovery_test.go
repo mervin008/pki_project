@@ -306,3 +306,145 @@ func startScanTarget(t *testing.T) string {
 	addr := srv.Listener.Addr().(*net.TCPAddr)
 	return net.JoinHostPort("127.0.0.1", strconv.Itoa(addr.Port))
 }
+
+// A scan too wide to wait for goes to the background and says so. The client
+// should not have to infer that from the status code.
+func TestWideScanRunsInTheBackground(t *testing.T) {
+	r, st := realRouter(t)
+
+	w := do(r, http.MethodPost, "/api/v1/discovery/scan",
+		gin.H{"targets": []string{"192.0.2.0/26"}}, nil)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (%s)", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Scan        *store.DiscoveryScan `json:"scan"`
+		Poll        string               `json:"poll"`
+		Summary     string               `json:"summary"`
+		TargetCount int                  `json:"target_count"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if resp.Scan.Status != store.ScanRunning {
+		t.Errorf("status = %q, want RUNNING", resp.Scan.Status)
+	}
+	if resp.TargetCount != 62 {
+		t.Errorf("target_count = %d, want 62 usable addresses in a /26", resp.TargetCount)
+	}
+	if !strings.Contains(resp.Poll, resp.Scan.ID) {
+		t.Errorf("no poll URL for the run: %q", resp.Poll)
+	}
+
+	// Cancelled immediately: this test must not spend a minute connecting to
+	// TEST-NET-1, and cancelling is the behaviour being relied on to do that.
+	cancel := do(r, http.MethodPost, "/api/v1/discovery/scans/"+resp.Scan.ID+"/cancel", nil, nil)
+	if cancel.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d (%s)", cancel.Code, cancel.Body.String())
+	}
+	if !strings.Contains(cancel.Body.String(), "already found is kept") {
+		t.Errorf("the cancel response should say results are kept: %s", cancel.Body.String())
+	}
+
+	logs, _, err := st.ListAuditLogs(context.Background(),
+		store.AuditLogFilter{Actions: []string{"discovery.cancelled"}})
+	if err != nil {
+		t.Fatalf("ListAuditLogs: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Errorf("got %d cancellation audit entries, want 1", len(logs))
+	}
+}
+
+// Expansion is where a typo becomes an incident: one misplaced digit turns a
+// /24 into sixteen million outbound connections carrying CertPilot's address.
+func TestScanRefusesAnAbsurdRange(t *testing.T) {
+	r, st := realRouter(t)
+
+	w := do(r, http.MethodPost, "/api/v1/discovery/scan", gin.H{"targets": []string{"10.0.0.0/8"}}, nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "16777216") {
+		t.Errorf("the refusal does not say how large the range is: %s", w.Body.String())
+	}
+
+	scans, _, _ := st.ListDiscoveryScans(context.Background(), 10, 0)
+	if len(scans) != 0 {
+		t.Errorf("a refused range recorded %d scan(s); nothing should have been started", len(scans))
+	}
+}
+
+// Cancelling a scan that is not running is not an error — it has usually just
+// finished — but the response has to say what state it is actually in.
+func TestCancellingAFinishedScanSaysSo(t *testing.T) {
+	r, _ := realRouter(t)
+	target := startScanTarget(t)
+
+	scanResp := do(r, http.MethodPost, "/api/v1/discovery/scan", gin.H{"targets": []string{target}}, nil)
+	var scan struct {
+		Scan *store.DiscoveryScan `json:"scan"`
+	}
+	_ = json.Unmarshal(scanResp.Body.Bytes(), &scan)
+
+	w := do(r, http.MethodPost, "/api/v1/discovery/scans/"+scan.Scan.ID+"/cancel", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "COMPLETED") {
+		t.Errorf("the response should name the scan's actual status: %s", w.Body.String())
+	}
+
+	missing := do(r, http.MethodPost, "/api/v1/discovery/scans/no-such-scan/cancel", nil, nil)
+	if missing.Code != http.StatusNotFound {
+		t.Errorf("cancelling an unknown scan = %d, want 404", missing.Code)
+	}
+}
+
+// The audit trail and the scan record keep what someone typed, not what it
+// expanded into.
+//
+// A scan is repeated by re-running what was asked for and found again by the
+// range somebody remembers typing. Two hundred and fifty four addresses in a
+// scan record answer neither question, and they make the audit entry unreadable
+// exactly when it is being read for a reason.
+func TestScanRecordsWhatWasTypedNotWhatItExpandedTo(t *testing.T) {
+	r, st := realRouter(t)
+
+	w := do(r, http.MethodPost, "/api/v1/discovery/scan",
+		gin.H{"targets": []string{"192.0.2.0/26"}}, nil)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (%s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Scan *store.DiscoveryScan `json:"scan"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	defer do(r, http.MethodPost, "/api/v1/discovery/scans/"+resp.Scan.ID+"/cancel", nil, nil)
+
+	if len(resp.Scan.Targets) != 1 || resp.Scan.Targets[0] != "192.0.2.0/26" {
+		t.Errorf("scan targets = %v, want the one entry that was typed", resp.Scan.Targets)
+	}
+	// The expansion is not lost — it is a count, which is what progress needs.
+	if resp.Scan.TargetCount != 62 {
+		t.Errorf("target_count = %d, want 62", resp.Scan.TargetCount)
+	}
+
+	logs, _, err := st.ListAuditLogs(context.Background(), store.AuditLogFilter{Actions: []string{"discovery.scan"}})
+	if err != nil {
+		t.Fatalf("ListAuditLogs: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("got %d audit entries, want 1", len(logs))
+	}
+	if !strings.Contains(logs[0].Details, "192.0.2.0/26") {
+		t.Errorf("the audit entry does not record what was asked for: %s", logs[0].Details)
+	}
+	if strings.Contains(logs[0].Details, "192.0.2.17") {
+		t.Errorf("the audit entry expanded the range into individual addresses: %s", logs[0].Details)
+	}
+	if !strings.Contains(logs[0].Details, `"endpoints":62`) {
+		t.Errorf("the audit entry does not say how far the range expanded: %s", logs[0].Details)
+	}
+}

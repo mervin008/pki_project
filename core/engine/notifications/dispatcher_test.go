@@ -627,3 +627,44 @@ type ackLookupFails struct{ store.Store }
 func (a *ackLookupFails) GetActiveAcknowledgement(context.Context, string, string) (*store.AlertAcknowledgement, error) {
 	return nil, fmt.Errorf("the acknowledgement table is unreachable")
 }
+
+// Scan progress must never reach a notification channel, even one configured to
+// take everything at INFO.
+//
+// A range scan publishes progress every few seconds for minutes. Delivering
+// that is how a team ends up muting the channel that also carries CA expiry
+// alerts — and the mute outlives the scan.
+func TestDispatcherNeverDeliversScanProgress(t *testing.T) {
+	rec := newRecorder(t)
+	s := store.NewMemoryStore()
+	broker := events.NewBroker()
+	defer broker.Stop()
+
+	// The most permissive channel possible: every topic, lowest severity.
+	ch := addChannel(t, s, webhookChannel("everything", rec.srv.URL, "INFO", nil))
+	sealPlain(t, s, ch, `{"url":"`+rec.srv.URL+`","allow_insecure_http":true}`)
+
+	d := newTestDispatcher(t, s, broker)
+	d.Start()
+
+	for i := 0; i < 5; i++ {
+		broker.PublishTopic(events.TopicDiscoveryProgress, events.SeverityInfo, "scan-1", map[string]any{
+			"scanned_count": i * 10, "target_count": 254,
+		})
+	}
+
+	// Then something that must arrive, so the test proves suppression rather
+	// than a dispatcher that happened to be asleep.
+	broker.PublishTopic(events.TopicDiscoveryUnmanaged, events.SeverityWarning, "scan-1", map[string]any{
+		"unmanaged_count": 3, "scanned_count": 254,
+	})
+
+	waitFor(t, 3*time.Second, "the finding to arrive", func() bool { return rec.count() >= 1 })
+
+	if rec.count() != 1 {
+		t.Errorf("%d deliveries, want exactly 1: the five progress events should have been suppressed", rec.count())
+	}
+	if !strings.Contains(rec.lastBody(), "discovery.unmanaged") {
+		t.Errorf("the delivered event was not the finding:\n%s", rec.lastBody())
+	}
+}

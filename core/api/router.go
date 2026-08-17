@@ -51,7 +51,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	caHandler := NewCAHandler(deps.Store, deps.CAMonitor, deps.ChainResolver)
 	caAccHandler := NewCAAccountHandler(deps.Store, deps.PluginMgr, deps.Keyring)
 	dashHandler := NewDashboardHandler(deps.Store)
-	discHandler := NewDiscoveryHandler(deps.Store, deps.Scanner, deps.Broker)
+	discHandler := NewDiscoveryHandler(deps.Store, deps.Scanner)
 	policyHandler := NewPolicyHandler(deps.Store)
 	eventsHandler := NewEventsHandler(deps.Store, deps.Broker)
 	displayHandler := NewDisplayTokenHandler(deps.Store)
@@ -119,6 +119,9 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// is estate state, the same as the CA list.
 		v1.GET("/discovery/scans", discHandler.ListScans)
 		v1.GET("/discovery/scans/:id", discHandler.GetScan)
+		// Stopping a scan is an operator action for the same reason starting one
+		// is: it changes what CertPilot is doing to somebody else's network.
+		v1.POST("/discovery/scans/:id/cancel", middleware.RequireRole(middleware.RoleOperator), discHandler.CancelScan)
 		v1.GET("/discovery/results", discHandler.ListResults)
 
 		// ── Display Tokens ──

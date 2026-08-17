@@ -176,7 +176,7 @@ The rest:
 | Step | | |
 |:---|:---|:---|
 | 1 | Scans that persist, and the verdict that matters | ✅ |
-| 2 | CIDR expansion, worker pool, cancellation, progress on the stream | |
+| 2 | CIDR expansion, worker pool, cancellation, progress on the stream | ✅ |
 | 3 | Scheduled scans and re-scan reconciliation | |
 | 4 | CT log monitoring | |
 | 5 | Cloud inventory: ACM, Azure Key Vault, GCP, Kubernetes secrets | |
@@ -231,6 +231,38 @@ wrong-host, incomplete-chain, TLS 1.0, 3DES, and a SHA-1 intermediate each
 produced exactly one correct finding, an unmanaged run reached a signed webhook
 through the existing dispatcher, and importing a result flipped the same
 endpoint to `MANAGED` on re-scan.
+
+**Step 2** made it a scanner rather than a lookup. Targets expand from CIDR
+networks and address ranges, run through a worker pool, and can be stopped.
+
+Expansion is where a typo becomes an incident: one misplaced digit turns
+`10.0.0.0/24` into `10.0.0.0/8`, which is sixteen million outbound connections
+carrying CertPilot's return address across somebody else's network. So the size
+is counted from the prefix before a single address is materialised, and the
+refusal names the number rather than merely saying no.
+
+Three things follow from a scan now taking minutes rather than seconds.
+
+Results are **written as they are found**, so a run that is cancelled, crashes,
+or is restarted through keeps everything it reached — the alternative is having
+nothing to show for the one endpoint it found something on. Progress goes to the
+event stream, but **never** to a notification channel: a range scan would put a
+message in Slack every few seconds for minutes, and a team that mutes that
+channel has also muted the CA expiry alerts sharing it. That distinction now
+exists in the broker as a property of the topic rather than of the severity,
+because an INFO event can still be news.
+
+And **cancelled is not failed.** A scan somebody stopped on purpose reached what
+it reached; recording it as a failure would make the scan history lie about
+which runs went wrong, and that history is the only thing that says whether
+discovery is running at all. Endpoints abandoned mid-probe are not recorded as
+unreachable either — they were never really asked, and a row saying otherwise is
+a finding about the estate invented by stopping the scan.
+
+The scan record keeps the targets as they were **typed**, with a separate count
+of what they expanded to. A scan is repeated by re-running what was asked for
+and found again by the range someone remembers typing; 254 addresses in an audit
+entry answer neither question.
 
 **Still open in this phase:** the same endpoint appears once per scan in the
 cross-scan results list, so "everything we have found and not adopted" over-counts.

@@ -13,7 +13,7 @@
  * backend has ever returned — so every field rendered as an em dash and the
  * scan itself 400'd.
  */
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref } from 'vue'
 import { useApi } from '@/composables/useApi'
 import type { DiscoveryResult, DiscoveryScanResponse } from '@/lib/types'
 import { AlertTriangle, CheckCircle, Radar, Search } from 'lucide-vue-next'
@@ -26,6 +26,59 @@ const scanError = ref('')
 const response = ref<DiscoveryScanResponse | null>(null)
 const importing = ref<string | null>(null)
 const importMessage = ref('')
+const cancelling = ref(false)
+
+/** A wide scan runs in the background; the response says so via scan.status. */
+const running = computed(() => response.value?.scan.status === 'RUNNING')
+let pollTimer: ReturnType<typeof setTimeout> | null = null
+
+onUnmounted(stopPolling)
+
+function stopPolling() {
+  if (pollTimer) {
+    clearTimeout(pollTimer)
+    pollTimer = null
+  }
+}
+
+/**
+ * Poll a background run until it stops.
+ *
+ * Deliberately not driven off the event stream. Progress is published there,
+ * but this view is opened to watch one specific scan, and a poll that keeps
+ * working when the stream is down is the version that does not leave someone
+ * staring at a run they cannot see the end of.
+ */
+function pollScan(id: string) {
+  stopPolling()
+  pollTimer = setTimeout(async () => {
+    try {
+      const res = await api.get<DiscoveryScanResponse>(`/api/v1/discovery/scans/${id}`)
+      response.value = res
+      if (res.scan.status === 'RUNNING') {
+        pollScan(id)
+      } else {
+        scanning.value = false
+      }
+    } catch (err: any) {
+      scanError.value = err.message || 'Lost track of the scan'
+      scanning.value = false
+    }
+  }, 2000)
+}
+
+async function cancelScan() {
+  const id = response.value?.scan.id
+  if (!id) return
+  cancelling.value = true
+  try {
+    await api.post(`/api/v1/discovery/scans/${id}/cancel`)
+  } catch (err: any) {
+    scanError.value = err.message || 'Cancel failed'
+  } finally {
+    cancelling.value = false
+  }
+}
 
 /** Split on commas, spaces, and newlines so a pasted list works. */
 const targets = computed(() =>
@@ -49,16 +102,21 @@ async function runScan() {
   scanError.value = ''
   importMessage.value = ''
   response.value = null
+  stopPolling()
   try {
-    response.value = await api.post<DiscoveryScanResponse>('/api/v1/discovery/scan', {
+    const res = await api.post<DiscoveryScanResponse>('/api/v1/discovery/scan', {
       targets: targets.value,
       port: parseInt(port.value) || 443,
     })
+    response.value = res
+    if (res.scan.status === 'RUNNING') {
+      pollScan(res.scan.id)
+      return // stays "scanning" until the run stops
+    }
   } catch (err: any) {
     scanError.value = err.message || 'Scan failed'
-  } finally {
-    scanning.value = false
   }
+  scanning.value = false
 }
 
 async function importResult(result: DiscoveryResult) {
@@ -125,7 +183,7 @@ function formatDate(d?: string) {
             <input
               v-model="targetInput"
               type="text"
-              placeholder="example.com, 10.0.0.5:8443"
+              placeholder="example.com, 10.0.0.0/24, 10.0.0.4-40:8443"
               class="input input-bordered input-sm"
               required
             />
@@ -158,13 +216,33 @@ function formatDate(d?: string) {
            reachable look identical as numbers and mean opposite things. -->
       <div class="card bg-base-100 border border-base-300">
         <div class="card-body p-5 gap-2">
-          <p class="text-sm font-medium">{{ response.summary }}</p>
-          <p class="text-xs text-base-content/60 font-mono">
-            {{ response.scan.results_count }} scanned ·
-            {{ response.scan.unmanaged_count }} unmanaged ·
-            {{ response.scan.managed_count }} managed ·
-            {{ response.scan.unreachable_count }} unreachable
-          </p>
+          <div class="flex items-start justify-between gap-3">
+            <div>
+              <p class="text-sm font-medium">{{ response.summary }}</p>
+              <p class="text-xs text-base-content/60 font-mono mt-1">
+                {{ response.scan.results_count }}<span v-if="response.target_count">
+                  of {{ response.target_count }}</span> scanned ·
+                {{ response.scan.unmanaged_count }} unmanaged ·
+                {{ response.scan.managed_count }} managed ·
+                {{ response.scan.unreachable_count }} unreachable
+              </p>
+            </div>
+            <button
+              v-if="running"
+              class="btn btn-xs btn-outline btn-error"
+              :disabled="cancelling"
+              @click="cancelScan"
+            >
+              <span v-if="cancelling" class="loading loading-spinner loading-xs"></span>
+              Stop scan
+            </button>
+          </div>
+          <progress
+            v-if="running && response.target_count"
+            class="progress progress-primary w-full"
+            :value="response.scan.results_count"
+            :max="response.target_count"
+          ></progress>
         </div>
       </div>
 

@@ -429,3 +429,47 @@ func TestStringID(t *testing.T) {
 		t.Fatalf("StringID = %q, want \"42\"", got)
 	}
 }
+
+// Progress is state, not news. A channel left at INFO would otherwise receive
+// one message every few seconds for the length of a range scan — and a team
+// that mutes that channel has also muted the CA expiry alerts sharing it.
+func TestScanProgressIsStreamOnly(t *testing.T) {
+	if IsNotifiable(TopicDiscoveryProgress) {
+		t.Error("scan progress may be delivered to notification channels")
+	}
+	if !IsNotifiable(TopicDiscoveryUnmanaged) {
+		t.Error("the finding a scan exists to produce is not notifiable")
+	}
+	if !IsNotifiable(TopicCAExpiryAlert) {
+		t.Error("CA expiry alerts are not notifiable")
+	}
+	// An unrecognised topic is notifiable. Producers add topics over time, and
+	// a rule that silently suppressed anything it did not recognise would turn
+	// every new event type into a coverage gap nobody sees.
+	if !IsNotifiable("something.new") {
+		t.Error("an unknown topic was suppressed")
+	}
+
+	// A topic that can be selected in a channel filter and will never arrive is
+	// the same failure as a typo'd one: configured on screen, silent in fact.
+	for _, topic := range AllTopics() {
+		if !IsNotifiable(topic) {
+			t.Errorf("AllTopics offers %q, which is never delivered", topic)
+		}
+	}
+
+	// The stream still carries it: that is the whole point.
+	broker := NewBroker()
+	defer broker.Stop()
+	sub := broker.Subscribe()
+	broker.PublishTopic(TopicDiscoveryProgress, SeverityInfo, "scan-1", map[string]any{"scanned_count": 4})
+
+	select {
+	case evt := <-sub.Events():
+		if evt.Topic != TopicDiscoveryProgress {
+			t.Errorf("got topic %q", evt.Topic)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("progress never reached a stream subscriber")
+	}
+}

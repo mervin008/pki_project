@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -22,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/store"
 	"github.com/certpilot/certpilot/pkg/x509util"
 )
@@ -37,6 +39,14 @@ const (
 	// of a rack finishes while someone is still looking at the screen, low
 	// enough not to look like a SYN flood to whatever sits in front of it.
 	defaultConcurrency = 12
+	// defaultBatchSize is how many results are written at once. Small enough
+	// that a cancelled range scan keeps nearly everything it found, large
+	// enough that the write is not the slow part of scanning.
+	defaultBatchSize = 25
+	// flushInterval bounds how long a result can sit unwritten. A range of
+	// unreachable addresses trickles in, and a scan whose stored progress does
+	// not move looks stuck rather than slow.
+	flushInterval = 3 * time.Second
 )
 
 // Target is one endpoint to ask.
@@ -94,19 +104,59 @@ func ParseTarget(raw string, defaultPort int) (Target, error) {
 // certificates and CAs CertPilot already knows about.
 type Scanner struct {
 	store       store.Store
+	broker      *events.Broker
 	dialTimeout time.Duration
 	concurrency int
+	batchSize   int
 	now         func() time.Time
+
+	// running holds the cancel function of every scan in flight, so a run
+	// somebody started by mistake can be stopped without restarting the core.
+	mu      sync.Mutex
+	running map[string]context.CancelFunc
+}
+
+// Option configures a Scanner.
+type Option func(*Scanner)
+
+// WithBroker publishes progress and completion to the event stream, so a scan
+// of a range is visible while it runs rather than only once it is over.
+func WithBroker(b *events.Broker) Option {
+	return func(s *Scanner) { s.broker = b }
+}
+
+// WithConcurrency sets how many handshakes run at once.
+func WithConcurrency(n int) Option {
+	return func(s *Scanner) {
+		if n > 0 {
+			s.concurrency = n
+		}
+	}
+}
+
+// WithDialTimeout bounds one endpoint.
+func WithDialTimeout(d time.Duration) Option {
+	return func(s *Scanner) {
+		if d > 0 {
+			s.dialTimeout = d
+		}
+	}
 }
 
 // NewScanner creates a scanner backed by the inventory in the given store.
-func NewScanner(s store.Store) *Scanner {
-	return &Scanner{
+func NewScanner(s store.Store, opts ...Option) *Scanner {
+	scanner := &Scanner{
 		store:       s,
 		dialTimeout: defaultDialTimeout,
 		concurrency: defaultConcurrency,
+		batchSize:   defaultBatchSize,
 		now:         time.Now,
+		running:     map[string]context.CancelFunc{},
 	}
+	for _, opt := range opts {
+		opt(scanner)
+	}
+	return scanner
 }
 
 // Probe is the raw observation of one endpoint, before any judgement.
@@ -177,7 +227,16 @@ func (s *Scanner) Probe(ctx context.Context, target Target) *Probe {
 
 // ScanRequest is one run.
 type ScanRequest struct {
+	// Targets are the endpoints that will be connected to, after expansion.
 	Targets []Target
+	// Specs are the entries as they were typed — "10.0.0.0/24" rather than the
+	// 254 addresses it became.
+	//
+	// Recorded instead of the expansion, and not merely to save space: a scan
+	// is repeated by re-running what someone asked for, and searched for by the
+	// range they remember typing. Two hundred and fifty four addresses in a
+	// scan record answer neither question.
+	Specs []string
 	// TriggeredBy and ActorEmail attribute the run. Scanning is an outbound
 	// action against someone else's infrastructure, so it is attributable by
 	// construction rather than by whoever remembers to write an audit entry.
@@ -186,34 +245,136 @@ type ScanRequest struct {
 }
 
 // Scan probes every target, judges each result against the inventory, and
-// records the run.
+// records the run, returning once it has finished.
 //
 // The scan record is written before any probing starts. A run that crashes
 // halfway then leaves evidence that it was attempted, rather than looking like
 // a scan nobody ever ran — which on this dashboard reads as "nothing to find".
 func (s *Scanner) Scan(ctx context.Context, req ScanRequest) (*store.DiscoveryScan, []*store.DiscoveryResult, error) {
+	scan, err := s.record(ctx, req)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ctx, cancel := s.track(ctx, scan.ID)
+	defer cancel()
+
+	results := s.execute(ctx, scan, req.Targets)
+	return scan, results, nil
+}
+
+// Start begins a scan in the background and returns as soon as it is recorded.
+//
+// For anything wider than a handful of endpoints this is the only workable
+// shape: a /24 on three ports is over seven hundred handshakes, which no HTTP
+// client is going to wait for and no proxy would keep open if it did.
+//
+// The run deliberately does **not** inherit the caller's context. An HTTP
+// request's context is cancelled the moment its response is written, so a scan
+// started from one would be killed by its own 202.
+func (s *Scanner) Start(req ScanRequest) (*store.DiscoveryScan, error) {
+	scan, err := s.record(context.Background(), req)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := s.track(context.Background(), scan.ID)
+	go func() {
+		defer cancel()
+		s.execute(ctx, scan, req.Targets)
+	}()
+
+	return scan, nil
+}
+
+// Cancel stops a running scan. Reports whether there was one to stop.
+//
+// What has already been found is kept. A scan someone stopped after twenty
+// seconds still looked at whatever it reached, and throwing that away would
+// make cancelling something you avoid doing.
+func (s *Scanner) Cancel(id string) bool {
+	s.mu.Lock()
+	cancel, ok := s.running[id]
+	s.mu.Unlock()
+	if ok {
+		cancel()
+	}
+	return ok
+}
+
+// Running lists the scans in flight, for diagnostics and shutdown.
+func (s *Scanner) Running() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]string, 0, len(s.running))
+	for id := range s.running {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// Stop cancels every scan in flight. Called during shutdown so a long range
+// scan does not hold the grace period open.
+func (s *Scanner) Stop() {
+	for _, id := range s.Running() {
+		s.Cancel(id)
+	}
+}
+
+// record writes the scan row before any probing starts.
+func (s *Scanner) record(ctx context.Context, req ScanRequest) (*store.DiscoveryScan, error) {
 	if len(req.Targets) == 0 {
-		return nil, nil, fmt.Errorf("a scan needs at least one target")
+		return nil, fmt.Errorf("a scan needs at least one target")
 	}
 
 	started := s.now()
-	targets := make([]string, 0, len(req.Targets))
-	for _, t := range req.Targets {
-		targets = append(targets, t.String())
+	// Falls back to the expanded list only when no specs were given, which is
+	// the case for a caller building targets directly rather than from input.
+	specs := req.Specs
+	if len(specs) == 0 {
+		specs = make([]string, 0, len(req.Targets))
+		for _, t := range req.Targets {
+			specs = append(specs, t.String())
+		}
 	}
 
 	scan := &store.DiscoveryScan{
 		ScanType:    store.ScanTypeNetwork,
-		Targets:     targets,
+		Targets:     specs,
+		TargetCount: len(req.Targets),
 		Status:      store.ScanRunning,
 		StartedAt:   &started,
 		TriggeredBy: req.TriggeredBy,
 		ActorEmail:  req.ActorEmail,
 	}
 	if err := s.store.CreateDiscoveryScan(ctx, scan); err != nil {
-		return nil, nil, fmt.Errorf("recording the scan: %w", err)
+		return nil, fmt.Errorf("recording the scan: %w", err)
 	}
+	return scan, nil
+}
 
+func (s *Scanner) track(parent context.Context, id string) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+
+	s.mu.Lock()
+	s.running[id] = cancel
+	s.mu.Unlock()
+
+	return ctx, func() {
+		cancel()
+		s.mu.Lock()
+		delete(s.running, id)
+		s.mu.Unlock()
+	}
+}
+
+// execute runs the worker pool, storing results as they are found.
+//
+// Results are written in batches rather than all at the end. A scan of a range
+// takes minutes, and a run that was cancelled, crashed, or restarted through
+// would otherwise have nothing to show for the endpoints it did reach — which
+// is the worst possible outcome for the one it found something on.
+func (s *Scanner) execute(ctx context.Context, scan *store.DiscoveryScan, targets []Target) []*store.DiscoveryResult {
 	// Trust anchors are loaded once per run, not once per endpoint. A failure
 	// here is not fatal: without the managed CAs an internally-issued
 	// certificate reads as UNTRUSTED, which overstates the problem, and that is
@@ -224,9 +385,86 @@ func (s *Scanner) Scan(ctx context.Context, req ScanRequest) (*store.DiscoverySc
 			"error", err)
 	}
 
-	results := s.probeAll(ctx, req.Targets, anchors)
+	results := make([]*store.DiscoveryResult, len(targets))
+	completed := make(chan int, len(targets))
+	jobs := make(chan int)
 
-	for _, result := range results {
+	workers := s.concurrency
+	if workers > len(targets) {
+		workers = len(targets)
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				probe := s.Probe(ctx, targets[i])
+				// A probe cut short by cancellation learned nothing. Recording
+				// it would put a row saying "this endpoint did not answer"
+				// against a host that was never really asked — which is a
+				// finding about the estate, invented by stopping the scan.
+				if probe.Err != nil && errors.Is(probe.Err, context.Canceled) {
+					completed <- -1
+					continue
+				}
+				results[i] = s.judge(ctx, probe, anchors)
+				completed <- i
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for i := range targets {
+			select {
+			case jobs <- i:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(completed)
+	}()
+
+	stored := make([]*store.DiscoveryResult, 0, len(targets))
+	batch := make([]*store.DiscoveryResult, 0, s.batchSize)
+	lastFlush := s.now()
+
+	flush := func() {
+		lastFlush = s.now()
+		if len(batch) == 0 {
+			return
+		}
+		// Detached from the run's context on purpose: a cancelled scan must
+		// still persist what it already found, and writing with a cancelled
+		// context would discard exactly that.
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+
+		if err := s.store.CreateDiscoveryResults(writeCtx, batch); err != nil {
+			slog.Error("a batch of scan results could not be stored", "scan_id", scan.ID, "error", err)
+			scan.Error = err.Error()
+		} else {
+			stored = append(stored, batch...)
+		}
+		batch = batch[:0]
+
+		scan.ResultsCount = len(stored)
+		if err := s.store.UpdateDiscoveryScan(writeCtx, scan); err != nil {
+			slog.Warn("scan progress could not be recorded", "scan_id", scan.ID, "error", err)
+		}
+		s.publishProgress(scan, len(targets))
+	}
+
+	for i := range completed {
+		if i < 0 {
+			continue // a probe abandoned when the scan was cancelled
+		}
+		result := results[i]
 		result.ScanID = scan.ID
 		switch result.ManagementState {
 		case store.DiscoveryUnreachable:
@@ -236,49 +474,127 @@ func (s *Scanner) Scan(ctx context.Context, req ScanRequest) (*store.DiscoverySc
 		default:
 			scan.UnmanagedCount++
 		}
+
+		batch = append(batch, result)
+		// Flushed on a clock as well as a count. A range of unreachable
+		// addresses produces results slowly and in bursts, so waiting for a
+		// full batch leaves a scan reading "0 of 254" for a minute — which is
+		// indistinguishable from a scan that is stuck, and gets cancelled.
+		if len(batch) >= s.batchSize || s.now().Sub(lastFlush) >= flushInterval {
+			flush()
+		}
 	}
+	flush()
 
-	scan.ResultsCount = len(results)
-	completed := s.now()
-	scan.CompletedAt = &completed
-	scan.Status = store.ScanCompleted
-
-	if err := s.store.CreateDiscoveryResults(ctx, results); err != nil {
+	finished := s.now()
+	scan.CompletedAt = &finished
+	scan.ResultsCount = len(stored)
+	switch {
+	case scan.Error != "":
 		scan.Status = store.ScanFailed
-		scan.Error = err.Error()
-		_ = s.store.UpdateDiscoveryScan(ctx, scan)
-		return scan, nil, fmt.Errorf("storing scan results: %w", err)
+	case ctx.Err() != nil:
+		// Cancelled is not failed. A scan somebody stopped on purpose reached
+		// what it reached, and recording that as a failure would make the
+		// history lie about which runs went wrong.
+		scan.Status = store.ScanCancelled
+		if scan.Error == "" {
+			scan.Error = fmt.Sprintf("cancelled after %d of %d endpoints", len(stored), len(targets))
+		}
+	default:
+		scan.Status = store.ScanCompleted
 	}
-	if err := s.store.UpdateDiscoveryScan(ctx, scan); err != nil {
-		// The results are already stored, so this is a bookkeeping failure, not
-		// a lost scan. Reported, not fatal.
+
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if err := s.store.UpdateDiscoveryScan(writeCtx, scan); err != nil {
 		slog.Warn("scan results stored but the scan record could not be updated", "scan_id", scan.ID, "error", err)
 	}
+	s.publishFinished(scan)
 
-	return scan, results, nil
+	return stored
 }
 
-// probeAll runs the probes with bounded concurrency and returns results in the
-// order the targets were given, so a scan of a range reads in address order
-// rather than in whichever order the network answered.
-func (s *Scanner) probeAll(ctx context.Context, targets []Target, anchors *TrustAnchors) []*store.DiscoveryResult {
-	results := make([]*store.DiscoveryResult, len(targets))
-	sem := make(chan struct{}, s.concurrency)
-	var wg sync.WaitGroup
-
-	for i, target := range targets {
-		wg.Add(1)
-		go func(i int, target Target) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			probe := s.Probe(ctx, target)
-			results[i] = s.judge(ctx, probe, anchors)
-		}(i, target)
+// publishProgress puts the running total on the event stream.
+//
+// Stream-only: progress is state, not news. A channel configured at INFO would
+// otherwise receive a message every few seconds for the length of a range scan,
+// which is how a team learns to mute the channel that also carries CA expiry.
+func (s *Scanner) publishProgress(scan *store.DiscoveryScan, total int) {
+	if s.broker == nil {
+		return
 	}
-	wg.Wait()
-	return results
+	s.broker.Publish(events.Event{
+		Topic:    events.TopicDiscoveryProgress,
+		Severity: events.SeverityInfo,
+		EntityID: scan.ID,
+		Payload: map[string]any{
+			"scan_id":         scan.ID,
+			"status":          scan.Status,
+			"scanned_count":   scan.ResultsCount,
+			"target_count":    total,
+			"unmanaged_count": scan.UnmanagedCount,
+			"managed_count":   scan.ManagedCount,
+		},
+	})
+}
+
+func (s *Scanner) publishFinished(scan *store.DiscoveryScan) {
+	if s.broker == nil {
+		return
+	}
+	s.broker.Publish(events.Event{
+		Topic:    events.TopicDiscoveryProgress,
+		Severity: events.SeverityInfo,
+		EntityID: scan.ID,
+		Payload: map[string]any{
+			"scan_id":         scan.ID,
+			"status":          scan.Status,
+			"scanned_count":   scan.ResultsCount,
+			"target_count":    scan.ResultsCount,
+			"unmanaged_count": scan.UnmanagedCount,
+			"managed_count":   scan.ManagedCount,
+			"finished":        true,
+		},
+	})
+
+	// The finding, separate from the progress. Published by the scanner rather
+	// than the handler so a background run alerts on what it found without
+	// anyone still being on the request that started it.
+	if scan.UnmanagedCount == 0 {
+		return
+	}
+	s.broker.Publish(events.Event{
+		Topic:    events.TopicDiscoveryUnmanaged,
+		Severity: events.SeverityWarning,
+		EntityID: scan.ID,
+		Payload: map[string]any{
+			"scan_id":         scan.ID,
+			"unmanaged_count": scan.UnmanagedCount,
+			"scanned_count":   scan.ResultsCount,
+			"hosts":           s.unmanagedHosts(scan.ID),
+		},
+	})
+}
+
+// unmanagedHosts names what the run found, capped, so an alert is actionable
+// without carrying a thousand hostnames into Slack.
+func (s *Scanner) unmanagedHosts(scanID string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	results, _, err := s.store.ListDiscoveryResults(ctx, store.DiscoveryResultFilter{
+		ScanID:          scanID,
+		ManagementState: store.DiscoveryUnmanaged,
+		Limit:           10,
+	})
+	if err != nil {
+		return nil
+	}
+	hosts := make([]string, 0, len(results))
+	for _, r := range results {
+		hosts = append(hosts, fmt.Sprintf("%s:%d", r.Host, r.Port))
+	}
+	return hosts
 }
 
 // judge turns a probe into a result: the verdicts, the findings, and the

@@ -387,11 +387,12 @@ omit it to derive from the host part of `gateway_addr`.
 ## Discovery
 
 ```
-POST /api/v1/discovery/scan        Scan endpoints and judge what they serve  (operator)
-POST /api/v1/discovery/import      Adopt a finding into inventory            (operator)
-GET  /api/v1/discovery/scans       Scan history
-GET  /api/v1/discovery/scans/:id   One run and its results
-GET  /api/v1/discovery/results     Findings across every scan
+POST /api/v1/discovery/scan              Scan endpoints and judge what they serve  (operator)
+POST /api/v1/discovery/import            Adopt a finding into inventory            (operator)
+POST /api/v1/discovery/scans/:id/cancel  Stop a running scan                       (operator)
+GET  /api/v1/discovery/scans             Scan history
+GET  /api/v1/discovery/scans/:id         One run and its results
+GET  /api/v1/discovery/results           Findings across every scan
 ```
 
 Scanning is operator-gated because it opens connections to third-party
@@ -401,12 +402,66 @@ answerable afterwards. One request is capped at 256 targets.
 
 ```json
 POST /api/v1/discovery/scan
-{ "targets": ["example.com", "10.0.0.5:8443"], "port": 443 }
+{ "targets": ["example.com", "10.0.0.0/24", "10.0.0.4-40:8443"], "ports": [443, 8443] }
 ```
 
-Every target is parsed before any is scanned: a malformed one fails the whole
-request rather than leaving you unsure which part of your list was reached.
-`host: "…"` is accepted as the single-target form.
+Each entry may be a host, `host:port`, a CIDR network, or an inclusive address
+range — `10.0.0.4-10.0.0.40` or the abbreviated `10.0.0.4-40`. A network or
+range may name its own port. `ports` applies to everything that does not, and
+multiplies the endpoint count. `host: "…"` is accepted as the single-target form.
+
+Everything is expanded and checked before anything is connected to: a malformed
+entry fails the whole request rather than leaving you unsure which part of your
+list was reached. Network and broadcast addresses are skipped for IPv4 prefixes
+wider than /31, so `10.0.0.0/24` is 254 endpoints and not 256.
+
+Two limits apply. A request carries at most **256 entries**, and those may
+expand to at most **4096 endpoints**. The second is the one that matters: a
+misplaced digit turns `10.0.0.0/24` into `10.0.0.0/8`, and the refusal names the
+size so the typo is visible rather than merely denied.
+
+```
+10.0.0.0/8 covers 16777216 addresses, past the 4096-endpoint limit for one
+scan; narrow it
+```
+
+### Small scans wait, wide scans do not
+
+At **32 endpoints or fewer** the scan runs while you wait and returns `200` with
+its results. Above that it goes to the background and returns `202` with a poll
+URL. The response says which happened without you having to read the status
+code — `scan.status` is `COMPLETED` or `RUNNING`:
+
+```json
+{
+  "scan": { "id": "…", "status": "RUNNING", "target_count": 254, "results_count": 0 },
+  "poll": "/api/v1/discovery/scans/<id>",
+  "summary": "Scanning 254 endpoints in the background. Results appear as they are found."
+}
+```
+
+Results are written as they are found, not at the end, so polling shows real
+progress and a run that is interrupted keeps what it reached. Progress is also
+published to the event stream as `discovery.progress` — **stream only**: it is
+never delivered to a notification channel, because a range scan would otherwise
+put a message in Slack every few seconds for minutes, and a team that mutes that
+channel has also muted CA expiry.
+
+```
+POST /api/v1/discovery/scans/:id/cancel
+```
+
+Cancelling keeps everything already found and records the run as `CANCELLED`,
+not `FAILED` — the history has to distinguish "somebody stopped it" from
+"something went wrong". Endpoints abandoned mid-probe are **not** recorded as
+unreachable: they were never really asked, and a row saying otherwise would be a
+finding about the estate invented by stopping the scan. Cancelling a run that
+has already finished is not an error; the response names its actual status.
+
+The scan record keeps the targets **as they were typed** — `10.0.0.0/24`, not
+254 addresses — with `target_count` carrying how far that expanded. A scan is
+repeated by re-running what was asked for and found again by the range someone
+remembers typing.
 
 The response carries the run, the results, and a sentence:
 

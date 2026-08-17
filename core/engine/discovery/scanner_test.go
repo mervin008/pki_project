@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -581,4 +582,231 @@ func startTLSServer(t *testing.T, leaf *testLeaf) testServer {
 
 	addr := srv.Listener.Addr().(*net.TCPAddr)
 	return testServer{target: Target{Host: "127.0.0.1", Port: addr.Port}}
+}
+
+// TestBackgroundScanKeepsWhatItFoundWhenCancelled.
+//
+// The load-bearing property of cancellation. A cancel that discarded results is
+// a cancel nobody uses, and then a range scan somebody started by mistake runs
+// to completion against a network they did not mean to touch.
+func TestBackgroundScanKeepsWhatItFoundWhenCancelled(t *testing.T) {
+	ca := newTestCA(t, "Test CA")
+	reachable := startTLSServer(t, ca.issue(t, "localhost", time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour)))
+	stalled := startStalledServer(t)
+
+	// Two endpoints that answer, then a queue of endpoints that never will.
+	targets := []Target{reachable.target, reachable.target}
+	for i := 0; i < 20; i++ {
+		targets = append(targets, stalled)
+	}
+
+	st := newEmptyStore()
+	scanner := NewScanner(st, WithConcurrency(2), WithDialTimeout(30*time.Second))
+	scanner.batchSize = 1 // so progress is observable rather than buffered
+
+	scan, err := scanner.Start(ScanRequest{Targets: targets})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if scan.Status != store.ScanRunning {
+		t.Fatalf("status = %q immediately after Start, want RUNNING", scan.Status)
+	}
+
+	// Wait for the two reachable endpoints to land.
+	waitFor(t, 10*time.Second, func() bool {
+		stored, _ := st.GetDiscoveryScan(context.Background(), scan.ID)
+		return stored.ResultsCount >= 2
+	}, "the reachable endpoints to be stored")
+
+	if !scanner.Cancel(scan.ID) {
+		t.Fatal("Cancel reported no scan running")
+	}
+
+	waitFor(t, 10*time.Second, func() bool {
+		stored, _ := st.GetDiscoveryScan(context.Background(), scan.ID)
+		return stored.Status != store.ScanRunning
+	}, "the scan to stop")
+
+	stored, err := st.GetDiscoveryScan(context.Background(), scan.ID)
+	if err != nil {
+		t.Fatalf("GetDiscoveryScan: %v", err)
+	}
+	// Cancelled, not failed: the history has to distinguish "somebody stopped
+	// it" from "something went wrong", or every deliberate stop reads as a bug.
+	if stored.Status != store.ScanCancelled {
+		t.Errorf("status = %q, want CANCELLED", stored.Status)
+	}
+	if stored.ResultsCount < 2 {
+		t.Errorf("results kept = %d, want at least the 2 that completed", stored.ResultsCount)
+	}
+	if stored.ResultsCount >= len(targets) {
+		t.Errorf("results = %d of %d targets; the scan did not actually stop early", stored.ResultsCount, len(targets))
+	}
+	if stored.CompletedAt == nil {
+		t.Error("a cancelled scan must still record when it stopped")
+	}
+
+	results, _, err := st.ListDiscoveryResults(context.Background(), store.DiscoveryResultFilter{ScanID: scan.ID})
+	if err != nil {
+		t.Fatalf("ListDiscoveryResults: %v", err)
+	}
+	if len(results) != stored.ResultsCount {
+		t.Errorf("%d results stored but the scan says %d", len(results), stored.ResultsCount)
+	}
+	// A probe cut short learned nothing. Recording it as unreachable would
+	// invent a finding about the estate by stopping the scan.
+	for _, r := range results {
+		if !r.Reachable {
+			t.Errorf("a cancelled probe was recorded as an unreachable endpoint: %s — %s", r.Host, r.Error)
+		}
+	}
+}
+
+// Cancelling something that has already finished is not an error — the usual
+// reason is that it completed a moment ago.
+func TestCancelIsHarmlessWhenNothingIsRunning(t *testing.T) {
+	scanner := NewScanner(newEmptyStore())
+	if scanner.Cancel("no-such-scan") {
+		t.Error("Cancel claimed to have stopped a scan that was never running")
+	}
+	scanner.Stop() // must not panic with nothing in flight
+}
+
+// Results are written as they are found, not all at the end. A run that was
+// cancelled, crashed, or restarted through would otherwise have nothing to show
+// for the endpoints it did reach.
+//
+// Asserted on the writes themselves rather than by racing a reader against the
+// scan: a timing-based version of this test passes on a slow machine and says
+// nothing on a fast one.
+func TestResultsAreStoredInBatchesWhileTheScanRuns(t *testing.T) {
+	ca := newTestCA(t, "Test CA")
+	leaf := ca.issue(t, "localhost", time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour))
+
+	targets := []Target{}
+	for i := 0; i < 6; i++ {
+		targets = append(targets, startTLSServer(t, leaf).target)
+	}
+
+	recorder := &batchRecorder{Store: newEmptyStore()}
+	scanner := NewScanner(recorder, WithConcurrency(2))
+	scanner.batchSize = 2
+
+	scan, _, err := scanner.Scan(context.Background(), ScanRequest{Targets: targets})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	batches := recorder.sizes()
+	if len(batches) < 3 {
+		t.Errorf("results were written in %d batches %v; six endpoints at a batch size of two should be three writes",
+			len(batches), batches)
+	}
+	total := 0
+	for _, n := range batches {
+		total += n
+		if n > 2 {
+			t.Errorf("a batch of %d exceeded the batch size of 2", n)
+		}
+	}
+	if total != len(targets) {
+		t.Errorf("%d results written in total, want %d", total, len(targets))
+	}
+
+	stored, _ := recorder.GetDiscoveryScan(context.Background(), scan.ID)
+	if stored.ResultsCount != len(targets) {
+		t.Errorf("results = %d, want %d", stored.ResultsCount, len(targets))
+	}
+}
+
+// batchRecorder notes the size of every write the scanner makes.
+type batchRecorder struct {
+	store.Store
+	mu      sync.Mutex
+	batches []int
+}
+
+func (b *batchRecorder) CreateDiscoveryResults(ctx context.Context, results []*store.DiscoveryResult) error {
+	b.mu.Lock()
+	b.batches = append(b.batches, len(results))
+	b.mu.Unlock()
+	return b.Store.CreateDiscoveryResults(ctx, results)
+}
+
+func (b *batchRecorder) sizes() []int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]int{}, b.batches...)
+}
+
+// The scan must outlive the request that started it. An HTTP request's context
+// is cancelled the moment its response is written, so a background scan started
+// from one would be killed by its own 202.
+func TestBackgroundScanSurvivesTheCallersContext(t *testing.T) {
+	ca := newTestCA(t, "Test CA")
+	srv := startTLSServer(t, ca.issue(t, "localhost", time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour)))
+
+	st := newEmptyStore()
+	scanner := NewScanner(st, WithConcurrency(2))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	scan, err := scanner.Start(ScanRequest{Targets: []Target{srv.target, srv.target}})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	cancel() // the caller goes away immediately
+	_ = ctx
+
+	waitFor(t, 10*time.Second, func() bool {
+		stored, _ := st.GetDiscoveryScan(context.Background(), scan.ID)
+		return stored.Status == store.ScanCompleted
+	}, "the scan to complete despite the caller having gone")
+
+	stored, _ := st.GetDiscoveryScan(context.Background(), scan.ID)
+	if stored.ResultsCount != 2 {
+		t.Errorf("results = %d, want 2", stored.ResultsCount)
+	}
+}
+
+// startStalledServer accepts TCP connections and never speaks, so a probe
+// against it hangs until it is cancelled or times out.
+func startStalledServer(t *testing.T) Target {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		var held []net.Conn
+		defer func() {
+			for _, c := range held {
+				_ = c.Close()
+			}
+		}()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, conn)
+		}
+	}()
+
+	addr := ln.Addr().(*net.TCPAddr)
+	return Target{Host: "127.0.0.1", Port: addr.Port}
+}
+
+func waitFor(t *testing.T, limit time.Duration, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s", limit, what)
 }

@@ -293,6 +293,10 @@ export interface DiscoveryScanResponse {
   /** A sentence, because the counts alone cannot distinguish "nothing
    *  answered" from "everything is managed". */
   summary: string
+  /** How many endpoints the targets expanded to. A /24 is 254. */
+  target_count?: number
+  /** Present on a 202: the run is in the background, poll this. */
+  poll?: string
 }
 
 /** core/store/models.go — Policy */

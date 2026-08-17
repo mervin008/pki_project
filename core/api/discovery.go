@@ -8,14 +8,13 @@ import (
 	"time"
 
 	"github.com/certpilot/certpilot/core/engine/discovery"
-	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/server/middleware"
 	"github.com/certpilot/certpilot/core/store"
 	"github.com/certpilot/certpilot/pkg/x509util"
 	"github.com/gin-gonic/gin"
 )
 
-// maxTargetsPerScan bounds one request.
+// maxTargetsPerScan bounds the entries in one request, before expansion.
 //
 // A scan is an outbound connection to somebody's infrastructure, made on behalf
 // of whoever called this endpoint. Without a cap, a single request with a
@@ -24,36 +23,56 @@ import (
 // what is being scanned rather than an obstacle to a legitimate run.
 const maxTargetsPerScan = 256
 
+// syncScanLimit is how many endpoints are scanned while the caller waits.
+//
+// Above it the run goes to the background and the response is a 202 with the
+// scan id. The threshold is set by what a person will sit through, not by what
+// the server can manage: a handful of endpoints comes back in a second or two,
+// and a /24 is seven hundred handshakes that no HTTP client will wait for and
+// no proxy would hold open if it did.
+const syncScanLimit = 32
+
 // DiscoveryHandler handles network TLS scanning and certificate discovery.
+//
+// It does not publish anything itself. The findings are published by the
+// scanner, because a background run has to alert on what it found long after
+// the request that started it has been answered.
 type DiscoveryHandler struct {
 	store   store.Store
 	scanner *discovery.Scanner
-	broker  *events.Broker
 }
 
 // NewDiscoveryHandler creates a new DiscoveryHandler.
-func NewDiscoveryHandler(s store.Store, sc *discovery.Scanner, broker *events.Broker) *DiscoveryHandler {
-	return &DiscoveryHandler{store: s, scanner: sc, broker: broker}
+func NewDiscoveryHandler(s store.Store, sc *discovery.Scanner) *DiscoveryHandler {
+	return &DiscoveryHandler{store: s, scanner: sc}
 }
 
 // ScanEndpointInput defines the payload to scan one or more endpoints.
 type ScanEndpointInput struct {
-	// Targets accepts "host", "host:port", or "[v6]:port".
+	// Targets accepts hosts, host:port, CIDR networks, and address ranges —
+	// see discovery.ExpandTargets.
 	Targets []string `json:"targets"`
 	// Host is the single-target form, kept because it is what the existing
 	// dashboard sends.
 	Host string `json:"host"`
 	// Port applies to any target that does not name its own.
 	Port int `json:"port"`
+	// Ports scans every target on more than one port. Multiplies the endpoint
+	// count, which is why the expansion limit is enforced after it is applied.
+	Ports []int `json:"ports"`
 }
 
 // Scan handles POST /api/v1/discovery/scan.
 //
-// Synchronous: the caller waits for the result. That holds while a scan is a
-// list of endpoints someone typed. It stops holding for a CIDR range, which is
-// why the scan record exists as a first-class row rather than as a wrapper
-// around the response — the same run becomes a background job without the
-// stored shape changing.
+// Small scans finish while the caller waits and return 200 with the results.
+// Anything wider goes to the background and returns 202 with the scan id, and
+// the response says which happened — `scan.status` is COMPLETED or RUNNING, so
+// a client does not have to infer it from the status code.
+//
+// Two behaviours from one endpoint is a deliberate trade. The alternative is
+// either making someone hold a connection open for seven hundred handshakes, or
+// making every three-host scan a poll — and the second would push people toward
+// not scanning at all.
 func (h *DiscoveryHandler) Scan(c *gin.Context) {
 	var input ScanEndpointInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -73,32 +92,54 @@ func (h *DiscoveryHandler) Scan(c *gin.Context) {
 	}
 	if len(raw) > maxTargetsPerScan {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("a single scan is limited to %d targets; %d were given", maxTargetsPerScan, len(raw)),
+			"error": fmt.Sprintf("a single scan is limited to %d entries; %d were given", maxTargetsPerScan, len(raw)),
 		})
 		return
 	}
 
-	// Every target is parsed before any is scanned. A run that scanned nine
-	// hosts and then rejected the tenth would leave the operator unable to say
-	// which part of their list was actually looked at.
-	targets := make([]discovery.Target, 0, len(raw))
-	for _, r := range raw {
-		target, err := discovery.ParseTarget(r, input.Port)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		targets = append(targets, target)
+	ports := input.Ports
+	if len(ports) == 0 && input.Port > 0 {
+		ports = []int{input.Port}
+	}
+
+	// Everything is expanded and checked before anything is connected to. A run
+	// that scanned nine hosts and then rejected the tenth would leave the
+	// operator unable to say which part of their list was actually looked at —
+	// and expansion is where a typo turns a /24 into a /8.
+	targets, err := discovery.ExpandTargets(raw, ports, discovery.DefaultExpansionLimit)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 
 	actorID := c.GetString(middleware.ContextUserID)
 	actorEmail := c.GetString(middleware.ContextUserEmail)
-	req := discovery.ScanRequest{Targets: targets}
+	req := discovery.ScanRequest{Targets: targets, Specs: raw}
 	if actorID != "" {
 		req.TriggeredBy = &actorID
 	}
 	if actorEmail != "" {
 		req.ActorEmail = &actorEmail
+	}
+
+	if len(targets) > syncScanLimit {
+		scan, err := h.scanner.Start(req)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		h.auditScan(c, scan, len(targets))
+
+		c.JSON(http.StatusAccepted, gin.H{
+			"scan":  scan,
+			"data":  []*store.DiscoveryResult{},
+			"total": 0,
+			"summary": fmt.Sprintf(
+				"Scanning %d endpoints in the background. Results appear as they are found.", len(targets)),
+			"poll":         "/api/v1/discovery/scans/" + scan.ID,
+			"target_count": len(targets),
+		})
+		return
 	}
 
 	scan, results, err := h.scanner.Scan(c.Request.Context(), req)
@@ -107,14 +148,55 @@ func (h *DiscoveryHandler) Scan(c *gin.Context) {
 		return
 	}
 
-	h.auditScan(c, scan)
-	h.announce(scan, results)
+	h.auditScan(c, scan, len(targets))
 
 	c.JSON(http.StatusOK, gin.H{
-		"scan":    scan,
-		"data":    results,
-		"total":   len(results),
-		"summary": summarize(scan),
+		"scan":         scan,
+		"data":         results,
+		"total":        len(results),
+		"summary":      summarize(scan),
+		"target_count": len(targets),
+	})
+}
+
+// CancelScan handles POST /api/v1/discovery/scans/:id/cancel.
+//
+// Everything found so far is kept. A cancel that discarded results would be a
+// cancel nobody uses, and a range scan somebody started by mistake would then
+// run to completion against a network they did not mean to touch.
+func (h *DiscoveryHandler) CancelScan(c *gin.Context) {
+	id := c.Param("id")
+
+	scan, err := h.store.GetDiscoveryScan(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !h.scanner.Cancel(id) {
+		// Not an error: the usual reason is that it finished a moment ago.
+		c.JSON(http.StatusOK, gin.H{
+			"scan":    scan,
+			"message": fmt.Sprintf("That scan is not running here — its status is %s.", scan.Status),
+		})
+		return
+	}
+
+	actorID := c.GetString(middleware.ContextUserID)
+	actorEmail := c.GetString(middleware.ContextUserEmail)
+	ip := c.ClientIP()
+	_ = h.store.CreateAuditLog(c.Request.Context(), &store.AuditLog{
+		Action:     "discovery.cancelled",
+		EntityType: "discovery_scan",
+		EntityID:   &id,
+		ActorID:    &actorID,
+		ActorEmail: &actorEmail,
+		IPAddress:  &ip,
+		Details:    fmt.Sprintf(`{"scanned_when_cancelled":%d,"targets":%s}`, scan.ResultsCount, jsonStringArray(scan.Targets)),
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Cancelled. Everything the scan had already found is kept.",
 	})
 }
 
@@ -123,6 +205,15 @@ func (h *DiscoveryHandler) Scan(c *gin.Context) {
 // zero reachable endpoints look identical on a tile and mean opposite things.
 func summarize(scan *store.DiscoveryScan) string {
 	switch {
+	case scan.Status == store.ScanRunning:
+		return fmt.Sprintf("Still running: %d of %d endpoints looked at, %d serving certificates CertPilot does not manage.",
+			scan.ResultsCount, scan.TargetCount, scan.UnmanagedCount)
+	case scan.Status == store.ScanCancelled:
+		// Names what was *not* reached as well as what was. A cancelled scan
+		// that only reported its findings would read as a clean result for a
+		// range most of which was never asked.
+		return fmt.Sprintf("Stopped after %d of %d endpoints. %d were serving certificates CertPilot does not manage; the remaining %d were never looked at.",
+			scan.ResultsCount, scan.TargetCount, scan.UnmanagedCount, scan.TargetCount-scan.ResultsCount)
 	case scan.ResultsCount == 0:
 		return "Nothing was scanned."
 	case scan.UnreachableCount == scan.ResultsCount:
@@ -134,37 +225,6 @@ func summarize(scan *store.DiscoveryScan) string {
 		return fmt.Sprintf("%d certificate(s) are being served that CertPilot does not manage. Nothing renews them.",
 			scan.UnmanagedCount)
 	}
-}
-
-// announce puts unmanaged findings on the event stream, so they reach the
-// channels a team already configured instead of waiting to be noticed on a
-// screen nobody has open.
-func (h *DiscoveryHandler) announce(scan *store.DiscoveryScan, results []*store.DiscoveryResult) {
-	if h.broker == nil || scan.UnmanagedCount == 0 {
-		return
-	}
-
-	hosts := make([]string, 0, scan.UnmanagedCount)
-	for _, r := range results {
-		if r.ManagementState == store.DiscoveryUnmanaged {
-			hosts = append(hosts, fmt.Sprintf("%s:%d", r.Host, r.Port))
-		}
-		if len(hosts) == 10 {
-			break
-		}
-	}
-
-	h.broker.Publish(events.Event{
-		Topic:    events.TopicDiscoveryUnmanaged,
-		Severity: events.SeverityWarning,
-		EntityID: scan.ID,
-		Payload: map[string]any{
-			"scan_id":         scan.ID,
-			"unmanaged_count": scan.UnmanagedCount,
-			"scanned_count":   scan.ResultsCount,
-			"hosts":           hosts,
-		},
-	})
 }
 
 // ListScans handles GET /api/v1/discovery/scans.
@@ -200,10 +260,11 @@ func (h *DiscoveryHandler) GetScan(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"scan":    scan,
-		"data":    results,
-		"total":   total,
-		"summary": summarize(scan),
+		"scan":         scan,
+		"data":         results,
+		"total":        total,
+		"summary":      summarize(scan),
+		"target_count": scan.TargetCount,
 	})
 }
 
@@ -397,7 +458,7 @@ func importSource(result *store.DiscoveryResult) string {
 	return fmt.Sprintf("%s:%d", result.Host, result.Port)
 }
 
-func (h *DiscoveryHandler) auditScan(c *gin.Context, scan *store.DiscoveryScan) {
+func (h *DiscoveryHandler) auditScan(c *gin.Context, scan *store.DiscoveryScan, endpoints int) {
 	actorID := c.GetString(middleware.ContextUserID)
 	actorEmail := c.GetString(middleware.ContextUserEmail)
 	ip := c.ClientIP()
@@ -413,8 +474,12 @@ func (h *DiscoveryHandler) auditScan(c *gin.Context, scan *store.DiscoveryScan) 
 		// The targets are the point of this entry. Scanning is an outbound act
 		// against third-party infrastructure, and "who asked us to connect to
 		// that" has to be answerable afterwards.
-		Details: fmt.Sprintf(`{"targets":%s,"results":%d,"unmanaged":%d,"unreachable":%d}`,
-			jsonStringArray(scan.Targets), scan.ResultsCount, scan.UnmanagedCount, scan.UnreachableCount),
+		// The targets are recorded as they were given, not as they expanded:
+		// "10.0.0.0/24" is what someone typed and what they will search for,
+		// and 254 addresses in an audit entry is unreadable. The endpoint count
+		// says how far that expanded.
+		Details: fmt.Sprintf(`{"targets":%s,"endpoints":%d,"results":%d,"unmanaged":%d,"unreachable":%d}`,
+			jsonStringArray(scan.Targets), endpoints, scan.ResultsCount, scan.UnmanagedCount, scan.UnreachableCount),
 	})
 }
 

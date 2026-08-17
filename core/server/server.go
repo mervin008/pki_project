@@ -33,6 +33,7 @@ type Server struct {
 	dispatcher   *notifications.Dispatcher
 	broker       *events.Broker
 	renewalSched *renewal.Scheduler
+	scanner      *discovery.Scanner
 	cfg          *config.CoreConfig
 }
 
@@ -109,7 +110,9 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	renewalExec := renewal.NewExecutor(st, pm, keyring, broker)
 	renewalSched := renewal.NewScheduler(st, renewalExec, cfg.Renewal.DefaultLeadDays)
 	policyEng := policy.NewEngine(st)
-	scanner := discovery.NewScanner(st)
+	// The scanner publishes progress so a range scan is visible while it runs,
+	// not only once it is over.
+	scanner := discovery.NewScanner(st, discovery.WithBroker(broker))
 
 	// The dispatcher is an ordinary broker subscriber. That is the point: it
 	// makes outbound HTTP and SMTP calls, and a wedged destination can only cost
@@ -162,6 +165,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		dispatcher:   dispatcher,
 		broker:       broker,
 		renewalSched: renewalSched,
+		scanner:      scanner,
 		cfg:          cfg,
 	}, nil
 }
@@ -226,6 +230,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("shutting down CertPilot Core")
 	s.renewalSched.Stop()
 	s.caMonitor.Stop()
+	// A range scan can run for minutes. Left alone it would hold the grace
+	// period open and then be killed mid-write anyway; cancelled, it records
+	// what it found and stops.
+	s.scanner.Stop()
 	// After the producers and before the broker: it must stop being fed before
 	// it stops draining, and it writes audit records so it has to finish while
 	// the store is still open.

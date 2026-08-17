@@ -103,7 +103,7 @@ explicitly.
 | Kiosk display tokens | ✅ | Read-only, viewer-scoped, expiring, revocable credentials for a wall display |
 | CA hierarchy tree | ⚠️ | Position and lineage are shown per CA and a malformed hierarchy is flagged; the tree is not drawn as a tree |
 | Policy engine | ⚠️ | `key_size`, `max_lifetime`, `ca_restriction`; other rule types are not implemented |
-| Discovery | ⚠️ | Scans a list of endpoints, records the full handshake, and says which certificates nobody manages. No CIDR ranges, scheduled scans, CT logs, or cloud inventory yet |
+| Discovery | ⚠️ | Scans hosts, CIDR networks, and address ranges; records the full handshake and says which certificates nobody manages. Wide scans run in the background and can be stopped. No scheduled scans, CT logs, or cloud inventory yet |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ❌ | Not started |
 | Host agent | ❌ | Not started |
@@ -269,7 +269,7 @@ surfaces immediately rather than during a renewal at 3am.
 
 ```bash
 curl -X POST localhost:8080/api/v1/discovery/scan -H 'Content-Type: application/json' \
-  -d '{"targets": ["example.com", "10.0.0.5:8443", "internal-api.corp"]}'
+  -d '{"targets": ["example.com", "10.0.0.0/24", "internal-api.corp:8443"]}'
 ```
 
 ```
@@ -300,6 +300,20 @@ incomplete-chain.example.com:443   UNMANAGED  PUBLIC
 An unreachable endpoint is a row, not an absence — a scan that reached nothing
 and a scan that found nothing produce the same empty list, and only one of them
 means the estate is clean.
+
+A `/24` is 254 endpoints and takes minutes, so anything past a handful runs in
+the background and returns a scan id to poll. Results are stored as they are
+found, progress goes to the live event stream, and the run can be stopped:
+
+```bash
+curl -X POST localhost:8080/api/v1/discovery/scans/<id>/cancel
+```
+
+Cancelling keeps everything already found and records the run as `CANCELLED`
+rather than `FAILED` — a scan somebody stopped on purpose is not a scan that
+went wrong, and a history that cannot tell the two apart is one nobody reads.
+Expansion is capped at 4096 endpoints, because a misplaced digit turns
+`10.0.0.0/24` into sixteen million outbound connections carrying your address.
 
 The full handshake is recorded on every result: TLS version, cipher suite, ALPN,
 and the negotiated key exchange group. Not because any of it is a defect today,

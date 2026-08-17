@@ -35,14 +35,41 @@ const (
 	// Published so it reaches the channels a team already configured, rather
 	// than waiting to be noticed on a results page nobody has open.
 	TopicDiscoveryUnmanaged = "discovery.unmanaged"
+	// TopicDiscoveryProgress reports how far a running scan has got. Stream
+	// only — see IsNotifiable.
+	TopicDiscoveryProgress = "discovery.progress"
 )
 
-// AllTopics lists every topic a producer publishes.
+// streamOnlyTopics are published for dashboards and never delivered as alerts.
+//
+// The distinction is between news and state. A scan crossing its four hundredth
+// endpoint is state: worth watching while it runs, worthless in an inbox. A
+// channel left at INFO would receive one of these every few seconds for the
+// length of a range scan, and a team that mutes that channel has also muted the
+// CA expiry alerts that share it.
+//
+// Deliberately decided here rather than by every producer, and deliberately not
+// by severity: an INFO event can still be news — a certificate was issued — and
+// suppressing all of them would be a different, worse rule.
+var streamOnlyTopics = map[string]bool{
+	TopicDiscoveryProgress: true,
+}
+
+// IsNotifiable reports whether an event of this topic may be delivered to a
+// notification channel.
+func IsNotifiable(topic string) bool {
+	return !streamOnlyTopics[topic]
+}
+
+// AllTopics lists every topic that can be delivered to a notification channel.
 //
 // Exists so the notification API can validate a channel's topic filter against
 // something real. A typo'd topic would otherwise be accepted and produce a
 // channel that matches nothing: configured on the dashboard, silent in practice,
 // which is the failure alerting exists to prevent rather than introduce.
+//
+// Stream-only topics are absent by construction: offering a topic that can be
+// selected and will never arrive is the same failure in a different disguise.
 //
 // Returns a copy — a caller sorting or appending to the package's own slice
 // would change what every later caller sees.

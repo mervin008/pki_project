@@ -215,6 +215,14 @@ func (d *Dispatcher) run() {
 // the loop returns to draining the subscription. A dispatcher blocked on SMTP is
 // a dispatcher losing events it has not looked at yet.
 func (d *Dispatcher) handle(evt events.Event) {
+	// Some topics exist for a dashboard and nowhere else. Scan progress is the
+	// first: a channel left at INFO would take one message every few seconds
+	// for the length of a range scan, and a team that mutes that channel has
+	// also muted the CA expiry alerts sharing it.
+	if !events.IsNotifiable(evt.Topic) {
+		return
+	}
+
 	channels, err := d.channels(context.Background())
 	if err != nil {
 		d.recordError(fmt.Errorf("could not load notification channels: %w", err))
