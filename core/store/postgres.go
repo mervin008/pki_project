@@ -1228,3 +1228,292 @@ func (s *PostgresStore) RevokeAcknowledgement(ctx context.Context, id string, re
 	}
 	return nil
 }
+
+// ── Discovery ───────────────────────────────────────────
+
+const discoveryScanColumns = `id, scan_type, coalesce(targets, '[]'::jsonb), status,
+		coalesce(results_count, 0), coalesce(unmanaged_count, 0), coalesce(managed_count, 0),
+		coalesce(unreachable_count, 0), started_at, completed_at, coalesce(error, ''),
+		triggered_by, actor_email, created_at`
+
+func scanDiscoveryScan(row pgx.Row) (*DiscoveryScan, error) {
+	scan := &DiscoveryScan{}
+	var targetsJSON []byte
+	err := row.Scan(
+		&scan.ID, &scan.ScanType, &targetsJSON, &scan.Status,
+		&scan.ResultsCount, &scan.UnmanagedCount, &scan.ManagedCount,
+		&scan.UnreachableCount, &scan.StartedAt, &scan.CompletedAt, &scan.Error,
+		&scan.TriggeredBy, &scan.ActorEmail, &scan.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(targetsJSON) > 0 {
+		_ = json.Unmarshal(targetsJSON, &scan.Targets)
+	}
+	// Never nil: a nil slice serializes as `null`, and a dashboard calling
+	// .map() on that crashes rather than rendering an empty run.
+	if scan.Targets == nil {
+		scan.Targets = []string{}
+	}
+	return scan, nil
+}
+
+func (s *PostgresStore) CreateDiscoveryScan(ctx context.Context, scan *DiscoveryScan) error {
+	targetsJSON, err := json.Marshal(scan.Targets)
+	if err != nil {
+		return err
+	}
+	if scan.Status == "" {
+		scan.Status = ScanPending
+	}
+	return s.pool.QueryRow(ctx, `
+		INSERT INTO public.discovery_scans
+			(scan_type, targets, status, started_at, triggered_by, actor_email)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, created_at`,
+		scan.ScanType, targetsJSON, scan.Status, scan.StartedAt, scan.TriggeredBy, scan.ActorEmail).
+		Scan(&scan.ID, &scan.CreatedAt)
+}
+
+func (s *PostgresStore) UpdateDiscoveryScan(ctx context.Context, scan *DiscoveryScan) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.discovery_scans SET
+			status = $2, results_count = $3, unmanaged_count = $4, managed_count = $5,
+			unreachable_count = $6, started_at = $7, completed_at = $8, error = $9
+		WHERE id = $1`,
+		scan.ID, scan.Status, scan.ResultsCount, scan.UnmanagedCount, scan.ManagedCount,
+		scan.UnreachableCount, scan.StartedAt, scan.CompletedAt, nullIfEmpty(scan.Error))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("discovery scan %s not found", scan.ID)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetDiscoveryScan(ctx context.Context, id string) (*DiscoveryScan, error) {
+	scan, err := scanDiscoveryScan(s.pool.QueryRow(ctx,
+		"SELECT "+discoveryScanColumns+" FROM public.discovery_scans WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("discovery scan %s not found", id)
+	}
+	return scan, err
+}
+
+func (s *PostgresStore) ListDiscoveryScans(ctx context.Context, limit, offset int) ([]*DiscoveryScan, int64, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	var total int64
+	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM public.discovery_scans").Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+discoveryScanColumns+` FROM public.discovery_scans
+		 ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	scans := make([]*DiscoveryScan, 0)
+	for rows.Next() {
+		scan, err := scanDiscoveryScan(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		scans = append(scans, scan)
+	}
+	return scans, total, rows.Err()
+}
+
+const discoveryResultColumns = `id, scan_id, host, port, coalesce(reachable, true), coalesce(error, ''),
+		coalesce(management_state, 'UNMANAGED'), coalesce(trust_state, 'UNKNOWN'), matched_certificate_id,
+		coalesce(common_name, ''), coalesce(subject_dn, ''), coalesce(sans, '[]'::jsonb),
+		coalesce(issuer_dn, ''), coalesce(serial_number, ''), not_before, not_after,
+		coalesce(key_type, ''), coalesce(key_size, 0), coalesce(is_ca, false),
+		coalesce(fingerprint_sha256, ''), coalesce(certificate_pem, ''), coalesce(chain_pem, ''),
+		coalesce(chain_length, 0), coalesce(tls_version, ''), coalesce(cipher_suite, ''),
+		coalesce(key_exchange, ''), coalesce(alpn, ''), coalesce(findings, '[]'::jsonb),
+		coalesce(is_imported, false), imported_certificate_id, coalesce(scanned_at, created_at), created_at`
+
+// scanDiscoveryResult reads one row of discoveryResultColumns.
+//
+// Every nullable column is COALESCEd. A single NULL scanning into a non-pointer
+// Go field fails the whole query rather than the row, so one hand-inserted
+// result would otherwise blank an entire scan's findings — the defect the first
+// live PostgreSQL run turned up on the certificate list.
+func scanDiscoveryResult(row pgx.Row) (*DiscoveryResult, error) {
+	r := &DiscoveryResult{}
+	var sansJSON, findingsJSON []byte
+	err := row.Scan(
+		&r.ID, &r.ScanID, &r.Host, &r.Port, &r.Reachable, &r.Error,
+		&r.ManagementState, &r.TrustState, &r.MatchedCertificateID,
+		&r.CommonName, &r.SubjectDN, &sansJSON,
+		&r.IssuerDN, &r.SerialNumber, &r.NotBefore, &r.NotAfter,
+		&r.KeyType, &r.KeySize, &r.IsCA,
+		&r.FingerprintSHA256, &r.CertificatePEM, &r.ChainPEM,
+		&r.ChainLength, &r.TLSVersion, &r.CipherSuite,
+		&r.KeyExchange, &r.ALPN, &findingsJSON,
+		&r.IsImported, &r.ImportedCertificateID, &r.ScannedAt, &r.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(sansJSON) > 0 {
+		_ = json.Unmarshal(sansJSON, &r.SANs)
+	}
+	if len(findingsJSON) > 0 {
+		_ = json.Unmarshal(findingsJSON, &r.Findings)
+	}
+	if r.SANs == nil {
+		r.SANs = []string{}
+	}
+	if r.Findings == nil {
+		r.Findings = []Finding{}
+	}
+	return r, nil
+}
+
+func (s *PostgresStore) CreateDiscoveryResults(ctx context.Context, results []*DiscoveryResult) error {
+	if len(results) == 0 {
+		return nil
+	}
+
+	// One transaction for the whole batch. A scan's results are a single
+	// observation of the estate; half of them landing would make the counts on
+	// the scan record disagree with the rows behind it.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, r := range results {
+		sansJSON, err := json.Marshal(r.SANs)
+		if err != nil {
+			return err
+		}
+		findings := r.Findings
+		if findings == nil {
+			findings = []Finding{}
+		}
+		findingsJSON, err := json.Marshal(findings)
+		if err != nil {
+			return err
+		}
+		if r.ScannedAt.IsZero() {
+			r.ScannedAt = time.Now()
+		}
+
+		err = tx.QueryRow(ctx, `
+			INSERT INTO public.discovery_results
+				(scan_id, host, port, reachable, error, management_state, trust_state,
+				 matched_certificate_id, common_name, subject_dn, sans, issuer_dn, serial_number,
+				 not_before, not_after, key_type, key_size, is_ca, fingerprint_sha256,
+				 certificate_pem, chain_pem, chain_length, tls_version, cipher_suite,
+				 key_exchange, alpn, findings, scanned_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+			RETURNING id, created_at`,
+			r.ScanID, r.Host, r.Port, r.Reachable, nullIfEmpty(r.Error), r.ManagementState, r.TrustState,
+			r.MatchedCertificateID, nullIfEmpty(r.CommonName), nullIfEmpty(r.SubjectDN), sansJSON,
+			nullIfEmpty(r.IssuerDN), nullIfEmpty(r.SerialNumber), r.NotBefore, r.NotAfter,
+			nullIfEmpty(r.KeyType), r.KeySize, r.IsCA, nullIfEmpty(r.FingerprintSHA256),
+			nullIfEmpty(r.CertificatePEM), nullIfEmpty(r.ChainPEM), r.ChainLength,
+			nullIfEmpty(r.TLSVersion), nullIfEmpty(r.CipherSuite), nullIfEmpty(r.KeyExchange),
+			nullIfEmpty(r.ALPN), findingsJSON, r.ScannedAt).
+			Scan(&r.ID, &r.CreatedAt)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PostgresStore) ListDiscoveryResults(ctx context.Context, filter DiscoveryResultFilter) ([]*DiscoveryResult, int64, error) {
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(clause string, value any) {
+		args = append(args, value)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
+
+	if filter.ScanID != "" {
+		add("scan_id = $%d", filter.ScanID)
+	}
+	if filter.ManagementState != "" {
+		add("management_state = $%d", filter.ManagementState)
+	}
+	if filter.TrustState != "" {
+		add("trust_state = $%d", filter.TrustState)
+	}
+	if filter.Host != "" {
+		add("host = $%d", filter.Host)
+	}
+	if filter.UnimportedOnly {
+		where = append(where, "coalesce(is_imported, false) = false")
+	}
+	clause := strings.Join(where, " AND ")
+
+	var total int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT count(*) FROM public.discovery_results WHERE "+clause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	args = append(args, limit, filter.Offset)
+	query := "SELECT " + discoveryResultColumns + " FROM public.discovery_results WHERE " + clause +
+		fmt.Sprintf(" ORDER BY created_at DESC, host ASC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]*DiscoveryResult, 0)
+	for rows.Next() {
+		r, err := scanDiscoveryResult(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, r)
+	}
+	return out, total, rows.Err()
+}
+
+func (s *PostgresStore) GetDiscoveryResult(ctx context.Context, id string) (*DiscoveryResult, error) {
+	r, err := scanDiscoveryResult(s.pool.QueryRow(ctx,
+		"SELECT "+discoveryResultColumns+" FROM public.discovery_results WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("discovery result %s not found", id)
+	}
+	return r, err
+}
+
+func (s *PostgresStore) MarkDiscoveryResultImported(ctx context.Context, id, certificateID string) error {
+	// management_state moves with it: adopting a result settles the question it
+	// was raised about, and a list that still called it unmanaged would keep
+	// asking for work already done.
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.discovery_results
+		SET is_imported = true, imported_certificate_id = $2,
+		    matched_certificate_id = $2, management_state = 'MANAGED'
+		WHERE id = $1`, id, certificateID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("discovery result %s not found", id)
+	}
+	return nil
+}

@@ -74,8 +74,9 @@ make migrate
   applied  004_monitoring_queries.sql
   applied  005_identity_decoupling.sql
   applied  006_ownership_and_acknowledgement.sql
+  applied  007_discovery.sql
 
-Applied 6 migration(s).
+Applied 7 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so
@@ -89,7 +90,7 @@ while the others still read the old shape. Run it as a job, an init container, o
 by hand.
 
 If you would rather paste the SQL into the Supabase SQL editor, apply the files
-in numeric order. `004` and `006` add columns to tables `001` creates.
+in numeric order. `004`, `006`, and `007` add columns to tables `001` creates.
 
 ### Migration 005 is not optional
 
@@ -171,7 +172,7 @@ path with a different threat model.
 
 ## Plain PostgreSQL
 
-Migrations `002` through `005` apply anywhere. **`001` does not**: it defines
+Migrations `002` through `007` apply anywhere. **`001` does not**: it defines
 `get_user_role()` in terms of `auth.jwt()` and its RLS policies grant to the
 `authenticated` role, neither of which exists outside Supabase. A portable `001`
 is a known gap, tracked in the README.

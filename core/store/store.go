@@ -100,6 +100,26 @@ type Store interface {
 	// RevokeAcknowledgement withdraws one, keeping the record that it was made.
 	RevokeAcknowledgement(ctx context.Context, id string, revokedBy *string) error
 
+	// ── Discovery ───────────────────────────────────────────
+
+	// CreateDiscoveryScan records a run before it starts, so a scan that
+	// crashes halfway leaves evidence that it was attempted.
+	CreateDiscoveryScan(ctx context.Context, scan *DiscoveryScan) error
+	// UpdateDiscoveryScan writes the outcome: status, counts, completion.
+	UpdateDiscoveryScan(ctx context.Context, scan *DiscoveryScan) error
+	GetDiscoveryScan(ctx context.Context, id string) (*DiscoveryScan, error)
+	ListDiscoveryScans(ctx context.Context, limit, offset int) ([]*DiscoveryScan, int64, error)
+	// CreateDiscoveryResults writes a run's findings in one call. Batched
+	// because a scan produces one row per endpoint and a per-row round trip
+	// would make the write slower than the scanning.
+	CreateDiscoveryResults(ctx context.Context, results []*DiscoveryResult) error
+	ListDiscoveryResults(ctx context.Context, filter DiscoveryResultFilter) ([]*DiscoveryResult, int64, error)
+	GetDiscoveryResult(ctx context.Context, id string) (*DiscoveryResult, error)
+	// MarkDiscoveryResultImported links a result to the certificate someone
+	// adopted it into, so the same endpoint stops being reported as an
+	// unmanaged finding on the next scan.
+	MarkDiscoveryResultImported(ctx context.Context, id, certificateID string) error
+
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)

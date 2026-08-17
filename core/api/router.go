@@ -51,7 +51,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	caHandler := NewCAHandler(deps.Store, deps.CAMonitor, deps.ChainResolver)
 	caAccHandler := NewCAAccountHandler(deps.Store, deps.PluginMgr, deps.Keyring)
 	dashHandler := NewDashboardHandler(deps.Store)
-	discHandler := NewDiscoveryHandler(deps.Store, deps.Scanner)
+	discHandler := NewDiscoveryHandler(deps.Store, deps.Scanner, deps.Broker)
 	policyHandler := NewPolicyHandler(deps.Store)
 	eventsHandler := NewEventsHandler(deps.Store, deps.Broker)
 	displayHandler := NewDisplayTokenHandler(deps.Store)
@@ -110,8 +110,16 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.GET("/gateways", caAccHandler.ListGateways)
 
 		// ── Discovery ──
-		v1.POST("/discovery/scan", middleware.RequireRole(middleware.RoleOperator), discHandler.ScanEndpoint)
+		// Scanning is operator, not viewer: it opens connections to third-party
+		// infrastructure from CertPilot's address, which is an action taken in
+		// the organisation's name rather than a read of its own state.
+		v1.POST("/discovery/scan", middleware.RequireRole(middleware.RoleOperator), discHandler.Scan)
 		v1.POST("/discovery/import", middleware.RequireRole(middleware.RoleOperator), discHandler.Import)
+		// Reading what past scans found is open to any authenticated user. It
+		// is estate state, the same as the CA list.
+		v1.GET("/discovery/scans", discHandler.ListScans)
+		v1.GET("/discovery/scans/:id", discHandler.GetScan)
+		v1.GET("/discovery/results", discHandler.ListResults)
 
 		// ── Display Tokens ──
 		// Admin-only throughout: minting a credential that authenticates to

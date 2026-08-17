@@ -171,22 +171,82 @@ The rest:
 - **Expiry timeline.** What breaks in the next 7 / 30 / 90 days, grouped by team
   and environment.
 
+### Phase 5 — Discovery that finds what nobody told you about
+
+| Step | | |
+|:---|:---|:---|
+| 1 | Scans that persist, and the verdict that matters | ✅ |
+| 2 | CIDR expansion, worker pool, cancellation, progress on the stream | |
+| 3 | Scheduled scans and re-scan reconciliation | |
+| 4 | CT log monitoring | |
+| 5 | Cloud inventory: ACM, Azure Key Vault, GCP, Kubernetes secrets | |
+
+One sentence governs the phase:
+
+> **Discovery's output is not a list of certificates. It is the list of
+> certificates nobody told you about.**
+
+A scan of a real estate returns mostly certificates the team issued itself and
+already watches. Those rows are noise. So every result carries a verdict —
+`MANAGED`, `UNMANAGED`, `UNREACHABLE` — decided on the certificate's fingerprint
+rather than its hostname, because two certificates for the same host are two
+different certificates and the one being served is the one that expires. An
+inventory lookup that fails reports `UNMANAGED` and says so: calling something
+managed that could not be checked is how a lookup error becomes an outage.
+
+**Step 1** replaced a scanner that could reach one host and store nothing.
+`discovery_scans` and `discovery_results` had existed since migration 001 with
+no Go surface at all, and the columns 001 chose describe a certificate — which
+is what a scanner *finds*, not what it needs to say.
+
+A second verdict runs alongside the first: what the served chain terminates in.
+`PUBLIC`, `INTERNAL` — a CA registered in CertPilot, so its own expiry is
+already being watched — `SELF_SIGNED`, or `UNTRUSTED`, meaning someone is
+issuing certificates from an authority nobody has registered. Internal trust is
+decided on **signatures rather than by path building**, and that distinction is
+load-bearing: an expired certificate fails every verification for one reason,
+and letting that reason decide the trust answer reports every expired internal
+certificate as issued by an unknown CA, sending whoever reads it hunting a rogue
+issuer that does not exist.
+
+Findings name the consequence rather than the observation. A missing
+intermediate is not "chain incomplete" but "clients that already hold the
+intermediate will connect and clients that do not will fail, which is why this
+breaks intermittently and only for some users". It is also detected without
+relying on verification succeeding, because a platform verifier caches
+intermediates it has seen — so the endpoint verifies on the machine that has
+visited it and fails on a fresh one, which is the defect itself.
+
+Two deliberate omissions. `auto_renew` is always false on import whatever was
+asked for, because CertPilot holds no private key for something it merely
+observed and a record claiming it will renew itself is a promise the system
+cannot keep. And a classical key exchange is **not** a finding: it is true of
+nearly every endpoint alive, and a finding that appears on every row is the
+noise that stops people reading the list. The negotiated group is recorded
+verbatim instead — which is the whole point of capturing the handshake, since it
+is unrecoverable once the connection is gone.
+
+Verified against live endpoints, not only in tests: expired, self-signed,
+wrong-host, incomplete-chain, TLS 1.0, 3DES, and a SHA-1 intermediate each
+produced exactly one correct finding, an unmanaged run reached a signed webhook
+through the existing dispatcher, and importing a result flipped the same
+endpoint to `MANAGED` on re-scan.
+
+**Still open in this phase:** the same endpoint appears once per scan in the
+cross-scan results list, so "everything we have found and not adopted" over-counts.
+Deduplicating to the latest observation per endpoint belongs with step 3, which
+is where re-scan reconciliation lives.
+
 ### Phase 4 — A renewal engine that survives 47-day certificates
+
+Deferred deliberately: it is the last phase before deployment, and every earlier
+phase widens what it has to renew.
 
 - Durable job queue with leader election (Postgres advisory locks)
 - Exponential backoff with jitter, per-CA rate limiting, idempotency keys
 - Renewal scheduled from the CA's ARI window where published, lead time otherwise
 - Post-renewal verification: re-scan the endpoint and confirm the new
   certificate is actually being served
-
-### Phase 5 — Discovery that finds what nobody told you about
-
-- CIDR expansion with a worker pool
-- **CT log monitoring** — the highest-signal, cheapest addition available, and
-  the only way to find certificates issued outside the team's knowledge
-- Cloud inventory: ACM, GCP, Azure Key Vault, Kubernetes secrets
-- Record full TLS handshake details during the scan, which is what the
-  post-quantum posture work is built on
 
 ### Phase 6 — Deployment, then the agent
 

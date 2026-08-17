@@ -327,6 +327,187 @@ func (c *NotificationChannel) Accepts(topic, severity string) bool {
 	return false
 }
 
+// Discovery scan types, matching the check constraint on discovery_scans.
+const (
+	ScanTypeNetwork = "network"
+	ScanTypeCTLog   = "ct_log"
+	ScanTypeCloud   = "cloud"
+)
+
+// Discovery scan lifecycle states.
+const (
+	ScanPending   = "PENDING"
+	ScanRunning   = "RUNNING"
+	ScanCompleted = "COMPLETED"
+	ScanFailed    = "FAILED"
+)
+
+// Whether CertPilot already knows about a discovered certificate.
+//
+// This is the verdict discovery exists to produce. A scan of a real estate
+// returns mostly certificates the team issued itself; the rows that matter are
+// the ones it did not.
+const (
+	// DiscoveryManaged means the served certificate's fingerprint matches a
+	// row in `certificates`.
+	DiscoveryManaged = "MANAGED"
+	// DiscoveryUnmanaged means it does not. Something is serving TLS with a
+	// certificate this system has never seen, and nothing will renew it.
+	DiscoveryUnmanaged = "UNMANAGED"
+	// DiscoveryUnreachable means the endpoint did not complete a TLS
+	// handshake, so there is no certificate to judge.
+	DiscoveryUnreachable = "UNREACHABLE"
+)
+
+// What the served chain terminates in.
+const (
+	// TrustPublic — verifies against the host's public root store.
+	TrustPublic = "PUBLIC"
+	// TrustInternal — verifies against a CA registered in CertPilot. This is
+	// the normal answer inside an organisation running private PKI, and it is
+	// the one that ties an endpoint to a CA whose expiry is being watched.
+	TrustInternal = "INTERNAL"
+	// TrustSelfSigned — the leaf signed itself. Common on appliances and
+	// forgotten test rigs, and a fair description of "nobody is managing this".
+	TrustSelfSigned = "SELF_SIGNED"
+	// TrustUntrusted — chains to neither. Either an intermediate is missing
+	// from the served chain, or the issuing CA is one nobody has registered.
+	TrustUntrusted = "UNTRUSTED"
+	// TrustUnknown — not established, because the endpoint was unreachable.
+	TrustUnknown = "UNKNOWN"
+)
+
+// Finding is one thing wrong with a discovered endpoint.
+//
+// Stored with the result rather than recomputed on read. A result is a record
+// of what was observed at a moment; deriving findings at read time would mean a
+// scan from March silently re-judged by today's rules, against a certificate
+// that has since been replaced.
+type Finding struct {
+	// Code is a stable machine-readable identifier, e.g. "hostname_mismatch".
+	Code string `json:"code"`
+	// Severity is INFO, WARNING, or CRITICAL — the same vocabulary the event
+	// stream and the notification channels use, so a finding can be routed
+	// without translation.
+	Severity string `json:"severity"`
+	// Detail is a sentence someone can act on, naming the specific values
+	// involved. "RSA-1024" beats "weak key".
+	Detail string `json:"detail"`
+}
+
+// DiscoveryScan is one run of the scanner over a set of targets.
+type DiscoveryScan struct {
+	ID       string `json:"id"`
+	ScanType string `json:"scan_type"`
+	// Targets is what was asked for, as given. Kept verbatim so a scan can be
+	// repeated and so an unexpected result can be traced back to the input
+	// that produced it.
+	Targets      []string `json:"targets"`
+	Status       string   `json:"status"`
+	ResultsCount int      `json:"results_count"`
+	// The three counts partition ResultsCount. UnmanagedCount is the headline:
+	// it is the number a PKI team reads first and the only one that implies
+	// work.
+	UnmanagedCount   int        `json:"unmanaged_count"`
+	ManagedCount     int        `json:"managed_count"`
+	UnreachableCount int        `json:"unreachable_count"`
+	StartedAt        *time.Time `json:"started_at,omitempty"`
+	CompletedAt      *time.Time `json:"completed_at,omitempty"`
+	Error            string     `json:"error,omitempty"`
+	TriggeredBy      *string    `json:"triggered_by,omitempty"`
+	ActorEmail       *string    `json:"actor_email,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+}
+
+// DiscoveryResult is what one endpoint was serving when it was asked.
+type DiscoveryResult struct {
+	ID     string `json:"id"`
+	ScanID string `json:"scan_id"`
+	Host   string `json:"host"`
+	Port   int    `json:"port"`
+
+	// Reachable is false when no TLS handshake completed. Error then carries
+	// the dialler's own words — "connection refused" and "certificate signed
+	// by unknown authority" are different problems and only one of them is
+	// about certificates.
+	Reachable bool   `json:"reachable"`
+	Error     string `json:"error,omitempty"`
+
+	ManagementState string `json:"management_state"`
+	TrustState      string `json:"trust_state"`
+	// MatchedCertificateID names the managed certificate this fingerprint
+	// belongs to, when there is one.
+	MatchedCertificateID *string `json:"matched_certificate_id,omitempty"`
+
+	CommonName        string     `json:"common_name,omitempty"`
+	SubjectDN         string     `json:"subject_dn,omitempty"`
+	SANs              []string   `json:"sans"`
+	IssuerDN          string     `json:"issuer_dn,omitempty"`
+	SerialNumber      string     `json:"serial_number,omitempty"`
+	NotBefore         *time.Time `json:"not_before,omitempty"`
+	NotAfter          *time.Time `json:"not_after,omitempty"`
+	KeyType           string     `json:"key_type,omitempty"`
+	KeySize           int        `json:"key_size,omitempty"`
+	IsCA              bool       `json:"is_ca"`
+	FingerprintSHA256 string     `json:"fingerprint_sha256,omitempty"`
+	CertificatePEM    string     `json:"certificate_pem,omitempty"`
+	ChainPEM          string     `json:"chain_pem,omitempty"`
+	// ChainLength is how many certificates the server sent, leaf included. One
+	// means it sent no intermediates, which works only for clients that
+	// already happen to hold them.
+	ChainLength int `json:"chain_length"`
+
+	TLSVersion  string `json:"tls_version,omitempty"`
+	CipherSuite string `json:"cipher_suite,omitempty"`
+	// KeyExchange is the negotiated group, e.g. "X25519MLKEM768". Recorded on
+	// every scan because it is unrecoverable afterwards and is the basis of
+	// any later answer about quantum readiness.
+	KeyExchange string `json:"key_exchange,omitempty"`
+	ALPN        string `json:"alpn,omitempty"`
+
+	Findings []Finding `json:"findings"`
+
+	IsImported            bool      `json:"is_imported"`
+	ImportedCertificateID *string   `json:"imported_certificate_id,omitempty"`
+	ScannedAt             time.Time `json:"scanned_at"`
+	CreatedAt             time.Time `json:"created_at"`
+}
+
+// WorstSeverity returns the highest severity among the result's findings, or
+// "" when there are none. Used to sort a result list by how much attention it
+// needs rather than by hostname.
+func (r *DiscoveryResult) WorstSeverity() string {
+	worst := ""
+	worstRank := -1
+	for _, f := range r.Findings {
+		rank, ok := severityRank[f.Severity]
+		if !ok {
+			continue
+		}
+		if rank > worstRank {
+			worstRank, worst = rank, f.Severity
+		}
+	}
+	return worst
+}
+
+// DiscoveryResultFilter narrows a result list.
+type DiscoveryResultFilter struct {
+	// ScanID restricts to one run. Empty means across every scan, which is how
+	// "everything unmanaged we have ever found" is asked.
+	ScanID string
+	// ManagementState is MANAGED, UNMANAGED, or UNREACHABLE.
+	ManagementState string
+	// TrustState is PUBLIC, INTERNAL, SELF_SIGNED, UNTRUSTED, or UNKNOWN.
+	TrustState string
+	// Host matches exactly.
+	Host string
+	// UnimportedOnly hides results someone has already adopted into inventory.
+	UnimportedOnly bool
+	Limit          int
+	Offset         int
+}
+
 // DashboardStats holds summary statistics for the overview dashboard.
 //
 // The five CA counts partition the estate: every CA lands in exactly one, and

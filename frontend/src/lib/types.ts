@@ -215,6 +215,86 @@ export interface NotificationTestResult {
   error?: string
 }
 
+// ── Discovery ─────────────────────────────────────────────
+
+/** One thing wrong with a discovered endpoint — core/store/models.go Finding */
+export interface Finding {
+  code: string
+  severity: 'INFO' | 'WARNING' | 'CRITICAL'
+  detail: string
+}
+
+/** core/store/models.go — DiscoveryScan */
+export interface DiscoveryScan {
+  id: string
+  scan_type: 'network' | 'ct_log' | 'cloud'
+  targets: string[]
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED'
+  results_count: number
+  /** The headline. The only count that implies work. */
+  unmanaged_count: number
+  managed_count: number
+  unreachable_count: number
+  started_at?: string
+  completed_at?: string
+  error?: string
+  actor_email?: string | null
+  created_at: string
+}
+
+/**
+ * core/store/models.go — DiscoveryResult.
+ *
+ * `management_state` is the verdict the whole feature exists to produce:
+ * UNMANAGED means something is serving TLS with a certificate this system has
+ * never seen, so nothing renews it and nobody is watching it expire.
+ */
+export interface DiscoveryResult {
+  id: string
+  scan_id: string
+  host: string
+  port: number
+  reachable: boolean
+  error?: string
+  management_state: 'MANAGED' | 'UNMANAGED' | 'UNREACHABLE'
+  trust_state: 'PUBLIC' | 'INTERNAL' | 'SELF_SIGNED' | 'UNTRUSTED' | 'UNKNOWN'
+  matched_certificate_id?: string | null
+  common_name?: string
+  subject_dn?: string
+  sans: string[]
+  issuer_dn?: string
+  serial_number?: string
+  not_before?: string
+  not_after?: string
+  key_type?: string
+  key_size?: number
+  is_ca: boolean
+  fingerprint_sha256?: string
+  certificate_pem?: string
+  chain_pem?: string
+  chain_length: number
+  tls_version?: string
+  cipher_suite?: string
+  /** The negotiated group, e.g. "X25519MLKEM768". Unrecoverable after the scan. */
+  key_exchange?: string
+  alpn?: string
+  findings: Finding[]
+  is_imported: boolean
+  imported_certificate_id?: string | null
+  scanned_at: string
+  created_at: string
+}
+
+/** POST /api/v1/discovery/scan and GET /api/v1/discovery/scans/:id */
+export interface DiscoveryScanResponse {
+  scan: DiscoveryScan
+  data: DiscoveryResult[]
+  total: number
+  /** A sentence, because the counts alone cannot distinguish "nothing
+   *  answered" from "everything is managed". */
+  summary: string
+}
+
 /** core/store/models.go — Policy */
 export interface Policy {
   id: string

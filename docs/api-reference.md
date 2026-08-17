@@ -387,12 +387,98 @@ omit it to derive from the host part of `gateway_addr`.
 ## Discovery
 
 ```
-POST /api/v1/discovery/scan    TLS handshake against {host, port}  (operator)
-POST /api/v1/discovery/import  Import a discovered certificate     (operator)
+POST /api/v1/discovery/scan        Scan endpoints and judge what they serve  (operator)
+POST /api/v1/discovery/import      Adopt a finding into inventory            (operator)
+GET  /api/v1/discovery/scans       Scan history
+GET  /api/v1/discovery/scans/:id   One run and its results
+GET  /api/v1/discovery/results     Findings across every scan
 ```
 
-> Single endpoint only. CIDR ranges, CT log monitoring, and cloud inventory are
-> not implemented, and results are not yet persisted to `discovery_scans`.
+Scanning is operator-gated because it opens connections to third-party
+infrastructure from CertPilot's address. Every run is recorded in the audit log
+with the targets it was given, so "who asked us to connect to that" is
+answerable afterwards. One request is capped at 256 targets.
+
+```json
+POST /api/v1/discovery/scan
+{ "targets": ["example.com", "10.0.0.5:8443"], "port": 443 }
+```
+
+Every target is parsed before any is scanned: a malformed one fails the whole
+request rather than leaving you unsure which part of your list was reached.
+`host: "…"` is accepted as the single-target form.
+
+The response carries the run, the results, and a sentence:
+
+```json
+{
+  "scan": { "results_count": 7, "unmanaged_count": 6, "managed_count": 0, "unreachable_count": 1 },
+  "data": [ … ],
+  "summary": "6 certificate(s) are being served that CertPilot does not manage. Nothing renews them."
+}
+```
+
+The `summary` exists because the counts alone are ambiguous in the one direction
+that matters: an estate where nothing answered and an estate where everything is
+managed both produce zero unmanaged results.
+
+### The verdicts
+
+Each result carries two, and they answer different questions.
+
+`management_state` — **`MANAGED`** when the served certificate's SHA-256
+fingerprint matches a row in `certificates`, **`UNMANAGED`** when it does not,
+**`UNREACHABLE`** when no handshake completed. Matched on fingerprint, not on
+name: two certificates for the same hostname are two different certificates, and
+the one being served is the one that expires. An inventory lookup that fails
+reports `UNMANAGED`, with a finding saying so — calling something managed that
+could not be checked is how a lookup error becomes an outage.
+
+`trust_state` — **`PUBLIC`**, **`INTERNAL`** (chains to a CA registered in
+CertPilot), **`SELF_SIGNED`**, **`UNTRUSTED`** (neither), or **`UNKNOWN`**.
+Internal trust is decided on signatures rather than by path building, so an
+expired certificate still reports the CA that issued it instead of reading as a
+rogue issuer.
+
+### Findings
+
+`findings` is an array of `{code, severity, detail}`. Codes are stable:
+`expired`, `not_yet_valid`, `expiring_soon`, `hostname_mismatch`, `self_signed`,
+`untrusted_issuer`, `incomplete_chain`, `weak_key`, `weak_signature`,
+`legacy_tls`, `weak_cipher`, `no_forward_secrecy`, `long_validity`,
+`internal_issuer`, `inventory_lookup_failed`.
+
+`weak_signature` covers the whole served chain, not just the leaf: a SHA-1
+intermediate breaks a connection as completely as a SHA-1 leaf, and is the more
+common of the two. Self-signed certificates are skipped, since a root's own
+signature is never verified by anything.
+
+A classical key exchange is deliberately **not** a finding. It is true of nearly
+every endpoint alive, and a finding on every row is not a finding. The
+negotiated group is recorded verbatim in `key_exchange` instead — that column is
+what a posture report reads.
+
+### Import
+
+```json
+POST /api/v1/discovery/import
+{ "result_id": "…", "team": "Platform", "environment": "production" }
+```
+
+`certificate_pem` is accepted instead, for a certificate someone has in hand.
+
+**`auto_renew` is always false on import, whatever was requested.** CertPilot
+holds no private key for something it merely observed, so a record claiming it
+will renew itself is a promise the system cannot keep — and the moment you find
+out is expiry. The response says so in words. Importing the same certificate
+twice converges on one record and returns 200 rather than a conflict.
+
+Publishes `discovery.unmanaged` (WARNING) when a run finds anything unmanaged,
+so the finding reaches the channels a team already configured instead of waiting
+to be noticed on a page nobody has open.
+
+> CIDR ranges, scheduled scans, CT log monitoring, and cloud inventory are not
+> implemented yet.
 
 ## Ownership and acknowledgement
 

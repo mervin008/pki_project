@@ -103,7 +103,7 @@ explicitly.
 | Kiosk display tokens | ✅ | Read-only, viewer-scoped, expiring, revocable credentials for a wall display |
 | CA hierarchy tree | ⚠️ | Position and lineage are shown per CA and a malformed hierarchy is flagged; the tree is not drawn as a tree |
 | Policy engine | ⚠️ | `key_size`, `max_lifetime`, `ca_restriction`; other rule types are not implemented |
-| Discovery | ⚠️ | Single `host:port` scan only. No CIDR, CT logs, or cloud inventory |
+| Discovery | ⚠️ | Scans a list of endpoints, records the full handshake, and says which certificates nobody manages. No CIDR ranges, scheduled scans, CT logs, or cloud inventory yet |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ❌ | Not started |
 | Host agent | ❌ | Not started |
@@ -264,6 +264,53 @@ curl -X POST localhost:8080/api/v1/ca-accounts -H 'Content-Type: application/jso
 
 The gateway validates this configuration before it is stored, so a wrong token
 surfaces immediately rather than during a renewal at 3am.
+
+### Finding what nobody told you about
+
+```bash
+curl -X POST localhost:8080/api/v1/discovery/scan -H 'Content-Type: application/json' \
+  -d '{"targets": ["example.com", "10.0.0.5:8443", "internal-api.corp"]}'
+```
+
+```
+6 certificate(s) are being served that CertPilot does not manage. Nothing renews them.
+```
+
+That sentence is the output. A scan of a real estate returns mostly certificates
+the team issued itself and already watches; the rows that justify having run it
+are the ones nobody knew about, so every result carries a verdict —
+`MANAGED`, `UNMANAGED`, or `UNREACHABLE` — matched on the certificate's
+fingerprint rather than its hostname.
+
+Alongside it, the second verdict: what the chain terminates in. `PUBLIC`,
+`INTERNAL` (a CA registered here, so its own expiry is being watched),
+`SELF_SIGNED`, or `UNTRUSTED` — someone is issuing certificates from an
+authority nobody has registered, which is a finding in its own right.
+
+Findings name the consequence rather than the observation:
+
+```
+incomplete-chain.example.com:443   UNMANAGED  PUBLIC
+  [WARNING] incomplete_chain: The server sent only its own certificate and no
+  issuing CA certificate. Clients that already hold the intermediate will
+  connect and clients that do not will fail, which is why this breaks
+  intermittently and only for some users.
+```
+
+An unreachable endpoint is a row, not an absence — a scan that reached nothing
+and a scan that found nothing produce the same empty list, and only one of them
+means the estate is clean.
+
+The full handshake is recorded on every result: TLS version, cipher suite, ALPN,
+and the negotiated key exchange group. Not because any of it is a defect today,
+but because it is unrecoverable afterwards — the connection is gone, and a
+certificate on its own says nothing about how it was negotiated. "142 of your
+endpoints do not negotiate X25519MLKEM768" is a question about history, and
+history has to have been collected before it is asked.
+
+Importing a finding watches it for expiry. It does **not** make it renewable:
+CertPilot holds no private key for something it merely observed, so `auto_renew`
+stays false whatever you ask for, and the response says why.
 
 ## Security model
 

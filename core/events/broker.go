@@ -30,6 +30,11 @@ const (
 	TopicCertRenewFail = "cert.renewal_failed"
 	TopicCertExpiring  = "cert.expiring"
 	TopicGatewayStatus = "gateway.status"
+	// TopicDiscoveryUnmanaged carries the one finding a discovery scan exists
+	// to produce: an endpoint serving a certificate this system has never seen.
+	// Published so it reaches the channels a team already configured, rather
+	// than waiting to be noticed on a results page nobody has open.
+	TopicDiscoveryUnmanaged = "discovery.unmanaged"
 )
 
 // AllTopics lists every topic a producer publishes.
@@ -50,6 +55,7 @@ func AllTopics() []string {
 		TopicCertRenewFail,
 		TopicCertExpiring,
 		TopicGatewayStatus,
+		TopicDiscoveryUnmanaged,
 	}
 }
 

@@ -101,6 +101,20 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "Gateway", Value: fallback(str(payload, "gateway"), "—")},
 		}
 
+	case events.TopicDiscoveryUnmanaged:
+		count := int(num(payload, "unmanaged_count"))
+		alert.Title = fmt.Sprintf("Discovery found %d unmanaged certificate(s)", count)
+		// Says what the finding means rather than what happened. "A scan
+		// completed" is not actionable; "nothing renews these" is.
+		alert.Summary = fmt.Sprintf(
+			"A scan of %s endpoints found %d serving certificates CertPilot does not manage. Nothing renews them and nobody is watching them expire.",
+			countText(num(payload, "scanned_count")), count)
+		alert.Fields = []Field{
+			{Label: "Unmanaged", Value: countText(num(payload, "unmanaged_count"))},
+			{Label: "Endpoints scanned", Value: countText(num(payload, "scanned_count"))},
+			{Label: "Hosts", Value: fallback(listText(payload, "hosts"), "—")},
+		}
+
 	case events.TopicGatewayStatus:
 		name := str(payload, "name")
 		alert.Title = fmt.Sprintf("Gateway %s", fallback(str(payload, "status"), "status changed"))
@@ -242,6 +256,33 @@ func dateText(value string) string {
 		return value
 	}
 	return ts.Format("2 January 2006")
+}
+
+// listText renders a payload field that holds a list of strings, which is how
+// a discovery alert names the hosts it found. Truncated rather than dropped: a
+// Slack message listing four hundred hosts is one nobody reads to the end.
+func listText(payload map[string]any, key string) string {
+	raw, ok := payload[key].([]any)
+	if !ok {
+		if strs, ok := payload[key].([]string); ok {
+			return joinTruncated(strs, 8)
+		}
+		return ""
+	}
+	items := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			items = append(items, s)
+		}
+	}
+	return joinTruncated(items, 8)
+}
+
+func joinTruncated(items []string, max int) string {
+	if len(items) <= max {
+		return strings.Join(items, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(items[:max], ", "), len(items)-max)
 }
 
 func fallback(value, or string) string {

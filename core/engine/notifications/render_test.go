@@ -204,3 +204,31 @@ func TestAnEventWithNoTimestampGetsOne(t *testing.T) {
 		t.Error("a zero timestamp survived, which renders as the year 1")
 	}
 }
+
+// A discovery alert has to say what the finding means, not that a job ran. "A
+// scan completed" is not actionable; "nothing renews these" is.
+func TestDiscoveryAlertNamesTheConsequence(t *testing.T) {
+	alert := AlertFromEvent(events.Event{
+		Topic:    events.TopicDiscoveryUnmanaged,
+		Severity: events.SeverityWarning,
+		EntityID: "scan-1",
+		Payload: map[string]any{
+			"unmanaged_count": 3,
+			"scanned_count":   12,
+			"hosts":           []any{"10.0.0.4:443", "10.0.0.9:8443"},
+		},
+	})
+
+	if !strings.Contains(alert.Title, "3") {
+		t.Errorf("title does not carry the count: %q", alert.Title)
+	}
+	if !strings.Contains(alert.Summary, "Nothing renews them") {
+		t.Errorf("summary does not state the consequence: %q", alert.Summary)
+	}
+	// The hosts are the actionable part: an alert that only gives a number
+	// sends the reader back to the dashboard to find out which.
+	hosts, _ := fieldValue(alert, "Hosts")
+	if !strings.Contains(hosts, "10.0.0.4:443") {
+		t.Errorf("the alert does not name the hosts found: %+v", alert.Fields)
+	}
+}

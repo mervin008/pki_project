@@ -11,14 +11,21 @@ import (
 
 // requiredTables are the tables the core reads or writes on an ordinary
 // request. Tables belonging to features that are not wired up yet
-// (discovery_scans, discovery_results, endpoint_tls_posture) are deliberately
-// absent: refusing to start over a table nothing queries would be a false alarm.
+// (endpoint_tls_posture) are deliberately absent: refusing to start over a
+// table nothing queries would be a false alarm.
+//
+// The discovery tables are here because they are now written on every scan, and
+// because of how they fail without their columns: a scan would run, reach out
+// across the network, and lose everything it found. An empty results list is
+// the same shape as a clean estate.
 var requiredTables = []string{
 	"audit_logs",
 	"ca_accounts",
 	"ca_authorities",
 	"certificates",
 	"deployment_targets",
+	"discovery_results",
+	"discovery_scans",
 	"display_tokens",
 	"notification_channels",
 	"policies",
@@ -174,6 +181,14 @@ func warnOnStaleSchema(ctx context.Context, pool *pgxpool.Pool) {
 				SELECT 1 FROM pg_catalog.pg_indexes
 				WHERE schemaname = 'public' AND indexname = 'idx_audit_logs_action_created')`,
 			consequence: "the audit log has no index on action (migration 004); filtering activity will scan the whole table",
+		},
+		{
+			// Migration 007.
+			query: `SELECT NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'discovery_results'
+				  AND column_name = 'management_state')`,
+			consequence: "discovery_results has no management_state column (migration 007); scans will run and then fail to record what they found",
 		},
 		{
 			// Migration 005. This one is a hard failure at write time rather

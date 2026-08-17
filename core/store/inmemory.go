@@ -35,6 +35,9 @@ type MemoryStore struct {
 	// overwritten by the next one.
 	acks      []*AlertAcknowledgement
 	auditLogs []*AuditLog
+	// Discovery runs and their results, both append-only and newest last.
+	discoveryScans   []*DiscoveryScan
+	discoveryResults []*DiscoveryResult
 }
 
 // clone returns a shallow copy of a stored record.
@@ -1009,4 +1012,172 @@ func (m *MemoryStore) RevokeAcknowledgement(ctx context.Context, id string, revo
 		return nil
 	}
 	return fmt.Errorf("acknowledgement %s not found", id)
+}
+
+// ── Discovery ───────────────────────────────────────────
+
+func (m *MemoryStore) CreateDiscoveryScan(ctx context.Context, scan *DiscoveryScan) error {
+	if scan.ScanType == "" {
+		return fmt.Errorf("a discovery scan needs a type")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if scan.ID == "" {
+		scan.ID = uuid.New().String()
+	}
+	scan.CreatedAt = time.Now()
+	if scan.Status == "" {
+		scan.Status = ScanPending
+	}
+	m.discoveryScans = append(m.discoveryScans, clone(scan))
+	return nil
+}
+
+func (m *MemoryStore) UpdateDiscoveryScan(ctx context.Context, scan *DiscoveryScan) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i, s := range m.discoveryScans {
+		if s.ID == scan.ID {
+			// CreatedAt is the store's, not the caller's: a scan record that
+			// could be back-dated by whoever updates it is not evidence.
+			updated := clone(scan)
+			updated.CreatedAt = s.CreatedAt
+			m.discoveryScans[i] = updated
+			return nil
+		}
+	}
+	return fmt.Errorf("discovery scan %s not found", scan.ID)
+}
+
+func (m *MemoryStore) GetDiscoveryScan(ctx context.Context, id string) (*DiscoveryScan, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, s := range m.discoveryScans {
+		if s.ID == id {
+			return clone(s), nil
+		}
+	}
+	return nil, fmt.Errorf("discovery scan %s not found", id)
+}
+
+func (m *MemoryStore) ListDiscoveryScans(ctx context.Context, limit, offset int) ([]*DiscoveryScan, int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	total := int64(len(m.discoveryScans))
+	if limit <= 0 {
+		limit = 50
+	}
+
+	// Newest first, which is the only order a scan history is ever read in.
+	out := make([]*DiscoveryScan, 0)
+	skipped := 0
+	for i := len(m.discoveryScans) - 1; i >= 0; i-- {
+		if skipped < offset {
+			skipped++
+			continue
+		}
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, clone(m.discoveryScans[i]))
+	}
+	return out, total, nil
+}
+
+func (m *MemoryStore) CreateDiscoveryResults(ctx context.Context, results []*DiscoveryResult) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	for _, r := range results {
+		if r.ScanID == "" {
+			return fmt.Errorf("a discovery result needs a scan id")
+		}
+		if r.ID == "" {
+			r.ID = uuid.New().String()
+		}
+		r.CreatedAt = now
+		if r.ScannedAt.IsZero() {
+			r.ScannedAt = now
+		}
+		m.discoveryResults = append(m.discoveryResults, clone(r))
+	}
+	return nil
+}
+
+func (m *MemoryStore) ListDiscoveryResults(ctx context.Context, filter DiscoveryResultFilter) ([]*DiscoveryResult, int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	matched := make([]*DiscoveryResult, 0)
+	for i := len(m.discoveryResults) - 1; i >= 0; i-- {
+		r := m.discoveryResults[i]
+		if filter.ScanID != "" && r.ScanID != filter.ScanID {
+			continue
+		}
+		if filter.ManagementState != "" && r.ManagementState != filter.ManagementState {
+			continue
+		}
+		if filter.TrustState != "" && r.TrustState != filter.TrustState {
+			continue
+		}
+		if filter.Host != "" && r.Host != filter.Host {
+			continue
+		}
+		if filter.UnimportedOnly && r.IsImported {
+			continue
+		}
+		matched = append(matched, clone(r))
+	}
+
+	total := int64(len(matched))
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	if filter.Offset >= len(matched) {
+		return []*DiscoveryResult{}, total, nil
+	}
+	end := filter.Offset + limit
+	if end > len(matched) {
+		end = len(matched)
+	}
+	return matched[filter.Offset:end], total, nil
+}
+
+func (m *MemoryStore) GetDiscoveryResult(ctx context.Context, id string) (*DiscoveryResult, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, r := range m.discoveryResults {
+		if r.ID == id {
+			return clone(r), nil
+		}
+	}
+	return nil, fmt.Errorf("discovery result %s not found", id)
+}
+
+func (m *MemoryStore) MarkDiscoveryResultImported(ctx context.Context, id, certificateID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, r := range m.discoveryResults {
+		if r.ID != id {
+			continue
+		}
+		certID := certificateID
+		r.IsImported = true
+		r.ImportedCertificateID = &certID
+		// Adopting a result also settles the question it was raised about: the
+		// certificate is managed from this moment on, and a results list that
+		// still called it unmanaged would keep asking for work already done.
+		r.ManagementState = DiscoveryManaged
+		r.MatchedCertificateID = &certID
+		return nil
+	}
+	return fmt.Errorf("discovery result %s not found", id)
 }
