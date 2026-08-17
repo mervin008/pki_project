@@ -1,0 +1,285 @@
+package notifications
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/certpilot/certpilot/core/events"
+)
+
+// AlertFromEvent turns a published event into something worth reading.
+//
+// Done once, centrally, so Slack, email, and a webhook receiver all describe the
+// same event the same way. Three channels wording an alert differently is how an
+// on-call engineer ends up comparing a Slack message with an email instead of
+// acting on either of them.
+//
+// An unrecognised topic still produces an alert. Topics are added by producers
+// over time, and a dispatcher that silently drops what it does not recognise
+// would turn every new event type into a coverage gap that nothing reports.
+func AlertFromEvent(evt events.Event) Alert {
+	payload := payloadMap(evt.Payload)
+
+	alert := Alert{
+		Severity:  normalizeSeverity(evt.Severity),
+		Topic:     evt.Topic,
+		EntityID:  evt.EntityID,
+		Timestamp: evt.Timestamp,
+	}
+	if alert.Timestamp.IsZero() {
+		alert.Timestamp = time.Now()
+	}
+
+	switch evt.Topic {
+	case events.TopicCAExpiryAlert:
+		name := str(payload, "ca_name")
+		days := num(payload, "days_remaining")
+		alert.Title = fmt.Sprintf("CA expiring: %s", fallback(name, "unnamed authority"))
+		alert.Summary = expirySentence(name, days, str(payload, "ca_type"))
+		alert.Fields = []Field{
+			{Label: "Authority", Value: fallback(name, "—")},
+			{Label: "Type", Value: fallback(str(payload, "ca_type"), "—")},
+			{Label: "Days remaining", Value: daysText(days)},
+			{Label: "Expires", Value: dateText(str(payload, "not_after"))},
+			{Label: "Threshold crossed", Value: thresholdText(payload)},
+		}
+
+	case events.TopicCAHealth:
+		name := str(payload, "ca_name")
+		from, to := str(payload, "previous_status"), str(payload, "status")
+		alert.Title = fmt.Sprintf("CA health changed: %s is %s", fallback(name, "a CA"), fallback(to, "unknown"))
+		alert.Summary = fmt.Sprintf("%s moved from %s to %s.",
+			fallback(name, "A certificate authority"), fallback(from, "an earlier state"), fallback(to, "an unknown state"))
+		alert.Fields = []Field{
+			{Label: "Authority", Value: fallback(name, "—")},
+			{Label: "Previous status", Value: fallback(from, "—")},
+			{Label: "Current status", Value: fallback(to, "—")},
+			{Label: "Days remaining", Value: daysText(num(payload, "days_remaining"))},
+		}
+
+	case events.TopicCertRenewFail:
+		cn := str(payload, "common_name")
+		alert.Title = fmt.Sprintf("Renewal failed: %s", fallback(cn, "a certificate"))
+		// Named as the thing it will become, because that is the part that
+		// matters: a failed renewal is an expiry with a delay on it.
+		alert.Summary = fmt.Sprintf(
+			"%s could not be renewed and will expire unless this is resolved.",
+			fallback(cn, "A certificate"))
+		alert.Fields = []Field{
+			{Label: "Common name", Value: fallback(cn, "—")},
+			{Label: "Days remaining", Value: daysText(num(payload, "days_remaining"))},
+			{Label: "Error", Value: fallback(str(payload, "error"), "—")},
+			{Label: "Attempts", Value: countText(num(payload, "renewal_count"))},
+		}
+
+	case events.TopicCertExpiring:
+		cn := str(payload, "common_name")
+		alert.Title = fmt.Sprintf("Certificate expiring: %s", fallback(cn, "unnamed"))
+		alert.Summary = fmt.Sprintf("%s expires in %s.",
+			fallback(cn, "A certificate"), daysText(num(payload, "days_remaining")))
+		alert.Fields = []Field{
+			{Label: "Common name", Value: fallback(cn, "—")},
+			{Label: "Days remaining", Value: daysText(num(payload, "days_remaining"))},
+			{Label: "Expires", Value: dateText(str(payload, "not_after"))},
+		}
+
+	case events.TopicCertIssued, events.TopicCertRenewed:
+		cn := str(payload, "common_name")
+		verb := "issued"
+		if evt.Topic == events.TopicCertRenewed {
+			verb = "renewed"
+		}
+		alert.Title = fmt.Sprintf("Certificate %s: %s", verb, fallback(cn, "unnamed"))
+		alert.Summary = fmt.Sprintf("%s was %s.", fallback(cn, "A certificate"), verb)
+		alert.Fields = []Field{
+			{Label: "Common name", Value: fallback(cn, "—")},
+			{Label: "Expires", Value: dateText(str(payload, "not_after"))},
+			{Label: "Gateway", Value: fallback(str(payload, "gateway"), "—")},
+		}
+
+	case events.TopicGatewayStatus:
+		name := str(payload, "name")
+		alert.Title = fmt.Sprintf("Gateway %s", fallback(str(payload, "status"), "status changed"))
+		alert.Summary = fmt.Sprintf("Gateway %s reported %s.",
+			fallback(name, "—"), fallback(str(payload, "status"), "a status change"))
+		alert.Fields = []Field{
+			{Label: "Gateway", Value: fallback(name, "—")},
+			{Label: "Status", Value: fallback(str(payload, "status"), "—")},
+			{Label: "Error", Value: fallback(str(payload, "error"), "—")},
+		}
+
+	default:
+		alert.Title = fmt.Sprintf("CertPilot event: %s", evt.Topic)
+		alert.Summary = fmt.Sprintf(
+			"An event of type %q was published. CertPilot has no specific wording for it yet, so the raw detail follows.",
+			evt.Topic)
+		alert.Fields = unknownFields(payload)
+	}
+
+	alert.Title = sanitizeHeaderValue(alert.Title)
+	alert.Fields = dropEmpty(alert.Fields)
+	return alert
+}
+
+// expirySentence states the consequence, not just the fact.
+//
+// "Corporate Issuing CA expires in 9 days" is a fact. An issuing CA expiring
+// invalidates every certificate it ever signed, and the person reading this at
+// 2am should not have to remember that.
+func expirySentence(name string, days float64, caType string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s expires in %s.", fallback(name, "A certificate authority"), daysText(days))
+
+	switch strings.ToUpper(caType) {
+	case "ISSUING", "INTERMEDIATE":
+		b.WriteString(" Every certificate it has issued stops validating when it does.")
+	case "ROOT":
+		b.WriteString(" Everything beneath it in the hierarchy stops validating when it does.")
+	}
+	return b.String()
+}
+
+// payloadMap normalises a payload to a map regardless of how it was published.
+//
+// In-process the broker carries the producer's original struct, but the same
+// event reaches an SSE client as JSON. Round-tripping means this code reads one
+// shape and cannot drift from what a webhook receiver sees.
+func payloadMap(payload any) map[string]any {
+	if payload == nil {
+		return map[string]any{}
+	}
+	if m, ok := payload.(map[string]any); ok {
+		return m
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func str(m map[string]any, key string) string {
+	switch v := m[key].(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case nil:
+		return ""
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
+func num(m map[string]any, key string) float64 {
+	switch v := m[key].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case json.Number:
+		f, _ := v.Float64()
+		return f
+	default:
+		// NaN rather than 0, so "the payload had no days_remaining" stays
+		// distinguishable from "it expires today". Rendering the second when
+		// the truth is the first would be a fabricated alert.
+		return math.NaN()
+	}
+}
+
+func isNumber(f float64) bool { return !math.IsNaN(f) }
+
+func daysText(days float64) string {
+	if !isNumber(days) {
+		return "unknown"
+	}
+	n := int(days)
+	switch {
+	case n < 0:
+		return fmt.Sprintf("expired %d days ago", -n)
+	case n == 0:
+		return "today"
+	case n == 1:
+		return "1 day"
+	default:
+		return fmt.Sprintf("%d days", n)
+	}
+}
+
+func countText(v float64) string {
+	if !isNumber(v) {
+		return "—"
+	}
+	return fmt.Sprintf("%d", int(v))
+}
+
+func thresholdText(payload map[string]any) string {
+	t := num(payload, "threshold")
+	if !isNumber(t) {
+		return "—"
+	}
+	return fmt.Sprintf("%d-day threshold", int(t))
+}
+
+// dateText renders an RFC 3339 timestamp as a date, or passes it through when it
+// is not one. Showing the raw value beats showing "—" for a field that clearly
+// held something.
+func dateText(value string) string {
+	if value == "" {
+		return "—"
+	}
+	ts, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return value
+	}
+	return ts.Format("2 January 2006")
+}
+
+func fallback(value, or string) string {
+	if strings.TrimSpace(value) == "" {
+		return or
+	}
+	return value
+}
+
+// unknownFields renders an unrecognised payload in a stable order, so the same
+// event does not produce differently ordered alerts on different runs.
+func unknownFields(payload map[string]any) []Field {
+	keys := make([]string, 0, len(payload))
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	fields := make([]Field, 0, len(keys))
+	for _, k := range keys {
+		fields = append(fields, Field{Label: k, Value: fmt.Sprint(payload[k])})
+	}
+	return fields
+}
+
+// dropEmpty removes fields whose value carries nothing.
+//
+// A wall of "Error: —" makes the fields that do hold something harder to find,
+// and an alert nobody reads carefully is an alert that fails at its one job.
+func dropEmpty(fields []Field) []Field {
+	kept := make([]Field, 0, len(fields))
+	for _, f := range fields {
+		v := strings.TrimSpace(f.Value)
+		if v == "" || v == "—" {
+			continue
+		}
+		f.Value = sanitizeHeaderValue(v)
+		kept = append(kept, f)
+	}
+	return kept
+}

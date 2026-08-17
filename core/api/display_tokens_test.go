@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/certpilot/certpilot/core/engine/discovery"
+	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
 	"github.com/certpilot/certpilot/core/engine/policy"
 	"github.com/certpilot/certpilot/core/engine/renewal"
@@ -34,6 +35,7 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 
 	st := store.NewMemoryStore()
 	broker := events.NewBroker()
+
 	keyring, err := secrets.NewEphemeralKeyring()
 	if err != nil {
 		t.Fatalf("keyring: %v", err)
@@ -54,6 +56,13 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 
 	pm := pluginmgr.NewManager(grpckit.TLSConfig{Insecure: true})
 
+	// A real dispatcher, not a nil one: the notification endpoints seal
+	// configuration through it and the test endpoint delivers through it, so a
+	// stub here would only prove the stub works.
+	dispatcher := notifications.NewDispatcher(st, keyring, broker,
+		notifications.WithChannelTTL(time.Millisecond),
+		notifications.WithSendTimeout(3*time.Second))
+
 	engine := gin.New()
 	SetupRouter(engine, RouterDeps{
 		Store:         st,
@@ -65,11 +74,13 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 		Scanner:       discovery.NewScanner(st),
 		Keyring:       keyring,
 		Broker:        broker,
+		Dispatcher:    dispatcher,
 		Auth:          auth,
 		Config:        cfg,
 	})
 
 	t.Cleanup(func() {
+		dispatcher.Stop()
 		broker.Stop()
 		pm.Close()
 		st.Close()

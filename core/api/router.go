@@ -2,6 +2,7 @@ package api
 
 import (
 	"github.com/certpilot/certpilot/core/engine/discovery"
+	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
 	"github.com/certpilot/certpilot/core/engine/policy"
 	"github.com/certpilot/certpilot/core/engine/renewal"
@@ -30,6 +31,7 @@ type RouterDeps struct {
 	Scanner       *discovery.Scanner
 	Keyring       *secrets.Keyring
 	Broker        *events.Broker
+	Dispatcher    *notifications.Dispatcher
 	Auth          *middleware.Authenticator
 	Config        *config.CoreConfig
 }
@@ -53,6 +55,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	policyHandler := NewPolicyHandler(deps.Store)
 	eventsHandler := NewEventsHandler(deps.Store, deps.Broker)
 	displayHandler := NewDisplayTokenHandler(deps.Store)
+	notifHandler := NewNotificationHandler(deps.Store, deps.Keyring, deps.Dispatcher)
 
 	v1 := engine.Group("/api/v1")
 	// Display tokens are resolved first, and only take effect when no
@@ -110,6 +113,19 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.GET("/display-tokens", middleware.RequireRole(middleware.RoleAdmin), displayHandler.List)
 		v1.POST("/display-tokens", middleware.RequireRole(middleware.RoleAdmin), displayHandler.Create)
 		v1.DELETE("/display-tokens/:id", middleware.RequireRole(middleware.RoleAdmin), displayHandler.Revoke)
+
+		// ── Notification channels ──
+		// Reading is open to any authenticated user: the list carries names,
+		// types, and thresholds, never the sealed credentials. Writing is
+		// operator, deletion admin — removing a channel silently stops alerts
+		// reaching whoever depended on it.
+		v1.GET("/notification-channels", notifHandler.List)
+		v1.POST("/notification-channels", middleware.RequireRole(middleware.RoleOperator), notifHandler.Create)
+		v1.PUT("/notification-channels/:id", middleware.RequireRole(middleware.RoleOperator), notifHandler.Update)
+		v1.DELETE("/notification-channels/:id", middleware.RequireRole(middleware.RoleAdmin), notifHandler.Delete)
+		// Sending a real alert to a real destination is an action, not a read,
+		// which is why it is a POST and gated at operator.
+		v1.POST("/notification-channels/:id/test", middleware.RequireRole(middleware.RoleOperator), notifHandler.Test)
 
 		// ── Policies ──
 		v1.GET("/policies", policyHandler.List)

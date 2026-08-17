@@ -144,6 +144,41 @@ export interface DashboardStats {
   total_scans: number
 }
 
+/**
+ * core/store/models.go — NotificationChannel.
+ *
+ * `config_encrypted` is deliberately absent: it carries `json:"-"` server-side
+ * because a Slack webhook URL and an SMTP password are bearer credentials. The
+ * config is write-only from a client's point of view.
+ */
+export interface NotificationChannel {
+  id: string
+  name: string
+  channel_type: 'slack' | 'webhook' | 'email'
+  is_enabled: boolean
+  severity_threshold: 'INFO' | 'WARNING' | 'CRITICAL'
+  /** Empty means every topic. */
+  topics: string[]
+  last_sent_at?: string
+  created_at: string
+  updated_at: string
+}
+
+/** GET /api/v1/notification-channels — core/api/notifications.go */
+export interface NotificationChannelList {
+  data: NotificationChannel[]
+  total: number
+  supported_types: string[]
+  topics: string[]
+}
+
+/** POST /api/v1/notification-channels/:id/test */
+export interface NotificationTestResult {
+  delivered: boolean
+  message?: string
+  error?: string
+}
+
 /** core/store/models.go — Policy */
 export interface Policy {
   id: string

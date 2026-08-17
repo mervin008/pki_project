@@ -77,7 +77,7 @@ is already being collected; almost none of it reaches a human unprompted.
 | 4 | Store filtering: audit log by action, CA filters, an index | ✅ |
 | 5 | Frontend event stream and connection indicator | ✅ |
 | 6 | CA health view, then fullscreen wall mode | ✅ |
-| 7 | Alert delivery: Slack, webhook, SMTP | |
+| 7 | Alert delivery: Slack, webhook, SMTP | ✅ |
 | 8 | Acknowledgement and ownership | |
 
 **Step 0** was a prerequisite rather than cleanup: the dashboard computed CA
@@ -135,16 +135,21 @@ bad row turned the hierarchy endpoint into a successful empty response for the
 whole estate — with the CAs in the loop absent from it entirely. A CA that
 quietly fails to render is the one nobody notices expiring.
 
+**Step 7** made alerts leave the building. Slack, a signed generic webhook, and
+email over SMTP, with the dispatcher subscribing to the broker rather than being
+called inline — so a wedged Slack webhook loses its own place in the queue and
+can never apply backpressure to the CA health sweep. Two rules shape it: a
+channel is validated when it is saved and can be tested on demand, because a
+channel that looks configured and silently drops everything is worse than none;
+and both outcomes are audited, because "we tried and Slack refused" and "we never
+tried" look identical from outside and only one means the configuration is wrong.
+
 The rest:
 
 - **Chain visualisation.** Each CA now states its position and lineage, and a
   malformed hierarchy is flagged rather than hidden. The tree itself — root →
   intermediate → issuing drawn as a tree, with health carried up it, because a
   healthy issuing CA under an expiring root is not healthy — is not drawn yet.
-- **Alerting that reaches people.** Slack, email over SMTP, and a signed generic
-  webhook. Today `notifications/dispatcher.go` can POST a webhook and nothing
-  calls it. An alert that only lands in an audit table is only marginally better
-  than a log line.
 - **Acknowledgement and ownership.** Who owns this CA, who was told, who
   silenced it and until when. Without this, an alerting dashboard becomes
   wallpaper within a month. The CA health view has deliberately left both

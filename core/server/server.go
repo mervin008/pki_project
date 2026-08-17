@@ -10,6 +10,7 @@ import (
 
 	"github.com/certpilot/certpilot/core/api"
 	"github.com/certpilot/certpilot/core/engine/discovery"
+	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
 	"github.com/certpilot/certpilot/core/engine/policy"
 	"github.com/certpilot/certpilot/core/engine/renewal"
@@ -29,6 +30,7 @@ type Server struct {
 	store        store.Store
 	pluginMgr    *pluginmgr.Manager
 	caMonitor    *pki.CAMonitor
+	dispatcher   *notifications.Dispatcher
 	broker       *events.Broker
 	renewalSched *renewal.Scheduler
 	cfg          *config.CoreConfig
@@ -109,6 +111,11 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	policyEng := policy.NewEngine(st)
 	scanner := discovery.NewScanner(st)
 
+	// The dispatcher is an ordinary broker subscriber. That is the point: it
+	// makes outbound HTTP and SMTP calls, and a wedged destination can only cost
+	// it its own place in the queue, never stall the CA health sweep.
+	dispatcher := notifications.NewDispatcher(st, keyring, broker)
+
 	// 5. Authentication.
 	authenticator, err := middleware.NewAuthenticator(ctx, cfg.Auth)
 	if err != nil {
@@ -132,6 +139,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		Scanner:       scanner,
 		Keyring:       keyring,
 		Broker:        broker,
+		Dispatcher:    dispatcher,
 		Auth:          authenticator,
 		Config:        cfg,
 	})
@@ -151,6 +159,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		store:        st,
 		pluginMgr:    pm,
 		caMonitor:    caMonitor,
+		dispatcher:   dispatcher,
 		broker:       broker,
 		renewalSched: renewalSched,
 		cfg:          cfg,
@@ -204,6 +213,10 @@ func (s *Server) Start() error {
 	}
 	s.caMonitor.Start(caInterval)
 
+	// After the producers, so nothing is published before there is anything
+	// subscribed to deliver it.
+	s.dispatcher.Start()
+
 	slog.Info("CertPilot Core HTTP API listening", "addr", s.httpServer.Addr, "mode", s.cfg.Server.Mode)
 	return s.httpServer.ListenAndServe()
 }
@@ -213,6 +226,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("shutting down CertPilot Core")
 	s.renewalSched.Stop()
 	s.caMonitor.Stop()
+	// After the producers and before the broker: it must stop being fed before
+	// it stops draining, and it writes audit records so it has to finish while
+	// the store is still open.
+	s.dispatcher.Stop()
 	// Before the HTTP shutdown, so in-flight event-stream handlers wake and
 	// return rather than holding the grace period open for its full duration.
 	s.broker.Stop()

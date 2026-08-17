@@ -95,7 +95,7 @@ explicitly.
 | Audit log | ⚠️ | Recorded, but the table is not yet tamper-evident |
 | Automated renewal | ⚠️ | Works; no retry, backoff, or distributed locking yet |
 | CA health monitoring | ⚠️ | Scheduled sweep, expiry thresholds, and CRL freshness are real; the OCSP check is not a real OCSP request |
-| CA expiry alerting | ⚠️ | Threshold crossings recorded to the audit log; no Slack/email/PagerDuty delivery yet |
+| CA expiry alerting | ✅ | Threshold crossings are delivered to Slack, a signed webhook, or email over SMTP, with per-channel severity and topic filters |
 | Live dashboard updates | ✅ | Server-Sent Events end to end. The client tracks data age independently, so a dead feed degrades the surface instead of freezing it on green |
 | CA health view | ✅ | Every CA by urgency: expiry countdown, chain position, CRL freshness, issuance volume. Owner and acknowledgement columns are not built yet |
 | Wall display mode | ✅ | `/display` — fullscreen, no chrome, readable across a room, authenticated by a kiosk token in the launch URL |
@@ -103,7 +103,7 @@ explicitly.
 | CA hierarchy tree | ⚠️ | Position and lineage are shown per CA and a malformed hierarchy is flagged; the tree is not drawn as a tree |
 | Policy engine | ⚠️ | `key_size`, `max_lifetime`, `ca_restriction`; other rule types are not implemented |
 | Discovery | ⚠️ | Single `host:port` scan only. No CIDR, CT logs, or cloud inventory |
-| Notifications | ⚠️ | Generic webhook only. No Slack, Teams, email, or PagerDuty |
+| Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ❌ | Not started |
 | Host agent | ❌ | Not started |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
@@ -161,6 +161,38 @@ history, `Referer` headers, and any photograph of the window.
 Revoke it with `DELETE /api/v1/display-tokens/<id>` when the screen is
 decommissioned — the display will show a "not authorised" panel rather than
 continuing to render whatever it last saw.
+
+### Getting alerts out
+
+Threshold crossings reach Slack, a signed webhook, or email. Configure a channel
+under Settings, or over the API:
+
+```bash
+curl -X POST localhost:8080/api/v1/notification-channels \
+  -H 'Content-Type: application/json' -d '{
+  "name": "pki-oncall",
+  "channel_type": "slack",
+  "severity_threshold": "WARNING",
+  "config": {"webhook_url": "https://hooks.slack.com/services/..."}
+}'
+```
+
+Then **test it**, because a channel nobody has ever sent through is a promise
+rather than a capability:
+
+```bash
+curl -X POST localhost:8080/api/v1/notification-channels/<id>/test
+```
+
+That sends once, does not retry, and returns the destination's own complaint
+verbatim — `invalid_token` tells you what to fix, "delivery failed" does not.
+
+Each channel carries a minimum severity and an optional topic filter, so a
+CRITICAL CA expiry can page while routine renewals stay quiet. Both outcomes are
+audited: `notification.sent` and `notification.failed` are queryable through
+`/api/v1/dashboard/activity?action=notification.failed`, because "we tried and
+Slack refused" and "we never tried" look identical from outside and only one of
+them means the configuration is wrong.
 
 ### Persisting to a database
 
@@ -276,6 +308,20 @@ clients, which cannot set headers; CertPilot's own frontend streams over `fetch`
 and so uses the header, which stays out of access logs and `Referer`. A real
 session always takes precedence — a display token left in a bookmark cannot mask
 an operator's identity in the audit log.
+
+**Notification channels.** A Slack webhook URL and an SMTP password are bearer
+credentials, so a channel's configuration is sealed with the keyring before it is
+stored and is never returned by any endpoint — not in the create response, not in
+the list. It is write-only from a client's point of view, which is why editing a
+channel without re-sending `config` keeps what is stored rather than requiring an
+operator to re-type a secret they cannot read back.
+
+Generic webhooks are signed with HMAC-SHA256 when a signing secret is set. The
+signature covers `<unix-seconds>.<raw body>` and travels in
+`X-CertPilot-Signature` alongside `X-CertPilot-Timestamp`. The timestamp is
+*inside* the signed string rather than merely beside it: signing the body alone
+produces a signature that never expires, so one captured delivery could be
+replayed forever and the receiver would have no way to tell.
 
 **Production mode** refuses anonymous access, an insecure gateway channel, and a
 wildcard CORS origin. These are the settings that look harmless locally and

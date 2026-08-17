@@ -6,6 +6,7 @@ import { useAsyncData } from '@/composables/useAsyncData'
 import { useAuthStore } from '@/stores/auth'
 import { useThemeStore } from '@/stores/theme'
 import DataState from '@/components/common/DataState.vue'
+import NotificationChannels from '@/components/settings/NotificationChannels.vue'
 import {
   Server, Cpu, ShieldCheck, CircleCheck, CircleX, RotateCw, Palette, UserCog,
 } from 'lucide-vue-next'
@@ -154,6 +155,9 @@ function refreshAll() {
           </div>
         </div>
       </section>
+
+      <!-- Alert delivery -->
+      <NotificationChannels />
 
       <!-- Preferences -->
       <section class="card bg-base-100 border border-base-300">

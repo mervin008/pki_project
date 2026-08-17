@@ -32,6 +32,27 @@ const (
 	TopicGatewayStatus = "gateway.status"
 )
 
+// AllTopics lists every topic a producer publishes.
+//
+// Exists so the notification API can validate a channel's topic filter against
+// something real. A typo'd topic would otherwise be accepted and produce a
+// channel that matches nothing: configured on the dashboard, silent in practice,
+// which is the failure alerting exists to prevent rather than introduce.
+//
+// Returns a copy — a caller sorting or appending to the package's own slice
+// would change what every later caller sees.
+func AllTopics() []string {
+	return []string{
+		TopicCAHealth,
+		TopicCAExpiryAlert,
+		TopicCertIssued,
+		TopicCertRenewed,
+		TopicCertRenewFail,
+		TopicCertExpiring,
+		TopicGatewayStatus,
+	}
+}
+
 // Severity levels, matching the vocabulary used by the CA monitor and the
 // frontend's severity module.
 const (
