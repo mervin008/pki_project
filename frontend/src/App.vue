@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useThemeStore } from '@/stores/theme'
 import { useCasStore } from '@/stores/cas'
@@ -41,10 +42,18 @@ watch(() => themeStore.currentTheme, applyDataTheme)
 // a small chip in the toolbar cannot do. The banner explains it; this makes it
 // impossible to read the screen as normal.
 const surfaceIsStale = computed(() => stream.status.value === 'stale')
+
+// Wall mode renders bare: no sidebar, no toolbar, no banner. It supplies its own
+// far louder degraded state, sized to be read from across a room — the ordinary
+// chrome would only shrink the thing the screen exists to show.
+const route = useRoute()
+const showChrome = computed(() => route.meta.chrome !== false)
 </script>
 
 <template>
-  <div class="flex min-h-screen bg-base-200">
+  <router-view v-if="!showChrome" />
+
+  <div v-else class="flex min-h-screen bg-base-200">
     <Sidebar />
     <div class="flex-1 flex flex-col min-w-0">
       <TopBar />

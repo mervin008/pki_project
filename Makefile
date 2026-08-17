@@ -105,11 +105,14 @@ test-race:
 		(cd $$m && $(GO) test ./... -race) || exit 1; \
 	done
 
-## Typecheck the frontend and check the hand-rolled SSE parser.
-## Needs Node 22.18+ — the check imports TypeScript directly, using Node's own
+## Typecheck the frontend and run its checks.
+## Needs Node 22.18+ — the checks import TypeScript directly, using Node's own
 ## type stripping rather than adding a test runner to the dependency tree.
 test-frontend:
-	cd frontend && npx vue-tsc --noEmit && node scripts/check-sse.mjs
+	cd frontend && npx vue-tsc --noEmit \
+		&& node scripts/check-sse.mjs \
+		&& node scripts/check-chain.mjs \
+		&& node scripts/check-display-token.mjs
 
 test-coverage:
 	@for m in $(MODULES); do \

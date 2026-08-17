@@ -1,4 +1,5 @@
 import { supabase } from '@/lib/supabase'
+import { displayTokenHeaders } from '@/lib/displayToken'
 
 export function useApi() {
   async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
@@ -18,6 +19,11 @@ export function useApi() {
         headers['Authorization'] = `Bearer ${session.access_token}`
       }
     }
+
+    // A wall display has no session. It authenticates with a kiosk token, which
+    // must reach every REST call and not only the event stream — a screen whose
+    // feed connects while each panel returns 401 is the worst of both.
+    Object.assign(headers, displayTokenHeaders(headers['Authorization'] !== undefined))
 
     const response = await fetch(endpoint, {
       ...options,

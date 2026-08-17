@@ -1,6 +1,7 @@
 import { computed, readonly, ref, type ComputedRef, type Ref } from 'vue'
 import { supabase } from '@/lib/supabase'
 import { createSseParser } from '@/lib/sse'
+import { displayTokenHeaders } from '@/lib/displayToken'
 import type { StreamEvent, StreamSnapshot } from '@/lib/types'
 
 /**
@@ -176,10 +177,10 @@ function createEventStream(): EventStream {
   /**
    * Headers for the stream request.
    *
-   * Kiosk display tokens will slot in here — they are the other way to
-   * authenticate a screen — but only once useApi carries them too. Supporting
-   * them on the stream alone would produce a wall display whose live feed works
-   * and whose REST panels all return 401.
+   * Two ways to authenticate: an operator's bearer token, or the kiosk display
+   * token a wall screen is launched with. `displayTokenHeaders` mirrors the
+   * server's precedence — a real session always wins, so a display token left in
+   * a bookmark cannot mask an operator's identity.
    */
   async function authHeaders(): Promise<Record<string, string>> {
     const headers: Record<string, string> = { Accept: 'text/event-stream' }
@@ -192,6 +193,8 @@ function createEventStream(): EventStream {
         headers.Authorization = `Bearer ${session.access_token}`
       }
     }
+
+    Object.assign(headers, displayTokenHeaders(headers.Authorization !== undefined))
 
     // Resume from where we left off. The core replays from its history when it
     // can, and sends a fresh snapshot when the gap is too wide — it never
