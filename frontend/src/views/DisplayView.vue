@@ -78,16 +78,27 @@ const connecting = computed(
 /**
  * A screen that cannot authenticate has to say so plainly, or it sits there
  * showing "connecting" forever while nobody realises the token was revoked.
+ *
+ * Deliberately not conditioned on whether data was ever loaded. Revoking a
+ * token while a screen is running is the normal case — that is what revocation
+ * is *for* — and the open stream survives it until the connection next drops, so
+ * a display can be hours into its last-known-good figures before the rejection
+ * appears. Falling back to the generic "not receiving updates" band there would
+ * be true but useless: it points at the network, when the fix is administrative.
+ *
+ * Taking over the screen loses the last-known figures, which is correct. A
+ * revoked display cannot be trusted to be showing anything current, and saying
+ * why is worth more than the stale numbers it would otherwise keep.
  */
 const unauthorised = computed(() => {
+  if (stream.status.value === 'live') return false
   const message = `${stream.lastError.value ?? ''} ${cas.error ?? ''}`.toLowerCase()
   return (
-    !cas.loaded &&
-    (message.includes('sign in') ||
-      message.includes('display token') ||
-      message.includes('not permitted') ||
-      message.includes('unauthorized') ||
-      message.includes('unauthorised'))
+    message.includes('sign in') ||
+    message.includes('display token') ||
+    message.includes('not permitted') ||
+    message.includes('unauthorized') ||
+    message.includes('unauthorised')
   )
 })
 
@@ -134,9 +145,12 @@ function remaining(days: number): string {
 <template>
   <div class="h-screen w-screen flex flex-col bg-base-200 overflow-hidden select-none">
     <!-- Alarm band. Occupies the top of the screen so a dead feed is the first
-         thing seen, ahead of any figure it would otherwise be trusted for. -->
+         thing seen, ahead of any figure it would otherwise be trusted for.
+         Suppressed when the reason is a rejected credential: the panel below
+         says the same thing more precisely, and two alarms for one fault make
+         the screen harder to read, not more urgent. -->
     <div
-      v-if="stale"
+      v-if="stale && !unauthorised"
       role="alert"
       class="wall-alarm bg-error text-error-content px-8 py-4 flex items-center gap-5 shrink-0"
     >
@@ -190,7 +204,14 @@ function remaining(days: number): string {
 
     <!-- Body. Greys out wholesale when the feed is stale: every figure in it is
          then last-known-good, and it must not look like a live readout. -->
-    <div class="flex-1 min-h-0 px-8 pb-6 flex flex-col gap-5" :class="{ 'surface-stale': stale }">
+    <!-- Greyed out while stale, since every figure in it is then last-known-good.
+         Not greyed when unauthorised: what it holds then is the explanation, and
+         draining the colour out of the one readable thing on the screen would be
+         the opposite of the point. -->
+    <div
+      class="flex-1 min-h-0 px-8 pb-6 flex flex-col gap-5"
+      :class="{ 'surface-stale': stale && !unauthorised }"
+    >
       <!-- Not authorised -->
       <div v-if="unauthorised" class="flex-1 flex items-center justify-center">
         <div class="text-center max-w-2xl">

@@ -75,8 +75,8 @@ is already being collected; almost none of it reaches a human unprompted.
 | 2 | `GET /api/v1/events` — Server-Sent Events | ✅ |
 | 3 | Kiosk display tokens | ✅ |
 | 4 | Store filtering: audit log by action, CA filters, an index | ✅ |
-| 5 | Frontend event stream and connection indicator | |
-| 6 | CA health view, then fullscreen wall mode | |
+| 5 | Frontend event stream and connection indicator | ✅ |
+| 6 | CA health view, then fullscreen wall mode | ✅ |
 | 7 | Alert delivery: Slack, webhook, SMTP | |
 | 8 | Acknowledgement and ownership | |
 
@@ -108,24 +108,49 @@ what it was handed:
 - The in-memory store returned live pointers into its own maps, making the
   health sweep and the event stream race over the same records.
 
+**Step 5** connected the UI to the stream. It is built on `fetch` rather than
+`EventSource`, which cannot set headers and so cannot carry a bearer token, and
+whose reconnect cannot be controlled beyond the server's `retry:` directive. The
+load-bearing part is not the transport but the watchdog: a half-open TCP
+connection raises no error and a browser will sit on a dead socket for minutes,
+so staleness is judged on **data age**, not socket state. Thirty-five seconds
+without a byte and the surface degrades — a chip for whoever is at the keyboard,
+a banner naming the last confirmed time, and the colour draining out of the
+content for whoever is across the room.
+
+**Step 6** turned that into the two views a PKI team actually watches: a CA
+health list sorted by urgency with days-remaining as the largest thing on each
+row, and `/display`, a fullscreen wall mode that authenticates from a kiosk
+token in its launch URL. Nothing needing attention is ever below the fold —
+rows that do not fit are counted in the footer rather than silently truncated —
+and an empty estate says it is empty rather than showing a calm green screen.
+
+Building chain position first required fixing `ChainResolver`, which had two
+defects of the kind that never announce themselves. It assigned depth while
+ranging over its input, so a grandchild seen before its parent reported the
+wrong depth, and since the input came from a map, identical data gave different
+answers on different requests. Worse, a loop in `parent_ca_id` produced a
+structure `json.Marshal` refuses to encode *after* Gin had sent the 200, so one
+bad row turned the hierarchy endpoint into a successful empty response for the
+whole estate — with the CAs in the loop absent from it entirely. A CA that
+quietly fails to render is the one nobody notices expiring.
+
 The rest:
 
-- **A frontend that consumes the stream.** The core streams; nothing in
-  `frontend/src` opens an `EventSource` yet. Connection state has to be a
-  first-class UI element, because a dashboard that stops updating must look
-  broken rather than healthy — a frozen screen showing green is worse than no
-  screen at all.
-- **CA health view.** Every CA, its expiry countdown, chain position, CRL
-  freshness, and issuance volume — sorted by urgency, readable across a room.
-- **Chain visualisation.** Root → intermediate → issuing, with health carried up
-  the tree, because a healthy issuing CA under an expiring root is not healthy.
+- **Chain visualisation.** Each CA now states its position and lineage, and a
+  malformed hierarchy is flagged rather than hidden. The tree itself — root →
+  intermediate → issuing drawn as a tree, with health carried up it, because a
+  healthy issuing CA under an expiring root is not healthy — is not drawn yet.
 - **Alerting that reaches people.** Slack, email over SMTP, and a signed generic
   webhook. Today `notifications/dispatcher.go` can POST a webhook and nothing
   calls it. An alert that only lands in an audit table is only marginally better
   than a log line.
 - **Acknowledgement and ownership.** Who owns this CA, who was told, who
   silenced it and until when. Without this, an alerting dashboard becomes
-  wallpaper within a month.
+  wallpaper within a month. The CA health view has deliberately left both
+  columns out rather than filling them with placeholders: `last_alert_threshold`
+  records what CertPilot *sent*, not what anyone *saw*, and labelling it
+  "acknowledged" would misreport the one thing the view exists for.
 - **Expiry timeline.** What breaks in the next 7 / 30 / 90 days, grouped by team
   and environment.
 
@@ -207,6 +232,12 @@ Tracked honestly rather than quietly:
   Supabase dependency; the schema is the only coupling
 - Policy is evaluated on issuance only, not renewal; `key_type`, `naming`, and
   `approval_required` rule types are accepted by the schema but not implemented
+- `PostgresStore` is verified by hand end to end but has no automated tests; the
+  suite runs against the in-memory implementation, which cannot express the
+  defects the manual run turned up. A container-backed suite is the fix
+- After a long outage the stream's backoff is capped at 30 seconds, so a display
+  can take that long to notice the core is back. Deliberate — the alternative is
+  a floor of wall displays stampeding a core the instant it restarts
 
 ## Deliberately out of scope
 

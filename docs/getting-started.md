@@ -63,8 +63,13 @@ make run-core                 # :8080
 ```
 
 ```bash
-make run-frontend             # :5173
+make run-frontend             # :3000
 ```
+
+The dashboard is at `http://localhost:3000`. `/ca-health` lists every CA by
+urgency, and `/display` is the fullscreen wall view — locally it works without a
+credential, because the core accepts anonymous requests on loopback in
+development mode. On a real deployment it needs a display token; see the README.
 
 Confirm the gateway registered over mTLS:
 

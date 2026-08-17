@@ -11,8 +11,15 @@ reporting.
 The dashboard is the point. A central PKI team runs a wall display: CA health
 and expiry countdowns have to be visible without anyone asking. An expiring
 issuing CA is the failure that takes down everything it ever signed, so the
-health sweep runs on a timer and threshold crossings are recorded where a human
-will see them.
+health sweep runs on a timer, changes are pushed to the browser as they happen,
+and there is a fullscreen mode built for a screen nobody is sitting at.
+
+One rule drives that whole surface: **a dashboard that stops updating must look
+broken, not healthy.** A frozen screen showing green manufactures exactly the
+false confidence this tool exists to prevent, so connection state is a
+first-class element of the UI, the client judges freshness by data age rather
+than by whether a socket has errored, and a dead feed visibly degrades the
+page instead of leaving the last good numbers on it.
 
 > **Status: early development.** The core, the gateway plugin architecture, and
 > the ACME and self-signed gateways work end to end. Deployment to servers, the
@@ -89,8 +96,11 @@ explicitly.
 | Automated renewal | ⚠️ | Works; no retry, backoff, or distributed locking yet |
 | CA health monitoring | ⚠️ | Scheduled sweep, expiry thresholds, and CRL freshness are real; the OCSP check is not a real OCSP request |
 | CA expiry alerting | ⚠️ | Threshold crossings recorded to the audit log; no Slack/email/PagerDuty delivery yet |
-| Live dashboard updates | ⚠️ | The core streams over Server-Sent Events; the Vue frontend does not consume it yet |
+| Live dashboard updates | ✅ | Server-Sent Events end to end. The client tracks data age independently, so a dead feed degrades the surface instead of freezing it on green |
+| CA health view | ✅ | Every CA by urgency: expiry countdown, chain position, CRL freshness, issuance volume. Owner and acknowledgement columns are not built yet |
+| Wall display mode | ✅ | `/display` — fullscreen, no chrome, readable across a room, authenticated by a kiosk token in the launch URL |
 | Kiosk display tokens | ✅ | Read-only, viewer-scoped, expiring, revocable credentials for a wall display |
+| CA hierarchy tree | ⚠️ | Position and lineage are shown per CA and a malformed hierarchy is flagged; the tree is not drawn as a tree |
 | Policy engine | ⚠️ | `key_size`, `max_lifetime`, `ca_restriction`; other rule types are not implemented |
 | Discovery | ⚠️ | Single `host:port` scan only. No CIDR, CT logs, or cloud inventory |
 | Notifications | ⚠️ | Generic webhook only. No Slack, Teams, email, or PagerDuty |
@@ -127,7 +137,30 @@ make run-core
 make run-frontend
 ```
 
-The API is on `:8080`, the frontend on `:5173`.
+The API is on `:8080`, the frontend on `:3000`.
+
+Three pages are worth opening first: `/` for the dashboard, `/ca-health` for
+every CA sorted by urgency, and `/display` for the fullscreen wall view.
+
+### Putting it on a wall
+
+`/display` is meant to run unattended on a screen nobody is sitting at, so it
+authenticates with its own credential rather than a logged-in session:
+
+```bash
+curl -X POST localhost:8080/api/v1/display-tokens \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "ops-corridor", "expires_in_days": 90}'
+```
+
+The raw token is returned once and never again. Launch the screen at
+`http://<host>:3000/display?display_token=cpd_...`; the browser moves it into
+session storage and strips it from the address bar, since a query string reaches
+history, `Referer` headers, and any photograph of the window.
+
+Revoke it with `DELETE /api/v1/display-tokens/<id>` when the screen is
+decommissioned — the display will show a "not authorised" panel rather than
+continuing to render whatever it last saw.
 
 ### Persisting to a database
 
@@ -227,16 +260,22 @@ read only from `app_metadata`, never `user_metadata`, which the user can write.
 Accepted signing algorithms are pinned. An invalid token is always rejected;
 there is no development fallback that grants admin.
 
-**Display tokens.** A wall display cannot use the bearer flow — `EventSource`
-cannot set headers — and the obvious workaround, leaving an operator session
-logged in on a machine in a corridor, hands that machine the authority to issue,
-revoke, and export private keys. A display token is a separate credential that
-carries none of it. The role it grants is the constant `viewer`; anything but a
-`GET` is refused on every route; private-key export, token enumeration, and the
-actor-attributed activity feed are refused by path, independently of the role
-gates those routes already carry. Tokens expire, are revocable, and record where
-and when they were last used. Only a SHA-256 is stored, so the raw value exists
-in exactly one response and nowhere else.
+**Display tokens.** The obvious way to get a dashboard onto a corridor screen —
+leave an operator session logged in on the machine — hands that machine the
+authority to issue, revoke, and export private keys. A display token is a
+separate credential that carries none of it. The role it grants is the constant
+`viewer`; anything but a `GET` is refused on every route; private-key export,
+token enumeration, and the actor-attributed activity feed are refused by path,
+independently of the role gates those routes already carry. Tokens expire, are
+revocable, and record where and when they were last used. Only a SHA-256 is
+stored, so the raw value exists in exactly one response and nowhere else.
+
+The server accepts the token in an `X-Display-Token` header or a
+`display_token` query parameter. The query parameter exists for `EventSource`
+clients, which cannot set headers; CertPilot's own frontend streams over `fetch`
+and so uses the header, which stays out of access logs and `Referer`. A real
+session always takes precedence — a display token left in a bookmark cannot mask
+an operator's identity in the audit log.
 
 **Production mode** refuses anonymous access, an insecure gateway channel, and a
 wildcard CORS origin. These are the settings that look harmless locally and
@@ -276,6 +315,13 @@ travel to production unnoticed.
   including `viewer`. Kiosk display tokens are refused it outright, since audit
   entries carry actor identity and a corridor screen should not name who deleted
   what — but a signed-in viewer is a person, and is not restricted.
+- Nobody owns a CA yet. `owner_team` and `owner_email` are not on
+  `ca_authorities`, and there is no acknowledgement record, so the CA health view
+  cannot say who to call or whether anyone has already looked. Both are the next
+  schema change; the view leaves the columns out rather than showing placeholders.
+- After the core has been down for a while, a wall display can take up to 30
+  seconds to notice it is back — the reconnect backoff is capped there so a floor
+  of displays does not stampede a core the instant it restarts.
 
 ## Post-quantum
 
@@ -312,16 +358,23 @@ revoke, status, CA info, capabilities, health, and config validation. See
 ## Development
 
 ```bash
-make test        # all modules
-make test-race   # under the race detector
-make lint        # go vet and gofmt
-make proto       # regenerate protobuf code
-make help        # everything else
+make test           # all modules
+make test-race      # under the race detector
+make test-frontend  # typecheck the UI and run its checks
+make lint           # go vet and gofmt
+make proto          # regenerate protobuf code
+make help           # everything else
 ```
 
 The repository is a Go workspace of four modules: `pkg` (shared), `core`, and
 one per gateway. Tooling iterates over them, since a single `./...` from the
 root does not cover a workspace.
+
+The frontend has no test runner and deliberately needs none: Node strips
+TypeScript types natively from v22.18, so `frontend/scripts/check-*.mjs` import
+the modules under test directly, with no build step and nothing to install. They
+cover the three pieces that are hand-rolled and fail silently when wrong — SSE
+frame parsing, CA chain resolution, and the display-token client.
 
 ## Tech stack
 
@@ -336,9 +389,10 @@ root does not cover a workspace.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). The next milestone is a monitoring surface a team
-can leave on a screen: live updates, a CA health wall view, chain visualisation,
-and alerting that actually reaches people.
+See [ROADMAP.md](ROADMAP.md). The monitoring surface is now live end to end — a
+streaming dashboard, a CA health view, and a wall display. What remains of that
+milestone is alerting that actually reaches people (Slack, SMTP, signed
+webhooks) and knowing who owns each CA and whether anyone has acknowledged it.
 
 ## License
 

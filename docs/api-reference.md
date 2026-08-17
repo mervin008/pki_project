@@ -19,19 +19,30 @@ mode on a loopback address. Presenting a broken token is still a 401.
 
 ### Authenticating an unattended screen
 
-A wall-mounted dashboard cannot use the bearer flow: a browser's `EventSource`
-has no way to set headers. A display token is a separate credential for exactly
-that case.
+A screen in a corridor has nobody to sign in at it, and leaving an operator
+session logged in there would hand it the authority to issue, revoke, and export
+private keys. A display token is a separate credential for exactly that case.
 
 ```
 X-Display-Token: cpd_<43 characters>
 ```
 
-or, for `EventSource`, in the query string:
+or, for clients that cannot set headers — `EventSource` is the one that matters
+— in the query string:
 
 ```
 GET /api/v1/events?display_token=cpd_...
 ```
+
+Prefer the header. A query string reaches access logs, `Referer` headers, and
+browser history; `RequestLogger` redacts this parameter for that reason, and
+CertPilot's own frontend streams over `fetch` so that it can use the header.
+
+A request carrying an `Authorization` header is never resolved as a display
+token, whatever else it presents. That precedence is what stops a token left in
+a bookmark from quietly masking an operator's identity in the audit log — and it
+means an invalid bearer token fails as an invalid bearer token rather than being
+rescued by a display token in the URL.
 
 It is **not** a second way to authenticate as a user. The middleware that
 resolves it enforces three things centrally, so no individual route has to
@@ -294,6 +305,45 @@ dashboard refresh.
 > The CRL freshness check is real. The OCSP check currently issues a plain GET
 > rather than an RFC 6960 request and reports a responder as healthy when it
 > should not — see the README's known gaps.
+
+### The hierarchy
+
+`GET /pki/tree` returns roots with their children attached recursively. Each
+node carries the authority, its `children`, and its `depth` — issuing steps from
+the root of its own chain, so a root is `0`.
+
+```json
+{
+  "authority": { "id": "...", "name": "Corporate Root", "...": "..." },
+  "depth": 0,
+  "children": [
+    { "authority": { "name": "Corporate Intermediate" }, "depth": 1, "children": [] }
+  ]
+}
+```
+
+Three guarantees, because the interesting cases here are malformed hierarchies
+rather than well-formed ones:
+
+- **Every registered CA appears exactly once**, including ones whose parentage is
+  wrong. A CA missing from a monitoring view is the one nobody notices expiring.
+- **The response is always acyclic and always serialisable.** A CA naming itself,
+  or a ring of CAs naming each other, is broken out to the top level rather than
+  reproduced as a loop.
+- **The order is stable.** Siblings sort by name, then id, so the tree does not
+  reshuffle itself between identical requests.
+
+A CA that could not be placed under a real root is returned at the top level with
+`"detached": true` and a `detached_reason` naming the problem:
+
+| Reason | Meaning |
+|:---|:---|
+| `its issuing CA is not registered in CertPilot` | Ordinary — a root held offline, or an intermediate imported on its own |
+| `this CA is recorded as its own issuer` | Bad data. `parent_ca_id` points at the CA itself |
+| `its issuer chain forms a loop, so it has no root` | Bad data. Two or more CAs name each other |
+
+The last two are also logged at `WARN` by the core, since they mean the recorded
+hierarchy is wrong rather than merely incomplete.
 
 ## CA accounts and gateways
 

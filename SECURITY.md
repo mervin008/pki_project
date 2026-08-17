@@ -82,6 +82,45 @@ symmetric key that can forge admin tokens.
 It is refused unless the server is in development mode bound to a loopback
 address. A malformed token is still a 401 even when it is enabled.
 
+### Display tokens
+
+A dashboard on a wall has nobody to sign in at it. The obvious workaround —
+leaving an operator session logged in on that machine — gives an unattended
+screen in a corridor the authority to issue certificates, revoke them, and
+export private keys. A display token is a separate credential that carries none
+of that.
+
+The constraints are enforced in one middleware rather than per route, because a
+rule that has to be remembered at every call site is one that will eventually be
+forgotten at one:
+
+- **The role is the constant `viewer`.** Not configurable, not derived from any
+  input, and not raisable by anything the request contains
+- **`GET` only.** Any other method is refused on every route, before the route's
+  own gate is consulted
+- **Refused by path** regardless of role: `/certificates/:id/private-key`,
+  `/display-tokens` (so one leaked screen cannot enumerate the others), and
+  `/dashboard/activity` (audit entries name who did what, which does not belong
+  on a screen in a corridor)
+- **An invalid token aborts**, and never falls through to the next
+  authenticator. With `allow_anonymous` enabled for local evaluation, falling
+  through would hand a rejected token an admin identity
+- **A real session always wins.** A request carrying an `Authorization` header is
+  never resolved as a display token, so one left in a bookmark cannot mask an
+  operator's identity in the audit log
+
+256 bits of CSPRNG output behind a `cpd_` prefix, so secret scanners can match
+it. Only a SHA-256 is stored: the raw value exists in the creation response and
+nowhere else, and is compared in constant time. Tokens carry an expiry, are
+revocable, and record `last_seen_at` and `last_seen_ip` so a leaked one is
+visible in use. Creation and revocation are admin-only and audited.
+
+Presented as an `X-Display-Token` header, or a `display_token` query parameter
+for clients that cannot set headers. The header is preferred and is what the
+CertPilot frontend uses; `RequestLogger` redacts the query parameter, but a
+query string still reaches proxy logs and browser history in ways a header does
+not.
+
 ### Authorization
 
 Roles come from `app_metadata.certpilot_role` in the token, and only from there.
@@ -137,7 +176,8 @@ Stated here rather than discovered later.
 | OCSP check is not a real OCSP request | A plain GET, so a responder returning 400 is scored healthy. RFC 6960 requires a POST with a DER-encoded request |
 | Policy evaluated on issuance only | Renewals bypass policy entirely |
 | Several policy rule types unimplemented | `key_type`, `naming`, and `approval_required` are accepted by the schema and silently do nothing |
-| No rate limiting on the HTTP API | No protection against brute force or resource exhaustion |
+| No rate limiting on the HTTP API | No protection against brute force or resource exhaustion. Display tokens are not throttled either — guessing 256 bits is not the concern, but a stolen token being used heavily is, and only revocation stops it |
+| Client IPs are not verified | Trusted proxies are unconfigured, so `X-Forwarded-For` is taken from whoever sends it. Audit entries and display-token `last_seen_ip` are hints, not evidence |
 | ACME account keys stored unencrypted on disk | Mode 0600 in the gateway state directory, not sealed with the KEK |
 | No secret zeroization guarantees | Go's garbage collector may retain copies of plaintext keys in memory |
 
@@ -154,6 +194,10 @@ Stated here rather than discovered later.
 8. Grant `admin` sparingly — it is the only role that can export private keys
 9. Ship audit logs to external storage, since the table is not yet tamper-evident
 10. Run the core behind a reverse proxy that terminates TLS and rate-limits
+11. Give each wall display its own display token with a real expiry, and revoke
+    it when the screen is decommissioned. One token shared across screens cannot
+    be revoked without going dark everywhere, and `last_seen_ip` stops telling
+    you which screen is calling
 
 ## Cryptography
 
