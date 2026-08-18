@@ -178,7 +178,7 @@ The rest:
 | 1 | Scans that persist, and the verdict that matters | ✅ |
 | 2 | CIDR expansion, worker pool, cancellation, progress on the stream | ✅ |
 | 3 | Scheduled scans and re-scan reconciliation | ✅ |
-| 4 | CT log monitoring | |
+| 4 | CT log monitoring | ✅ |
 | 5 | Cloud inventory: ACM, Azure Key Vault, GCP, Kubernetes secrets | |
 
 One sentence governs the phase:
@@ -306,9 +306,54 @@ change alert is composed from the parts that happened: the first version said
 certificates outside this system", which asserts a claim about zero things and
 then draws a conclusion from it.
 
-**Still open in this phase:** two replicas both run every schedule. Leader
-election over Postgres advisory locks arrives with the renewal engine in phase
-4, which has the same gap.
+**Step 4** added the half of discovery that a network scan cannot reach. A scan
+answers "what is being served on the addresses I told you about". Certificate
+Transparency answers a larger question — **what has been issued in your name at
+all**, by any CA, to anyone, whether or not it was ever deployed and whether or
+not the machine is reachable from here. A developer who obtained a certificate
+for `api.corp.example.com` with a personal ACME account appears in no scan of
+any range, and appears in CT within minutes, because every publicly-trusted CA
+is required to log there.
+
+One rule governs it, and it is the same rule as the dashboard's:
+
+> **A check that could not run must not look like a check that found nothing.**
+
+So a monitor carries two timestamps, not one: when a check was last *attempted*,
+and when one last *answered*. Collapsed into a single "last checked", a monitor
+unable to reach the log for a week reads exactly like one that has found nothing
+for a week — and only one of those means nobody is being told about certificates
+issued in their name. The list surfaces stale domains, and an on-demand check
+answers 502 with the index's own words rather than an empty list.
+
+That rule was exercised immediately: crt.sh returned 502s through most of the
+live verification. The failure path is therefore the better-tested one, which is
+not the worst outcome for a feature whose dependency is a free community service.
+
+Two defects came out of running it against real data rather than fixtures.
+
+A precertificate and its final certificate are logged separately and share a
+serial, and the index publishes no field saying which is which — so a live check
+of `badssl.com` reported **18** certificates where there are **9**. A headline
+number wrong by a factor of two is one people act on. Entries are now labelled
+by the one reliable signal (the precertificate is logged first, so it carries
+the lower entry id), both rows are kept because "pre-logged, then issued" is
+real information, and every count is per certificate.
+
+And the synchronous check outlived the HTTP server's 30-second write timeout, so
+the response was cut off mid-write and the caller got an empty body — which
+reads as "nothing happened", the one conclusion that must never be reachable by
+accident. The on-demand path is now bounded under it; the background poller
+keeps its longer budget, because nobody is waiting on it.
+
+Findings are matched to inventory on serial number, since the log index does not
+publish a fingerprint. Both sides normalise first: CertPilot stores unpadded
+lowercase hex and indexes pad and upper-case them, and a mismatch there would
+report this system's own certificates as ones nobody manages.
+
+**Still open in this phase:** two replicas both run every schedule and every CT
+monitor. Leader election over Postgres advisory locks arrives with the renewal
+engine in phase 4, which has the same gap.
 
 ### Phase 4 — A renewal engine that survives 47-day certificates
 

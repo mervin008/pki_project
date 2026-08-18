@@ -336,6 +336,66 @@ export interface DiscoveryScanResponse {
   poll?: string
 }
 
+/**
+ * core/store/models.go — CTMonitor.
+ *
+ * Note the two timestamps. `last_checked_at` is when a check was last
+ * attempted, `last_success_at` when one last answered. A UI that shows only the
+ * first lets a monitor that cannot reach the log read exactly like one that is
+ * finding nothing — and only one of those means nobody is being told about
+ * certificates issued in your name.
+ */
+export interface CTMonitor {
+  id: string
+  domain: string
+  include_subdomains: boolean
+  is_enabled: boolean
+  check_interval_minutes: number
+  last_checked_at?: string | null
+  last_success_at?: string | null
+  next_check_at?: string | null
+  last_error?: string
+  last_entry_id?: number | null
+  /** Counted per certificate, not per log entry. */
+  certificates_seen: number
+  unmanaged_seen: number
+  created_at: string
+  updated_at: string
+}
+
+/** core/store/models.go — CTCertificate */
+export interface CTCertificate {
+  id: string
+  monitor_id: string
+  entry_id?: number | null
+  logged_at?: string | null
+  serial_number?: string
+  issuer_dn?: string
+  common_name?: string
+  sans: string[]
+  not_before?: string | null
+  not_after?: string | null
+  /** UNMANAGED here is stronger than on a scan: the certificate exists, is
+   *  valid for your domain, and nothing here issued it. */
+  management_state: 'MANAGED' | 'UNMANAGED'
+  matched_certificate_id?: string | null
+  /** The pre-issuance log entry. Hidden by default so one certificate counts
+   *  once — before this existed a live check reported 18 where there are 9. */
+  is_precertificate: boolean
+  first_seen_at: string
+  created_at: string
+}
+
+/** GET /api/v1/ct/monitors */
+export interface CTMonitorList {
+  data: CTMonitor[]
+  total: number
+  min_interval_minutes: number
+  /** Domains whose checks have stopped answering. Nothing is watching them. */
+  stale_domains: string[]
+  warning?: string
+}
+
 /** core/store/models.go — Policy */
 export interface Policy {
   id: string
@@ -421,6 +481,7 @@ export type StreamTopic =
   | 'discovery.unmanaged'
   | 'discovery.changed'
   | 'discovery.progress'
+  | 'ct.unmanaged'
 
 /** One published change — core/events/broker.go `Event`. */
 export interface StreamEvent {

@@ -143,6 +143,31 @@ type Store interface {
 	// stale definition as a side effect of recording that it ran.
 	MarkDiscoveryScheduleRun(ctx context.Context, id string, ranAt, nextRunAt time.Time, scanID *string, runErr string) error
 
+	// ── Certificate Transparency ────────────────────────────
+
+	ListCTMonitors(ctx context.Context) ([]*CTMonitor, error)
+	GetCTMonitor(ctx context.Context, id string) (*CTMonitor, error)
+	CreateCTMonitor(ctx context.Context, m *CTMonitor) error
+	UpdateCTMonitor(ctx context.Context, m *CTMonitor) error
+	DeleteCTMonitor(ctx context.Context, id string) error
+	GetDueCTMonitors(ctx context.Context, now time.Time) ([]*CTMonitor, error)
+	// MarkCTMonitorChecked records the outcome of one check.
+	//
+	// Takes `success` explicitly rather than inferring it from an error string,
+	// because the two timestamps it maintains answer different questions: when
+	// did we last try, and when did we last actually learn anything. A monitor
+	// that has been unable to reach the log for a week must not look like one
+	// that has found nothing for a week.
+	MarkCTMonitorChecked(ctx context.Context, id string, checkedAt, nextCheckAt time.Time,
+		success bool, lastEntryID *int64, seen, unmanaged int, checkErr string) error
+
+	// RecordCTCertificates stores what a check found, ignoring entries already
+	// known. Returns only the ones that were new, which is what an alert is
+	// built from — re-reporting the same certificate every six hours is how a
+	// channel gets muted.
+	RecordCTCertificates(ctx context.Context, certs []*CTCertificate) ([]*CTCertificate, error)
+	ListCTCertificates(ctx context.Context, filter CTCertificateFilter) ([]*CTCertificate, int64, error)
+
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)

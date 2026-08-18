@@ -103,7 +103,8 @@ explicitly.
 | Kiosk display tokens | ✅ | Read-only, viewer-scoped, expiring, revocable credentials for a wall display |
 | CA hierarchy tree | ⚠️ | Position and lineage are shown per CA and a malformed hierarchy is flagged; the tree is not drawn as a tree |
 | Policy engine | ⚠️ | `key_size`, `max_lifetime`, `ca_restriction`; other rule types are not implemented |
-| Discovery | ⚠️ | Scans hosts, CIDR networks, and address ranges on a schedule; records the full handshake, says which certificates nobody manages, and reports what changed since last time. No CT logs or cloud inventory yet |
+| Discovery | ⚠️ | Scans hosts, CIDR networks, and address ranges on a schedule; records the full handshake, says which certificates nobody manages, and reports what changed since last time. No cloud inventory yet |
+| Certificate Transparency | ✅ | Watches CT for certificates issued in your name — including ones never deployed anywhere you could scan. A check that could not run is never reported as a check that found nothing |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ❌ | Not started |
 | Host agent | ❌ | Not started |
@@ -349,6 +350,28 @@ The second run is where the value is. It reports what **changed**:
 The same rotation on a managed endpoint is a renewal CertPilot performed, and is
 reported at INFO. Alerting on its own renewals is how a system teaches people to
 ignore the alert that matters.
+
+### Certificates you never asked for
+
+A scan finds what is being served. Certificate Transparency finds what was
+**issued** — including the certificate somebody obtained for your domain with a
+personal ACME account and never deployed anywhere you could scan.
+
+```bash
+curl -X POST localhost:8080/api/v1/ct/monitors -H 'Content-Type: application/json' \
+  -d '{"domain": "example.com", "include_subdomains": true}'
+```
+
+```
+9 certificate(s) have been issued for badssl.com that CertPilot did not issue
+and does not manage. Somebody holds their private keys.
+```
+
+The rule here is the dashboard's rule again: **a check that could not run must
+not look like a check that found nothing.** Every monitor records when a check
+was last *attempted* and when one last *answered*, separately, and the list
+names the domains that have gone quiet. An on-demand check against an
+unreachable index answers 502 with its own words, never an empty list.
 
 ## Security model
 

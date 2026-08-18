@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/certpilot/certpilot/core/api"
+	"github.com/certpilot/certpilot/core/engine/ctlog"
 	"github.com/certpilot/certpilot/core/engine/discovery"
 	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
@@ -35,6 +36,7 @@ type Server struct {
 	renewalSched *renewal.Scheduler
 	scanner      *discovery.Scanner
 	discoverySch *discovery.Scheduler
+	ctMonitor    *ctlog.Monitor
 	cfg          *config.CoreConfig
 }
 
@@ -116,6 +118,9 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	scanner := discovery.NewScanner(st, discovery.WithBroker(broker))
 	// Discovery run once is a snapshot; run on a schedule it is monitoring.
 	discoverySch := discovery.NewScheduler(st, scanner)
+	// Certificate Transparency reaches what a scan cannot: certificates issued
+	// for these domains that were never deployed anywhere CertPilot can see.
+	ctMonitor := ctlog.NewMonitor(st, ctlog.WithBroker(broker))
 
 	// The dispatcher is an ordinary broker subscriber. That is the point: it
 	// makes outbound HTTP and SMTP calls, and a wedged destination can only cost
@@ -143,6 +148,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		RenewalExec:   renewalExec,
 		PolicyEngine:  policyEng,
 		Scanner:       scanner,
+		CTMonitor:     ctMonitor,
 		Keyring:       keyring,
 		Broker:        broker,
 		Dispatcher:    dispatcher,
@@ -170,6 +176,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		renewalSched: renewalSched,
 		scanner:      scanner,
 		discoverySch: discoverySch,
+		ctMonitor:    ctMonitor,
 		cfg:          cfg,
 	}, nil
 }
@@ -225,6 +232,7 @@ func (s *Server) Start() error {
 	// often enough to notice one is due. A fresh install has no schedules and
 	// this loop does nothing but one indexed query a minute.
 	s.discoverySch.Start()
+	s.ctMonitor.Start()
 
 	// After the producers, so nothing is published before there is anything
 	// subscribed to deliver it.
@@ -240,6 +248,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.renewalSched.Stop()
 	s.caMonitor.Stop()
 	s.discoverySch.Stop()
+	s.ctMonitor.Stop()
 	// A range scan can run for minutes. Left alone it would hold the grace
 	// period open and then be killed mid-write anyway; cancelled, it records
 	// what it found and stops.

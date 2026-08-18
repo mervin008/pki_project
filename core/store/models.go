@@ -550,6 +550,114 @@ func (s *DiscoverySchedule) Due(now time.Time) bool {
 	return !s.NextRunAt.After(now)
 }
 
+// CTMonitor watches Certificate Transparency for one domain.
+//
+// Network scanning answers "what is being served on the addresses I told you
+// about". CT answers a larger question: what has been issued in your name at
+// all — by any CA, to anyone, whether or not it was ever deployed. A developer
+// who obtained a certificate for api.corp.example.com with a personal ACME
+// account appears in no scan of any range, and in CT within minutes.
+type CTMonitor struct {
+	ID     string `json:"id"`
+	Domain string `json:"domain"`
+	// IncludeSubdomains watches *.example.com alongside example.com. On by
+	// default: the subdomain nobody registered is the one worth finding.
+	IncludeSubdomains bool `json:"include_subdomains"`
+	IsEnabled         bool `json:"is_enabled"`
+	// CheckIntervalMinutes is how often the log is queried. Floored higher than
+	// a scan's interval, because the logs are read through a free community
+	// service and polling it hard is how everyone loses access to it.
+	CheckIntervalMinutes int `json:"check_interval_minutes"`
+
+	// LastCheckedAt is when a check was last attempted. LastSuccessAt is when
+	// one last answered.
+	//
+	// Keeping these apart is the point of the type. Collapsed into one, a
+	// monitor that has been unable to reach the log for a week looks exactly
+	// like a monitor that has found nothing for a week — and one of those means
+	// nobody is being told about certificates issued in their name.
+	LastCheckedAt *time.Time `json:"last_checked_at,omitempty"`
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	NextCheckAt   *time.Time `json:"next_check_at,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+
+	// LastEntryID is the newest log entry already seen, so a later check asks
+	// for what is new rather than re-reading years of history.
+	LastEntryID      *int64    `json:"last_entry_id,omitempty"`
+	CertificatesSeen int       `json:"certificates_seen"`
+	UnmanagedSeen    int       `json:"unmanaged_seen"`
+	CreatedBy        *string   `json:"created_by,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// Due reports whether the monitor should be checked now.
+func (m *CTMonitor) Due(now time.Time) bool {
+	if m == nil || !m.IsEnabled {
+		return false
+	}
+	if m.NextCheckAt == nil {
+		return true
+	}
+	return !m.NextCheckAt.After(now)
+}
+
+// Stale reports whether it has been too long since a check actually answered.
+//
+// Separate from LastError: a monitor can fail silently by simply never being
+// run — a core that was down, a loop that stopped — and "no error recorded"
+// would then read as healthy.
+func (m *CTMonitor) Stale(now time.Time) bool {
+	if m == nil || !m.IsEnabled {
+		return false
+	}
+	if m.LastSuccessAt == nil {
+		// Never succeeded. Only stale once it has had time to try.
+		return m.CreatedAt.Add(2 * time.Duration(m.CheckIntervalMinutes) * time.Minute).Before(now)
+	}
+	return m.LastSuccessAt.Add(3 * time.Duration(m.CheckIntervalMinutes) * time.Minute).Before(now)
+}
+
+// CTCertificate is one certificate a log reported for a watched domain.
+type CTCertificate struct {
+	ID        string `json:"id"`
+	MonitorID string `json:"monitor_id"`
+	// EntryID identifies the log entry, and is what makes a re-check idempotent.
+	EntryID  *int64     `json:"entry_id,omitempty"`
+	LoggedAt *time.Time `json:"logged_at,omitempty"`
+
+	SerialNumber string     `json:"serial_number,omitempty"`
+	IssuerDN     string     `json:"issuer_dn,omitempty"`
+	CommonName   string     `json:"common_name,omitempty"`
+	SANs         []string   `json:"sans"`
+	NotBefore    *time.Time `json:"not_before,omitempty"`
+	NotAfter     *time.Time `json:"not_after,omitempty"`
+
+	// ManagementState is MANAGED or UNMANAGED. Unmanaged here is a stronger
+	// signal than on a scan result: a certificate valid for your domain exists,
+	// somebody holds its private key, and nothing in this system issued it.
+	ManagementState      string  `json:"management_state"`
+	MatchedCertificateID *string `json:"matched_certificate_id,omitempty"`
+	// IsPrecertificate marks the pre-issuance log entry. A precertificate and
+	// its final certificate are two entries for one certificate; recorded
+	// rather than dropped, but flagged so a count of findings is not doubled.
+	IsPrecertificate bool `json:"is_precertificate"`
+
+	FirstSeenAt time.Time `json:"first_seen_at"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// CTCertificateFilter narrows a list of CT findings.
+type CTCertificateFilter struct {
+	MonitorID       string
+	ManagementState string
+	// ExcludePrecertificates hides the pre-issuance entry when its final
+	// certificate is also present, so one certificate counts once.
+	ExcludePrecertificates bool
+	Limit                  int
+	Offset                 int
+}
+
 // DiscoveryResultFilter narrows a result list.
 type DiscoveryResultFilter struct {
 	// ScanID restricts to one run. Empty means across every scan, which is how

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"github.com/certpilot/certpilot/core/engine/ctlog"
 	"github.com/certpilot/certpilot/core/engine/discovery"
 	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
@@ -29,6 +30,7 @@ type RouterDeps struct {
 	RenewalExec   *renewal.Executor
 	PolicyEngine  *policy.Engine
 	Scanner       *discovery.Scanner
+	CTMonitor     *ctlog.Monitor
 	Keyring       *secrets.Keyring
 	Broker        *events.Broker
 	Dispatcher    *notifications.Dispatcher
@@ -57,6 +59,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	displayHandler := NewDisplayTokenHandler(deps.Store)
 	notifHandler := NewNotificationHandler(deps.Store, deps.Keyring, deps.Dispatcher)
 	ackHandler := NewAcknowledgementHandler(deps.Store)
+	ctHandler := NewCTHandler(deps.Store, deps.CTMonitor)
 
 	v1 := engine.Group("/api/v1")
 	// Display tokens are resolved first, and only take effect when no
@@ -131,6 +134,16 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.PUT("/discovery/schedules/:id", middleware.RequireRole(middleware.RoleOperator), discHandler.UpdateSchedule)
 		v1.DELETE("/discovery/schedules/:id", middleware.RequireRole(middleware.RoleAdmin), discHandler.DeleteSchedule)
 		v1.POST("/discovery/schedules/:id/run", middleware.RequireRole(middleware.RoleOperator), discHandler.RunSchedule)
+
+		// ── Certificate Transparency ──
+		// The half of discovery a network scan cannot reach: what has been
+		// issued in your name, whether or not it was ever deployed.
+		v1.GET("/ct/monitors", ctHandler.ListMonitors)
+		v1.POST("/ct/monitors", middleware.RequireRole(middleware.RoleOperator), ctHandler.CreateMonitor)
+		v1.PUT("/ct/monitors/:id", middleware.RequireRole(middleware.RoleOperator), ctHandler.UpdateMonitor)
+		v1.DELETE("/ct/monitors/:id", middleware.RequireRole(middleware.RoleAdmin), ctHandler.DeleteMonitor)
+		v1.POST("/ct/monitors/:id/check", middleware.RequireRole(middleware.RoleOperator), ctHandler.CheckMonitor)
+		v1.GET("/ct/certificates", ctHandler.ListCertificates)
 
 		// ── Display Tokens ──
 		// Admin-only throughout: minting a credential that authenticates to

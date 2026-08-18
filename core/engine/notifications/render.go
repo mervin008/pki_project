@@ -155,6 +155,25 @@ func AlertFromEvent(evt events.Event) Alert {
 				Field{Label: "No longer answering", Value: fallback(listText(payload, "disappeared_hosts"), "—")})
 		}
 
+	case events.TopicCTUnmanaged:
+		domain := str(payload, "domain")
+		count := int(num(payload, "unmanaged_count"))
+		alert.Title = fmt.Sprintf("Certificate issued for %s that you do not manage", fallback(domain, "a watched domain"))
+		// The strongest wording in the system, because this is the strongest
+		// signal in it. An unmanaged certificate on an endpoint may be one
+		// somebody forgot to register; an unmanaged certificate in a public log
+		// is one that exists, is valid for your domain, and whose private key
+		// is held by somebody who did not get it from here.
+		alert.Summary = fmt.Sprintf(
+			"%d certificate(s) valid for %s appeared in Certificate Transparency and CertPilot did not issue them. Somebody holds their private keys. Either an internal team obtained them outside this system, or they were not obtained by your organisation at all.",
+			count, fallback(domain, "a watched domain"))
+		alert.Fields = []Field{
+			{Label: "Domain", Value: fallback(domain, "—")},
+			{Label: "Unmanaged", Value: countText(num(payload, "unmanaged_count"))},
+			{Label: "Certificates", Value: fallback(listText(payload, "certificates"), "—")},
+			{Label: "Source", Value: fallback(str(payload, "source"), "—")},
+		}
+
 	case events.TopicGatewayStatus:
 		name := str(payload, "name")
 		alert.Title = fmt.Sprintf("Gateway %s", fallback(str(payload, "status"), "status changed"))

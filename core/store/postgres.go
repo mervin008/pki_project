@@ -1737,3 +1737,275 @@ func (s *PostgresStore) MarkDiscoveryScheduleRun(ctx context.Context, id string,
 	}
 	return nil
 }
+
+// ── Certificate Transparency ────────────────────────────
+
+const ctMonitorColumns = `id, domain, coalesce(include_subdomains, true), coalesce(is_enabled, true),
+		coalesce(check_interval_minutes, 360), last_checked_at, last_success_at, next_check_at,
+		coalesce(last_error, ''), last_entry_id, coalesce(certificates_seen, 0),
+		coalesce(unmanaged_seen, 0), created_by, created_at, updated_at`
+
+func scanCTMonitor(row pgx.Row) (*CTMonitor, error) {
+	m := &CTMonitor{}
+	err := row.Scan(
+		&m.ID, &m.Domain, &m.IncludeSubdomains, &m.IsEnabled,
+		&m.CheckIntervalMinutes, &m.LastCheckedAt, &m.LastSuccessAt, &m.NextCheckAt,
+		&m.LastError, &m.LastEntryID, &m.CertificatesSeen,
+		&m.UnmanagedSeen, &m.CreatedBy, &m.CreatedAt, &m.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (s *PostgresStore) ListCTMonitors(ctx context.Context) ([]*CTMonitor, error) {
+	rows, err := s.pool.Query(ctx, "SELECT "+ctMonitorColumns+" FROM public.ct_monitors ORDER BY domain ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*CTMonitor, 0)
+	for rows.Next() {
+		m, err := scanCTMonitor(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) GetCTMonitor(ctx context.Context, id string) (*CTMonitor, error) {
+	m, err := scanCTMonitor(s.pool.QueryRow(ctx,
+		"SELECT "+ctMonitorColumns+" FROM public.ct_monitors WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("certificate transparency monitor %s not found", id)
+	}
+	return m, err
+}
+
+func (s *PostgresStore) CreateCTMonitor(ctx context.Context, m *CTMonitor) error {
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO public.ct_monitors
+			(domain, include_subdomains, is_enabled, check_interval_minutes, next_check_at, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, created_at, updated_at`,
+		m.Domain, m.IncludeSubdomains, m.IsEnabled, m.CheckIntervalMinutes, m.NextCheckAt, m.CreatedBy).
+		Scan(&m.ID, &m.CreatedAt, &m.UpdatedAt)
+	if err != nil && strings.Contains(err.Error(), "ct_monitors_domain_unique") {
+		return fmt.Errorf("%s is already being watched", m.Domain)
+	}
+	return err
+}
+
+func (s *PostgresStore) UpdateCTMonitor(ctx context.Context, m *CTMonitor) error {
+	// Deliberately does not write the check timestamps or the watermark:
+	// editing a monitor and recording that it ran are different acts, and
+	// letting an edit carry stale scheduling state would make saving a name
+	// change re-read years of log history.
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.ct_monitors
+		SET domain = $2, include_subdomains = $3, is_enabled = $4,
+		    check_interval_minutes = $5, updated_at = now()
+		WHERE id = $1`,
+		m.ID, m.Domain, m.IncludeSubdomains, m.IsEnabled, m.CheckIntervalMinutes)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("certificate transparency monitor %s not found", m.ID)
+	}
+	return nil
+}
+
+func (s *PostgresStore) DeleteCTMonitor(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, "DELETE FROM public.ct_monitors WHERE id = $1", id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("certificate transparency monitor %s not found", id)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetDueCTMonitors(ctx context.Context, now time.Time) ([]*CTMonitor, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+ctMonitorColumns+` FROM public.ct_monitors
+		 WHERE is_enabled AND (next_check_at IS NULL OR next_check_at <= $1)
+		 ORDER BY domain ASC`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*CTMonitor, 0)
+	for rows.Next() {
+		m, err := scanCTMonitor(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) MarkCTMonitorChecked(ctx context.Context, id string, checkedAt, nextCheckAt time.Time,
+	success bool, lastEntryID *int64, seen, unmanaged int, checkErr string) error {
+	// last_success_at moves only when the check answered. Everything on screen
+	// that says "we are watching this domain" is really saying "we last heard
+	// from the log at this time", and a failing monitor must not read as a
+	// quiet one.
+	query := `
+		UPDATE public.ct_monitors
+		SET last_checked_at = $2, next_check_at = $3, last_error = $4`
+	args := []any{id, checkedAt, nextCheckAt, nullIfEmpty(checkErr)}
+	if success {
+		query += `, last_success_at = $2,
+		           last_entry_id = coalesce($5, last_entry_id),
+		           certificates_seen = coalesce(certificates_seen, 0) + $6,
+		           unmanaged_seen = coalesce(unmanaged_seen, 0) + $7`
+		args = append(args, lastEntryID, seen, unmanaged)
+	}
+	query += ", updated_at = now() WHERE id = $1"
+
+	tag, err := s.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("certificate transparency monitor %s not found", id)
+	}
+	return nil
+}
+
+const ctCertificateColumns = `id, monitor_id, entry_id, logged_at, coalesce(serial_number, ''),
+		coalesce(issuer_dn, ''), coalesce(common_name, ''), coalesce(sans, '[]'::jsonb),
+		not_before, not_after, coalesce(management_state, 'UNMANAGED'), matched_certificate_id,
+		coalesce(is_precertificate, false), coalesce(first_seen_at, created_at), created_at`
+
+func scanCTCertificate(row pgx.Row) (*CTCertificate, error) {
+	c := &CTCertificate{}
+	var sansJSON []byte
+	err := row.Scan(
+		&c.ID, &c.MonitorID, &c.EntryID, &c.LoggedAt, &c.SerialNumber,
+		&c.IssuerDN, &c.CommonName, &sansJSON,
+		&c.NotBefore, &c.NotAfter, &c.ManagementState, &c.MatchedCertificateID,
+		&c.IsPrecertificate, &c.FirstSeenAt, &c.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(sansJSON) > 0 {
+		_ = json.Unmarshal(sansJSON, &c.SANs)
+	}
+	if c.SANs == nil {
+		c.SANs = []string{}
+	}
+	return c, nil
+}
+
+func (s *PostgresStore) RecordCTCertificates(ctx context.Context, certs []*CTCertificate) ([]*CTCertificate, error) {
+	added := make([]*CTCertificate, 0, len(certs))
+	if len(certs) == 0 {
+		return added, nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, c := range certs {
+		sansJSON, err := json.Marshal(c.SANs)
+		if err != nil {
+			return nil, err
+		}
+		// ON CONFLICT DO NOTHING is what makes a re-check idempotent: the
+		// windows overlap by design, and re-reporting the same certificate
+		// every six hours is how a notification channel gets muted.
+		row := tx.QueryRow(ctx, `
+			INSERT INTO public.ct_certificates
+				(monitor_id, entry_id, logged_at, serial_number, issuer_dn, common_name, sans,
+				 not_before, not_after, management_state, matched_certificate_id, is_precertificate)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (monitor_id, entry_id) DO NOTHING
+			RETURNING id, created_at, first_seen_at`,
+			c.MonitorID, c.EntryID, c.LoggedAt, nullIfEmpty(c.SerialNumber), nullIfEmpty(c.IssuerDN),
+			nullIfEmpty(c.CommonName), sansJSON, c.NotBefore, c.NotAfter, c.ManagementState,
+			c.MatchedCertificateID, c.IsPrecertificate)
+
+		err = row.Scan(&c.ID, &c.CreatedAt, &c.FirstSeenAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue // already known
+		}
+		if err != nil {
+			return nil, err
+		}
+		added = append(added, c)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return added, nil
+}
+
+func (s *PostgresStore) ListCTCertificates(ctx context.Context, filter CTCertificateFilter) ([]*CTCertificate, int64, error) {
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(clause string, value any) {
+		args = append(args, value)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
+
+	if filter.MonitorID != "" {
+		add("monitor_id = $%d", filter.MonitorID)
+	}
+	if filter.ManagementState != "" {
+		add("management_state = $%d", filter.ManagementState)
+	}
+	if filter.ExcludePrecertificates {
+		// Drops the pre-issuance entry only when the real certificate is also
+		// present. A precertificate whose final entry has not been logged is
+		// still the only record that the certificate exists.
+		where = append(where, `NOT (coalesce(is_precertificate, false) AND EXISTS (
+			SELECT 1 FROM public.ct_certificates final
+			WHERE final.serial_number = ct_certificates.serial_number
+			  AND NOT coalesce(final.is_precertificate, false)))`)
+	}
+	clause := strings.Join(where, " AND ")
+
+	var total int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT count(*) FROM public.ct_certificates WHERE "+clause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	args = append(args, limit, filter.Offset)
+	query := "SELECT " + ctCertificateColumns + " FROM public.ct_certificates WHERE " + clause +
+		fmt.Sprintf(" ORDER BY coalesce(logged_at, created_at) DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]*CTCertificate, 0)
+	for rows.Next() {
+		c, err := scanCTCertificate(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, c)
+	}
+	return out, total, rows.Err()
+}

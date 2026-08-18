@@ -44,6 +44,14 @@ const (
 	// years; "the certificate on it changed last night" is a fact about
 	// somebody actively operating it, and it is only visible on a second scan.
 	TopicDiscoveryChanged = "discovery.changed"
+	// TopicCTUnmanaged carries a certificate that Certificate Transparency
+	// reported for a watched domain and that nothing here issued.
+	//
+	// A stronger signal than its scanning equivalent. An unmanaged certificate
+	// on an endpoint may be one somebody forgot to register; an unmanaged
+	// certificate in CT is one that exists, is valid for your domain, and whose
+	// private key is held by somebody who did not get it from this system.
+	TopicCTUnmanaged = "ct.unmanaged"
 	// TopicDiscoveryProgress reports how far a running scan has got. Stream
 	// only — see IsNotifiable.
 	TopicDiscoveryProgress = "discovery.progress"
@@ -93,6 +101,7 @@ func AllTopics() []string {
 		TopicGatewayStatus,
 		TopicDiscoveryUnmanaged,
 		TopicDiscoveryChanged,
+		TopicCTUnmanaged,
 	}
 }
 

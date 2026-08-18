@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/certpilot/certpilot/core/engine/ctlog"
 	"github.com/certpilot/certpilot/core/engine/discovery"
 	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
@@ -73,7 +74,10 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 		PolicyEngine:  policy.NewEngine(st),
 		// A real broker on the scanner: background scans publish their findings
 		// themselves, so a scanner without one would silently drop them.
-		Scanner:    discovery.NewScanner(st, discovery.WithBroker(broker), discovery.WithDialTimeout(3*time.Second)),
+		Scanner: discovery.NewScanner(st, discovery.WithBroker(broker), discovery.WithDialTimeout(3*time.Second)),
+		// A stub source: these tests must not reach a public service, and a
+		// monitor without one would silently do nothing.
+		CTMonitor:  ctlog.NewMonitor(st, ctlog.WithBroker(broker), ctlog.WithSource(stubCTSource{})),
 		Keyring:    keyring,
 		Broker:     broker,
 		Dispatcher: dispatcher,

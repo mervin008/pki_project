@@ -279,12 +279,22 @@ func (s *Scanner) Start(req ScanRequest) (*store.DiscoveryScan, error) {
 	}
 
 	ctx, cancel := s.track(context.Background(), scan.ID)
+
+	// The caller gets its own copy, taken before the run starts.
+	//
+	// `execute` mutates this record continuously as results arrive — counts,
+	// status, completion — and the handler serialises what it is handed into a
+	// 202. Returning the live pointer means encoding a struct while another
+	// goroutine writes it, which the race detector found and which produces a
+	// torn response in production rather than a wrong number in a test.
+	snapshot := *scan
+
 	go func() {
 		defer cancel()
 		s.execute(ctx, scan, req.Targets)
 	}()
 
-	return scan, nil
+	return &snapshot, nil
 }
 
 // Cancel stops a running scan. Reports whether there was one to stop.

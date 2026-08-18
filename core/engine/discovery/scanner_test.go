@@ -888,3 +888,51 @@ func startClosableTLSServer(t *testing.T, leaf *testLeaf) (Target, func()) {
 
 	return Target{Host: "127.0.0.1", Port: addr.Port}, stop
 }
+
+// A background scan's record must not be handed to the caller while the run is
+// still writing to it.
+//
+// The handler serialises what Start returns into its 202 response, and the run
+// mutates counts and status continuously as results arrive. Returning the live
+// pointer encodes a struct while another goroutine writes it — a torn response
+// in production, not merely a wrong number in a test. Found by the race
+// detector on the schedule endpoint.
+func TestStartHandsBackASnapshotNotTheLiveRecord(t *testing.T) {
+	ca := newTestCA(t, "Test CA")
+	leaf := ca.issue(t, "localhost", time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour))
+
+	targets := []Target{}
+	for i := 0; i < 8; i++ {
+		targets = append(targets, startTLSServer(t, leaf).target)
+	}
+
+	st := newEmptyStore()
+	scanner := NewScanner(st, WithConcurrency(2))
+	scanner.batchSize = 1
+
+	returned, err := scanner.Start(ScanRequest{Targets: targets})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Read every field the response serialises, repeatedly, while the run is
+	// in flight. Under -race this fails if the record is shared.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = returned.Status
+		_ = returned.ResultsCount
+		_ = returned.UnmanagedCount
+		_ = returned.CompletedAt
+	}
+
+	// The snapshot is of the moment it started, so it must still say RUNNING
+	// even though the real run has moved on.
+	if returned.Status != store.ScanRunning {
+		t.Errorf("the returned record changed under the caller: status = %q", returned.Status)
+	}
+
+	waitFor(t, 10*time.Second, func() bool {
+		stored, _ := st.GetDiscoveryScan(context.Background(), returned.ID)
+		return stored.Status == store.ScanCompleted
+	}, "the scan to finish")
+}

@@ -220,3 +220,50 @@ func TestWorstSeverityRanksFindings(t *testing.T) {
 		t.Errorf("WorstSeverity with no findings = %q, want empty", got)
 	}
 }
+
+// Stale is what makes a monitor's silence readable.
+//
+// Without it, a monitor that has been unable to reach the transparency index
+// for a week looks exactly like one that has found nothing for a week — and one
+// of those means nobody is being told about certificates issued in their name.
+func TestCTMonitorStaleness(t *testing.T) {
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	hourly := 60
+
+	fresh := &CTMonitor{
+		IsEnabled: true, CheckIntervalMinutes: hourly,
+		LastSuccessAt: timePtr(now.Add(-30 * time.Minute)),
+	}
+	if fresh.Stale(now) {
+		t.Error("a monitor that answered half an hour ago reads as stale")
+	}
+
+	lapsed := &CTMonitor{
+		IsEnabled: true, CheckIntervalMinutes: hourly,
+		LastSuccessAt: timePtr(now.Add(-5 * time.Hour)),
+	}
+	if !lapsed.Stale(now) {
+		t.Error("a monitor that has not answered in five hourly windows reads as healthy")
+	}
+
+	// A brand new monitor is not stale — it has not had a chance yet, and
+	// flagging it would train people to ignore the flag.
+	brandNew := &CTMonitor{IsEnabled: true, CheckIntervalMinutes: hourly, CreatedAt: now.Add(-5 * time.Minute)}
+	if brandNew.Stale(now) {
+		t.Error("a monitor created five minutes ago reads as stale")
+	}
+
+	// One created days ago that has never answered is exactly what this is for.
+	neglected := &CTMonitor{IsEnabled: true, CheckIntervalMinutes: hourly, CreatedAt: now.Add(-72 * time.Hour)}
+	if !neglected.Stale(now) {
+		t.Error("a monitor that has never once answered reads as healthy")
+	}
+
+	// A disabled monitor is not stale: nobody expects it to be running.
+	off := &CTMonitor{IsEnabled: false, CheckIntervalMinutes: hourly, CreatedAt: now.Add(-72 * time.Hour)}
+	if off.Stale(now) {
+		t.Error("a disabled monitor reads as stale")
+	}
+}
+
+func timePtr(t time.Time) *time.Time { return &t }

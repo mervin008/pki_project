@@ -39,6 +39,8 @@ type MemoryStore struct {
 	discoveryScans     []*DiscoveryScan
 	discoveryResults   []*DiscoveryResult
 	discoverySchedules map[string]*DiscoverySchedule
+	ctMonitors         map[string]*CTMonitor
+	ctCertificates     []*CTCertificate
 }
 
 // clone returns a shallow copy of a stored record.
@@ -230,6 +232,10 @@ func NewMemoryStore() *MemoryStore {
 		// Empty: a schedule is an outbound action on a timer, and seeding one
 		// would have a fresh install scanning something nobody asked it to.
 		discoverySchedules: make(map[string]*DiscoverySchedule),
+		// Also empty. A monitor is an outbound query on a timer, and a seeded
+		// one would have a fresh install polling a public service about a
+		// domain nobody asked it to watch.
+		ctMonitors: make(map[string]*CTMonitor),
 	}
 }
 
@@ -1329,4 +1335,208 @@ func (m *MemoryStore) MarkDiscoveryScheduleRun(ctx context.Context, id string, r
 	}
 	s.UpdatedAt = time.Now()
 	return nil
+}
+
+// ── Certificate Transparency ────────────────────────────
+
+func (m *MemoryStore) ListCTMonitors(ctx context.Context) ([]*CTMonitor, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*CTMonitor, 0, len(m.ctMonitors))
+	for _, mon := range m.ctMonitors {
+		out = append(out, clone(mon))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Domain < out[j].Domain })
+	return out, nil
+}
+
+func (m *MemoryStore) GetCTMonitor(ctx context.Context, id string) (*CTMonitor, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if mon, ok := m.ctMonitors[id]; ok {
+		return clone(mon), nil
+	}
+	return nil, fmt.Errorf("certificate transparency monitor %s not found", id)
+}
+
+func (m *MemoryStore) CreateCTMonitor(ctx context.Context, mon *CTMonitor) error {
+	if strings.TrimSpace(mon.Domain) == "" {
+		return fmt.Errorf("a monitor needs a domain")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, existing := range m.ctMonitors {
+		if strings.EqualFold(existing.Domain, mon.Domain) {
+			return fmt.Errorf("%s is already being watched", mon.Domain)
+		}
+	}
+	if mon.ID == "" {
+		mon.ID = uuid.New().String()
+	}
+	now := time.Now()
+	mon.CreatedAt, mon.UpdatedAt = now, now
+	m.ctMonitors[mon.ID] = clone(mon)
+	return nil
+}
+
+func (m *MemoryStore) UpdateCTMonitor(ctx context.Context, mon *CTMonitor) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	existing, ok := m.ctMonitors[mon.ID]
+	if !ok {
+		return fmt.Errorf("certificate transparency monitor %s not found", mon.ID)
+	}
+	updated := clone(mon)
+	updated.CreatedAt = existing.CreatedAt
+	updated.UpdatedAt = time.Now()
+	m.ctMonitors[mon.ID] = updated
+	return nil
+}
+
+func (m *MemoryStore) DeleteCTMonitor(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.ctMonitors[id]; !ok {
+		return fmt.Errorf("certificate transparency monitor %s not found", id)
+	}
+	delete(m.ctMonitors, id)
+
+	kept := m.ctCertificates[:0]
+	for _, c := range m.ctCertificates {
+		if c.MonitorID != id {
+			kept = append(kept, c)
+		}
+	}
+	m.ctCertificates = kept
+	return nil
+}
+
+func (m *MemoryStore) GetDueCTMonitors(ctx context.Context, now time.Time) ([]*CTMonitor, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*CTMonitor, 0)
+	for _, mon := range m.ctMonitors {
+		if mon.Due(now) {
+			out = append(out, clone(mon))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Domain < out[j].Domain })
+	return out, nil
+}
+
+func (m *MemoryStore) MarkCTMonitorChecked(ctx context.Context, id string, checkedAt, nextCheckAt time.Time,
+	success bool, lastEntryID *int64, seen, unmanaged int, checkErr string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	mon, ok := m.ctMonitors[id]
+	if !ok {
+		return fmt.Errorf("certificate transparency monitor %s not found", id)
+	}
+	mon.LastCheckedAt = &checkedAt
+	mon.NextCheckAt = &nextCheckAt
+	mon.LastError = checkErr
+	if success {
+		// Only a check that answered moves this. Everything on screen that says
+		// "we are watching this domain" is really saying "we last heard from
+		// the log at this time".
+		mon.LastSuccessAt = &checkedAt
+		if lastEntryID != nil {
+			mon.LastEntryID = lastEntryID
+		}
+		mon.CertificatesSeen += seen
+		mon.UnmanagedSeen += unmanaged
+	}
+	mon.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryStore) RecordCTCertificates(ctx context.Context, certs []*CTCertificate) ([]*CTCertificate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	known := map[string]bool{}
+	for _, existing := range m.ctCertificates {
+		known[ctEntryKey(existing)] = true
+	}
+
+	now := time.Now()
+	added := make([]*CTCertificate, 0, len(certs))
+	for _, c := range certs {
+		key := ctEntryKey(c)
+		if known[key] {
+			continue
+		}
+		known[key] = true
+		if c.ID == "" {
+			c.ID = uuid.New().String()
+		}
+		if c.FirstSeenAt.IsZero() {
+			c.FirstSeenAt = now
+		}
+		c.CreatedAt = now
+		m.ctCertificates = append(m.ctCertificates, clone(c))
+		added = append(added, clone(c))
+	}
+	return added, nil
+}
+
+func ctEntryKey(c *CTCertificate) string {
+	if c.EntryID != nil {
+		return fmt.Sprintf("%s/%d", c.MonitorID, *c.EntryID)
+	}
+	return fmt.Sprintf("%s/serial:%s", c.MonitorID, c.SerialNumber)
+}
+
+func (m *MemoryStore) ListCTCertificates(ctx context.Context, filter CTCertificateFilter) ([]*CTCertificate, int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// A precertificate and its final certificate are two entries for one
+	// certificate. Excluding one of them means excluding the *pre*-issuance
+	// entry when the real one is also present, never the other way round.
+	finalSerials := map[string]bool{}
+	if filter.ExcludePrecertificates {
+		for _, c := range m.ctCertificates {
+			if !c.IsPrecertificate && c.SerialNumber != "" {
+				finalSerials[c.SerialNumber] = true
+			}
+		}
+	}
+
+	matched := make([]*CTCertificate, 0)
+	for i := len(m.ctCertificates) - 1; i >= 0; i-- {
+		c := m.ctCertificates[i]
+		if filter.MonitorID != "" && c.MonitorID != filter.MonitorID {
+			continue
+		}
+		if filter.ManagementState != "" && c.ManagementState != filter.ManagementState {
+			continue
+		}
+		if filter.ExcludePrecertificates && c.IsPrecertificate && finalSerials[c.SerialNumber] {
+			continue
+		}
+		matched = append(matched, clone(c))
+	}
+
+	total := int64(len(matched))
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	if filter.Offset >= len(matched) {
+		return []*CTCertificate{}, total, nil
+	}
+	end := filter.Offset + limit
+	if end > len(matched) {
+		end = len(matched)
+	}
+	return matched[filter.Offset:end], total, nil
 }

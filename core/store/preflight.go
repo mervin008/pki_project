@@ -24,6 +24,8 @@ var requiredTables = []string{
 	"ca_authorities",
 	"certificates",
 	"deployment_targets",
+	"ct_certificates",
+	"ct_monitors",
 	"discovery_results",
 	"discovery_scans",
 	"display_tokens",
@@ -189,6 +191,13 @@ func warnOnStaleSchema(ctx context.Context, pool *pgxpool.Pool) {
 				WHERE table_schema = 'public' AND table_name = 'discovery_results'
 				  AND column_name = 'management_state')`,
 			consequence: "discovery_results has no management_state column (migration 007); scans will run and then fail to record what they found",
+		},
+		{
+			// Migration 009 / 010.
+			query: `SELECT NOT EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = 'public' AND table_name = 'discovery_schedules')`,
+			consequence: "there is no discovery_schedules table (migration 009); scheduled scans will not run",
 		},
 		{
 			// Migration 005. This one is a hard failure at write time rather
