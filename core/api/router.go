@@ -1,6 +1,7 @@
 package api
 
 import (
+	"github.com/certpilot/certpilot/core/engine/cloudsync"
 	"github.com/certpilot/certpilot/core/engine/ctlog"
 	"github.com/certpilot/certpilot/core/engine/discovery"
 	"github.com/certpilot/certpilot/core/engine/notifications"
@@ -31,6 +32,7 @@ type RouterDeps struct {
 	PolicyEngine  *policy.Engine
 	Scanner       *discovery.Scanner
 	CTMonitor     *ctlog.Monitor
+	CloudEngine   *cloudsync.Engine
 	Keyring       *secrets.Keyring
 	Broker        *events.Broker
 	Dispatcher    *notifications.Dispatcher
@@ -60,6 +62,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	notifHandler := NewNotificationHandler(deps.Store, deps.Keyring, deps.Dispatcher)
 	ackHandler := NewAcknowledgementHandler(deps.Store)
 	ctHandler := NewCTHandler(deps.Store, deps.CTMonitor)
+	cloudHandler := NewCloudHandler(deps.Store, deps.CloudEngine, deps.Keyring)
 
 	v1 := engine.Group("/api/v1")
 	// Display tokens are resolved first, and only take effect when no
@@ -144,6 +147,20 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.DELETE("/ct/monitors/:id", middleware.RequireRole(middleware.RoleAdmin), ctHandler.DeleteMonitor)
 		v1.POST("/ct/monitors/:id/check", middleware.RequireRole(middleware.RoleOperator), ctHandler.CheckMonitor)
 		v1.GET("/ct/certificates", ctHandler.ListCertificates)
+
+		// ── Cloud inventory ──
+		// The third place certificates hide: stored rather than served, in an
+		// account a scan has no address for. Reading is open to any
+		// authenticated user — the list never carries the sealed credentials.
+		v1.GET("/cloud/connections", cloudHandler.ListConnections)
+		v1.POST("/cloud/connections", middleware.RequireRole(middleware.RoleOperator), cloudHandler.CreateConnection)
+		v1.PUT("/cloud/connections/:id", middleware.RequireRole(middleware.RoleOperator), cloudHandler.UpdateConnection)
+		v1.DELETE("/cloud/connections/:id", middleware.RequireRole(middleware.RoleAdmin), cloudHandler.DeleteConnection)
+		// Reaching out to somebody else's account with stored credentials is an
+		// action, not a read, which is why it is a POST and gated at operator.
+		v1.POST("/cloud/connections/:id/sync", middleware.RequireRole(middleware.RoleOperator), cloudHandler.SyncConnection)
+		v1.GET("/cloud/certificates", cloudHandler.ListCertificates)
+		v1.POST("/cloud/import", middleware.RequireRole(middleware.RoleOperator), cloudHandler.ImportCertificate)
 
 		// ── Display Tokens ──
 		// Admin-only throughout: minting a credential that authenticates to

@@ -2009,3 +2009,396 @@ func (s *PostgresStore) ListCTCertificates(ctx context.Context, filter CTCertifi
 	}
 	return out, total, rows.Err()
 }
+
+// ── Cloud inventory ─────────────────────────────────────────
+
+const cloudConnectionColumns = `id, name, provider, coalesce(config_encrypted, ''),
+		coalesce(is_enabled, true), coalesce(sync_interval_minutes, 360),
+		last_synced_at, last_success_at, next_sync_at, coalesce(last_error, ''),
+		coalesce(scopes, '[]'::jsonb), coalesce(certificates_seen, 0), coalesce(unmanaged_seen, 0),
+		created_by, created_at, updated_at`
+
+func scanCloudConnection(row pgx.Row) (*CloudConnection, error) {
+	c := &CloudConnection{}
+	var scopesJSON []byte
+	err := row.Scan(
+		&c.ID, &c.Name, &c.Provider, &c.ConfigEncrypted,
+		&c.IsEnabled, &c.SyncIntervalMinutes,
+		&c.LastSyncedAt, &c.LastSuccessAt, &c.NextSyncAt, &c.LastError,
+		&scopesJSON, &c.CertificatesSeen, &c.UnmanagedSeen,
+		&c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(scopesJSON) > 0 {
+		_ = json.Unmarshal(scopesJSON, &c.Scopes)
+	}
+	if c.Scopes == nil {
+		c.Scopes = []string{}
+	}
+	return c, nil
+}
+
+func (s *PostgresStore) ListCloudConnections(ctx context.Context) ([]*CloudConnection, error) {
+	rows, err := s.pool.Query(ctx, "SELECT "+cloudConnectionColumns+" FROM public.cloud_connections ORDER BY name ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*CloudConnection, 0)
+	for rows.Next() {
+		c, err := scanCloudConnection(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) GetCloudConnection(ctx context.Context, id string) (*CloudConnection, error) {
+	c, err := scanCloudConnection(s.pool.QueryRow(ctx,
+		"SELECT "+cloudConnectionColumns+" FROM public.cloud_connections WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("cloud connection %s not found", id)
+	}
+	return c, err
+}
+
+func (s *PostgresStore) CreateCloudConnection(ctx context.Context, conn *CloudConnection) error {
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO public.cloud_connections
+			(name, provider, config_encrypted, is_enabled, sync_interval_minutes, next_sync_at, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, created_at, updated_at`,
+		conn.Name, conn.Provider, nullIfEmpty(conn.ConfigEncrypted), conn.IsEnabled,
+		conn.SyncIntervalMinutes, conn.NextSyncAt, conn.CreatedBy).
+		Scan(&conn.ID, &conn.CreatedAt, &conn.UpdatedAt)
+	if err != nil && strings.Contains(err.Error(), "cloud_connections_name_unique") {
+		return fmt.Errorf("a cloud connection named %q already exists", conn.Name)
+	}
+	return err
+}
+
+func (s *PostgresStore) UpdateCloudConnection(ctx context.Context, conn *CloudConnection) error {
+	// Deliberately does not write the sync timestamps: editing a connection and
+	// recording that it ran are different acts, and letting an edit carry stale
+	// scheduling state would make a rename look like a successful sync.
+	//
+	// config_encrypted is written only when the caller supplied one, so saving
+	// a name change cannot silently blank the credentials.
+	query := `
+		UPDATE public.cloud_connections
+		SET name = $2, provider = $3, is_enabled = $4, sync_interval_minutes = $5, updated_at = now()`
+	args := []any{conn.ID, conn.Name, conn.Provider, conn.IsEnabled, conn.SyncIntervalMinutes}
+	if conn.ConfigEncrypted != "" {
+		query += ", config_encrypted = $6"
+		args = append(args, conn.ConfigEncrypted)
+	}
+	query += " WHERE id = $1"
+
+	tag, err := s.pool.Exec(ctx, query, args...)
+	if err != nil {
+		if strings.Contains(err.Error(), "cloud_connections_name_unique") {
+			return fmt.Errorf("a cloud connection named %q already exists", conn.Name)
+		}
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("cloud connection %s not found", conn.ID)
+	}
+	return nil
+}
+
+func (s *PostgresStore) DeleteCloudConnection(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, "DELETE FROM public.cloud_connections WHERE id = $1", id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("cloud connection %s not found", id)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetDueCloudConnections(ctx context.Context, now time.Time) ([]*CloudConnection, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+cloudConnectionColumns+` FROM public.cloud_connections
+		 WHERE is_enabled AND (next_sync_at IS NULL OR next_sync_at <= $1)
+		 ORDER BY name ASC`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*CloudConnection, 0)
+	for rows.Next() {
+		c, err := scanCloudConnection(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) MarkCloudConnectionSynced(ctx context.Context, id string, syncedAt, nextSyncAt time.Time,
+	success bool, scopes []string, seen, unmanaged int, syncErr string) error {
+	query := `
+		UPDATE public.cloud_connections
+		SET last_synced_at = $2, next_sync_at = $3, last_error = $4`
+	args := []any{id, syncedAt, nextSyncAt, nullIfEmpty(syncErr)}
+	if success {
+		scopesJSON, err := json.Marshal(scopes)
+		if err != nil {
+			return err
+		}
+		// scopes are replaced rather than merged: they describe this sync, and
+		// carrying forward a scope the current credentials can no longer reach
+		// would claim coverage that no longer exists.
+		query += `, last_success_at = $2, scopes = $5,
+		           certificates_seen = $6, unmanaged_seen = $7`
+		args = append(args, scopesJSON, seen, unmanaged)
+	}
+	query += ", updated_at = now() WHERE id = $1"
+
+	tag, err := s.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("cloud connection %s not found", id)
+	}
+	return nil
+}
+
+const cloudCertificateColumns = `id, connection_id, resource_id, coalesce(name, ''), coalesce(location, ''),
+		coalesce(common_name, ''), coalesce(subject_dn, ''), coalesce(issuer_dn, ''), coalesce(serial_number, ''),
+		coalesce(sans, '[]'::jsonb), not_before, not_after, coalesce(key_type, ''), coalesce(key_size, 0),
+		coalesce(fingerprint_sha256, ''), coalesce(certificate_pem, ''),
+		coalesce(management_state, 'UNMANAGED'), matched_certificate_id,
+		coalesce(renewal_mode, ''), will_renew, attached, coalesce(attached_to, '[]'::jsonb),
+		coalesce(findings, '[]'::jsonb), coalesce(is_imported, false), imported_certificate_id,
+		first_seen_at, last_seen_at, removed_at, created_at`
+
+func scanCloudCertificate(row pgx.Row) (*CloudCertificate, error) {
+	c := &CloudCertificate{}
+	var sansJSON, attachedToJSON, findingsJSON []byte
+	err := row.Scan(
+		&c.ID, &c.ConnectionID, &c.ResourceID, &c.Name, &c.Location,
+		&c.CommonName, &c.SubjectDN, &c.IssuerDN, &c.SerialNumber,
+		&sansJSON, &c.NotBefore, &c.NotAfter, &c.KeyType, &c.KeySize,
+		&c.FingerprintSHA256, &c.CertificatePEM,
+		&c.ManagementState, &c.MatchedCertificateID,
+		&c.RenewalMode, &c.WillRenew, &c.Attached, &attachedToJSON,
+		&findingsJSON, &c.IsImported, &c.ImportedCertificateID,
+		&c.FirstSeenAt, &c.LastSeenAt, &c.RemovedAt, &c.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(sansJSON) > 0 {
+		_ = json.Unmarshal(sansJSON, &c.SANs)
+	}
+	if len(attachedToJSON) > 0 {
+		_ = json.Unmarshal(attachedToJSON, &c.AttachedTo)
+	}
+	if len(findingsJSON) > 0 {
+		_ = json.Unmarshal(findingsJSON, &c.Findings)
+	}
+	if c.SANs == nil {
+		c.SANs = []string{}
+	}
+	if c.AttachedTo == nil {
+		c.AttachedTo = []string{}
+	}
+	if c.Findings == nil {
+		c.Findings = []Finding{}
+	}
+	return c, nil
+}
+
+func (s *PostgresStore) UpsertCloudCertificates(ctx context.Context, certs []*CloudCertificate) ([]*CloudCertificate, error) {
+	added := make([]*CloudCertificate, 0, len(certs))
+	if len(certs) == 0 {
+		return added, nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, c := range certs {
+		sansJSON, err := json.Marshal(c.SANs)
+		if err != nil {
+			return nil, err
+		}
+		attachedToJSON, err := json.Marshal(c.AttachedTo)
+		if err != nil {
+			return nil, err
+		}
+		findingsJSON, err := json.Marshal(c.Findings)
+		if err != nil {
+			return nil, err
+		}
+
+		// The xmax test distinguishes an insert from an update. Without it an
+		// upsert cannot say which certificates were new, and an alert built
+		// from "everything the sync saw" fires the entire ACM inventory into a
+		// channel every six hours.
+		//
+		// first_seen_at is never overwritten, and removed_at is cleared: a
+		// certificate that came back is the same certificate returning, not a
+		// new one, and its history is the interesting part.
+		row := tx.QueryRow(ctx, `
+			INSERT INTO public.cloud_certificates
+				(connection_id, resource_id, name, location, common_name, subject_dn, issuer_dn,
+				 serial_number, sans, not_before, not_after, key_type, key_size, fingerprint_sha256,
+				 certificate_pem, management_state, matched_certificate_id, renewal_mode, will_renew,
+				 attached, attached_to, findings, last_seen_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+			        $19, $20, $21, $22, $23)
+			ON CONFLICT (connection_id, resource_id) DO UPDATE SET
+				name = excluded.name, location = excluded.location,
+				common_name = excluded.common_name, subject_dn = excluded.subject_dn,
+				issuer_dn = excluded.issuer_dn, serial_number = excluded.serial_number,
+				sans = excluded.sans, not_before = excluded.not_before, not_after = excluded.not_after,
+				key_type = excluded.key_type, key_size = excluded.key_size,
+				fingerprint_sha256 = excluded.fingerprint_sha256,
+				certificate_pem = excluded.certificate_pem,
+				management_state = excluded.management_state,
+				matched_certificate_id = excluded.matched_certificate_id,
+				renewal_mode = excluded.renewal_mode, will_renew = excluded.will_renew,
+				attached = excluded.attached, attached_to = excluded.attached_to,
+				findings = excluded.findings, last_seen_at = excluded.last_seen_at,
+				removed_at = NULL
+			RETURNING id, first_seen_at, last_seen_at, created_at, (xmax = 0) AS inserted`,
+			c.ConnectionID, c.ResourceID, nullIfEmpty(c.Name), nullIfEmpty(c.Location),
+			nullIfEmpty(c.CommonName), nullIfEmpty(c.SubjectDN), nullIfEmpty(c.IssuerDN),
+			nullIfEmpty(c.SerialNumber), sansJSON, c.NotBefore, c.NotAfter,
+			nullIfEmpty(c.KeyType), c.KeySize, nullIfEmpty(c.FingerprintSHA256),
+			nullIfEmpty(c.CertificatePEM), c.ManagementState, c.MatchedCertificateID,
+			nullIfEmpty(c.RenewalMode), c.WillRenew, c.Attached, attachedToJSON, findingsJSON,
+			c.LastSeenAt)
+
+		var inserted bool
+		if err := row.Scan(&c.ID, &c.FirstSeenAt, &c.LastSeenAt, &c.CreatedAt, &inserted); err != nil {
+			return nil, err
+		}
+		if inserted {
+			added = append(added, c)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return added, nil
+}
+
+func (s *PostgresStore) MarkCloudCertificatesRemoved(ctx context.Context, connectionID string,
+	seenResourceIDs []string, at time.Time) (int, error) {
+	// An empty seen list is not treated as "everything is gone". A provider
+	// that answered with nothing is possible, but so is a bug, and reporting an
+	// entire estate as deleted is the more expensive mistake of the two.
+	if len(seenResourceIDs) == 0 {
+		return 0, nil
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.cloud_certificates
+		SET removed_at = $2
+		WHERE connection_id = $1 AND removed_at IS NULL AND NOT (resource_id = ANY($3))`,
+		connectionID, at, seenResourceIDs)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+func (s *PostgresStore) ListCloudCertificates(ctx context.Context, filter CloudCertificateFilter) ([]*CloudCertificate, int64, error) {
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(clause string, value any) {
+		args = append(args, value)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
+
+	if filter.ConnectionID != "" {
+		add("connection_id = $%d", filter.ConnectionID)
+	}
+	if filter.ManagementState != "" {
+		add("management_state = $%d", filter.ManagementState)
+	}
+	if filter.FindingCode != "" {
+		// Containment against a one-element array: matches a findings entry
+		// whose code is this, whatever else that entry carries.
+		add(`findings @> $%d::jsonb`, `[{"code":"`+filter.FindingCode+`"}]`)
+	}
+	if !filter.IncludeRemoved {
+		where = append(where, "removed_at IS NULL")
+	}
+	if filter.UnimportedOnly {
+		where = append(where, "is_imported = false")
+	}
+	clause := strings.Join(where, " AND ")
+
+	var total int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT count(*) FROM public.cloud_certificates WHERE "+clause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	args = append(args, limit, filter.Offset)
+	query := "SELECT " + cloudCertificateColumns + " FROM public.cloud_certificates WHERE " + clause +
+		fmt.Sprintf(" ORDER BY not_after ASC NULLS LAST, resource_id ASC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]*CloudCertificate, 0)
+	for rows.Next() {
+		c, err := scanCloudCertificate(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, c)
+	}
+	return out, total, rows.Err()
+}
+
+func (s *PostgresStore) GetCloudCertificate(ctx context.Context, id string) (*CloudCertificate, error) {
+	c, err := scanCloudCertificate(s.pool.QueryRow(ctx,
+		"SELECT "+cloudCertificateColumns+" FROM public.cloud_certificates WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("cloud certificate %s not found", id)
+	}
+	return c, err
+}
+
+func (s *PostgresStore) MarkCloudCertificateImported(ctx context.Context, id, certificateID string) error {
+	// Management state moves with the import. A list that still called an
+	// adopted certificate unmanaged would keep asking for work already done.
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.cloud_certificates
+		SET is_imported = true, imported_certificate_id = $2,
+		    management_state = 'MANAGED', matched_certificate_id = coalesce(matched_certificate_id, $2)
+		WHERE id = $1`, id, certificateID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("cloud certificate %s not found", id)
+	}
+	return nil
+}

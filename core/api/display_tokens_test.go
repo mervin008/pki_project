@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/certpilot/certpilot/core/engine/cloudsync"
 	"github.com/certpilot/certpilot/core/engine/ctlog"
 	"github.com/certpilot/certpilot/core/engine/discovery"
 	"github.com/certpilot/certpilot/core/engine/notifications"
@@ -77,7 +78,14 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 		Scanner: discovery.NewScanner(st, discovery.WithBroker(broker), discovery.WithDialTimeout(3*time.Second)),
 		// A stub source: these tests must not reach a public service, and a
 		// monitor without one would silently do nothing.
-		CTMonitor:  ctlog.NewMonitor(st, ctlog.WithBroker(broker), ctlog.WithSource(stubCTSource{})),
+		CTMonitor: ctlog.NewMonitor(st, ctlog.WithBroker(broker), ctlog.WithSource(stubCTSource{})),
+		// Likewise a stub cloud provider: these tests must not reach anybody's
+		// cloud account, and an engine without a builder would fail every sync
+		// for a reason that has nothing to do with what is being tested.
+		CloudEngine: cloudsync.NewEngine(st, keyring, cloudsync.WithBroker(broker),
+			cloudsync.WithProviderBuilder(func(string, []byte) (cloudsync.Provider, error) {
+				return stubCloudProvider{}, nil
+			})),
 		Keyring:    keyring,
 		Broker:     broker,
 		Dispatcher: dispatcher,

@@ -174,6 +174,38 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "Source", Value: fallback(str(payload, "source"), "—")},
 		}
 
+	case events.TopicCloudUnmanaged:
+		count := int(num(payload, "unmanaged_count"))
+		conn := fallback(str(payload, "connection"), "a cloud account")
+		alert.Title = fmt.Sprintf("%d certificate(s) in %s that you do not manage", count, conn)
+		alert.Summary = fmt.Sprintf(
+			"%d certificate(s) are stored in %s and CertPilot did not put them there. They are not being served on anything it scans, so nothing else would have found them.",
+			count, conn)
+		alert.Fields = []Field{
+			{Label: "Connection", Value: conn},
+			{Label: "Provider", Value: providerText(str(payload, "provider"))},
+			{Label: "Unmanaged", Value: countText(num(payload, "unmanaged_count"))},
+			{Label: "Certificates", Value: fallback(listText(payload, "certificates"), "—")},
+		}
+
+	case events.TopicCloudWillNotRenew:
+		count := int(num(payload, "count"))
+		conn := fallback(str(payload, "connection"), "a cloud account")
+		provider := providerText(str(payload, "provider"))
+		alert.Title = fmt.Sprintf("%d certificate(s) in %s that nothing will renew", count, conn)
+		// The point is the mismatch between what the provider does and what
+		// everybody assumes it does. Saying "expiring soon" would describe a
+		// certificate; saying this describes a belief that is about to fail.
+		alert.Summary = fmt.Sprintf(
+			"%s itself reports that it does not renew %d certificate(s) in %s. They expire on their own schedule and stop working, and the console shows them as healthy until they do.",
+			provider, count, conn)
+		alert.Fields = []Field{
+			{Label: "Connection", Value: conn},
+			{Label: "Provider", Value: provider},
+			{Label: "Not renewing", Value: countText(num(payload, "count"))},
+			{Label: "Certificates", Value: fallback(listText(payload, "certificates"), "—")},
+		}
+
 	case events.TopicGatewayStatus:
 		name := str(payload, "name")
 		alert.Title = fmt.Sprintf("Gateway %s", fallback(str(payload, "status"), "status changed"))
@@ -382,4 +414,23 @@ func dropEmpty(fields []Field) []Field {
 		kept = append(kept, f)
 	}
 	return kept
+}
+
+// providerText turns a stored provider identifier into the name people use for
+// it. "aws_acm" in a Slack message reads as a database column, not a product.
+func providerText(provider string) string {
+	switch provider {
+	case "aws_acm":
+		return "AWS Certificate Manager"
+	case "azure_key_vault":
+		return "Azure Key Vault"
+	case "gcp":
+		return "Google Cloud"
+	case "kubernetes":
+		return "Kubernetes"
+	case "":
+		return "—"
+	default:
+		return provider
+	}
 }

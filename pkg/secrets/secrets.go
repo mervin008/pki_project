@@ -31,11 +31,12 @@ import (
 // Context strings identify which field a ciphertext belongs to. They are bound
 // into the ciphertext as additional authenticated data.
 const (
-	ContextCAAccountConfig    = "ca_account:config"
-	ContextCertificatePrivKey = "certificate:private_key"
-	ContextDeploymentConfig   = "deployment_target:config"
-	ContextNotificationConfig = "notification_channel:config"
-	ContextACMEAccountKey     = "ca_account:acme_account_key"
+	ContextCAAccountConfig       = "ca_account:config"
+	ContextCertificatePrivKey    = "certificate:private_key"
+	ContextDeploymentConfig      = "deployment_target:config"
+	ContextNotificationConfig    = "notification_channel:config"
+	ContextCloudConnectionConfig = "cloud_connection:config"
+	ContextACMEAccountKey        = "ca_account:acme_account_key"
 )
 
 const (

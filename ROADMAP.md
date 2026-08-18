@@ -179,7 +179,7 @@ The rest:
 | 2 | CIDR expansion, worker pool, cancellation, progress on the stream | ✅ |
 | 3 | Scheduled scans and re-scan reconciliation | ✅ |
 | 4 | CT log monitoring | ✅ |
-| 5 | Cloud inventory: ACM, Azure Key Vault, GCP, Kubernetes secrets | |
+| 5 | Cloud inventory: ACM, Azure Key Vault, GCP, Kubernetes secrets | ✅ |
 
 One sentence governs the phase:
 
@@ -351,9 +351,58 @@ publish a fingerprint. Both sides normalise first: CertPilot stores unpadded
 lowercase hex and indexes pad and upper-case them, and a mismatch there would
 report this system's own certificates as ones nobody manages.
 
-**Still open in this phase:** two replicas both run every schedule and every CT
-monitor. Leader election over Postgres advisory locks arrives with the renewal
-engine in phase 4, which has the same gap.
+**Step 5** covered the third place certificates hide: stored rather than served.
+ACM, Azure Key Vault, Google Cloud load balancing, and Kubernetes TLS secrets.
+
+The reason this belongs in a certificate lifecycle tool, rather than "because
+cloud is popular", is one sentence: **cloud certificate stores do not renew
+everything in them, and everybody believes they do.** AWS never renews an
+imported certificate and says so in `RenewalEligibility`, a field beside a green
+`ISSUED` on the console. A Key Vault certificate whose policy issuer is
+`Unknown` was uploaded as a PFX and has no issuer to go back to — its lifetime
+action can only send an email. A GCP `SELF_MANAGED` certificate sits in the same
+list as its `MANAGED` neighbour and is renewed by nobody. A Kubernetes secret
+without a cert-manager annotation was made by hand by somebody who may have
+left. On each provider's own console, all four are indistinguishable from the
+ones that renew themselves.
+
+Severity therefore tracks **time rather than category**. The same self-managed
+certificate is a note with a year left and an emergency with three weeks left,
+and ranking them alike buries the one that matters among two hundred that do
+not — the noise rule from step 1, in a new place. The inverse finding is the
+sharpest of all: a provider that claims to renew a certificate and has not, days
+from expiry, means automatic renewal has failed and nothing else would have said
+so.
+
+Two things are recorded that a naive inventory would omit. **Scopes** — what
+each sync actually enumerated, in the provider's own words, including what it
+cannot see: ACM is regional, and GCP Certificate Manager is not covered at all.
+A tool that quietly covers one corner of a provider while presenting itself as
+covering the provider produces a short list that reads as a small estate when it
+is really a narrow search. And **attachment is three-valued**: attached, not
+attached, or not knowable. A Key Vault has no idea what is serving its
+certificates, and reporting "nothing is using this" there would be inventing a
+finding.
+
+No cloud SDK is vendored. The four providers are their REST APIs plus SigV4,
+OAuth2 client credentials, JWT-bearer signing, and the instance metadata
+services, written out — roughly two hundred transitive modules avoided inside a
+process that holds every private key this system has issued. The signer is
+checked against AWS's published test vector, because the failure mode of getting
+it subtly wrong is a 403 that reads on a dashboard as the account refusing us.
+
+Two defects came out of running it rather than testing it. An expired
+certificate that nothing renews looked exactly like an expired certificate
+cert-manager was about to replace on its own, because the two findings were
+competing in one switch; they are separate facts now and both are raised. And
+the import was rejected outright by a check constraint from migration 001 that
+had never heard of `CLOUD` — invisible to every test, because the in-memory
+store enforces no constraints. Writing `IMPORT` instead would have passed and
+thrown away the answer to the only question that column exists for.
+
+**Still open in this phase:** two replicas both run every schedule, every CT
+monitor, and every cloud sync. Leader election over Postgres advisory locks
+arrives with the renewal engine in phase 4, which has the same gap.
 
 ### Phase 4 — A renewal engine that survives 47-day certificates
 

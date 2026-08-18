@@ -23,6 +23,8 @@ var requiredTables = []string{
 	"ca_accounts",
 	"ca_authorities",
 	"certificates",
+	"cloud_certificates",
+	"cloud_connections",
 	"deployment_targets",
 	"ct_certificates",
 	"ct_monitors",
@@ -198,6 +200,13 @@ func warnOnStaleSchema(ctx context.Context, pool *pgxpool.Pool) {
 				SELECT 1 FROM information_schema.tables
 				WHERE table_schema = 'public' AND table_name = 'discovery_schedules')`,
 			consequence: "there is no discovery_schedules table (migration 009); scheduled scans will not run",
+		},
+		{
+			// Migration 011.
+			query: `SELECT NOT EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = 'public' AND table_name = 'cloud_connections')`,
+			consequence: "there is no cloud_connections table (migration 011); certificates stored in ACM, Key Vault, GCP, or Kubernetes will not be inventoried",
 		},
 		{
 			// Migration 005. This one is a hard failure at write time rather

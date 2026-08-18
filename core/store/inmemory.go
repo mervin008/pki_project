@@ -41,6 +41,8 @@ type MemoryStore struct {
 	discoverySchedules map[string]*DiscoverySchedule
 	ctMonitors         map[string]*CTMonitor
 	ctCertificates     []*CTCertificate
+	cloudConnections   map[string]*CloudConnection
+	cloudCertificates  []*CloudCertificate
 }
 
 // clone returns a shallow copy of a stored record.
@@ -235,7 +237,8 @@ func NewMemoryStore() *MemoryStore {
 		// Also empty. A monitor is an outbound query on a timer, and a seeded
 		// one would have a fresh install polling a public service about a
 		// domain nobody asked it to watch.
-		ctMonitors: make(map[string]*CTMonitor),
+		ctMonitors:       make(map[string]*CTMonitor),
+		cloudConnections: make(map[string]*CloudConnection),
 	}
 }
 
@@ -1539,4 +1542,314 @@ func (m *MemoryStore) ListCTCertificates(ctx context.Context, filter CTCertifica
 		end = len(matched)
 	}
 	return matched[filter.Offset:end], total, nil
+}
+
+// ── Cloud inventory ─────────────────────────────────────────
+
+func (m *MemoryStore) ListCloudConnections(ctx context.Context) ([]*CloudConnection, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*CloudConnection, 0, len(m.cloudConnections))
+	for _, conn := range m.cloudConnections {
+		out = append(out, clone(conn))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *MemoryStore) GetCloudConnection(ctx context.Context, id string) (*CloudConnection, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if conn, ok := m.cloudConnections[id]; ok {
+		return clone(conn), nil
+	}
+	return nil, fmt.Errorf("cloud connection %s not found", id)
+}
+
+func (m *MemoryStore) CreateCloudConnection(ctx context.Context, conn *CloudConnection) error {
+	if strings.TrimSpace(conn.Name) == "" {
+		return fmt.Errorf("a cloud connection needs a name")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, existing := range m.cloudConnections {
+		if strings.EqualFold(existing.Name, conn.Name) {
+			return fmt.Errorf("a cloud connection named %q already exists", conn.Name)
+		}
+	}
+	if conn.ID == "" {
+		conn.ID = uuid.New().String()
+	}
+	if conn.Scopes == nil {
+		conn.Scopes = []string{}
+	}
+	now := time.Now()
+	conn.CreatedAt, conn.UpdatedAt = now, now
+	m.cloudConnections[conn.ID] = clone(conn)
+	return nil
+}
+
+func (m *MemoryStore) UpdateCloudConnection(ctx context.Context, conn *CloudConnection) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	existing, ok := m.cloudConnections[conn.ID]
+	if !ok {
+		return fmt.Errorf("cloud connection %s not found", conn.ID)
+	}
+	updated := clone(conn)
+	// Carried over rather than taken from the caller: an edit is not a sync,
+	// and the credentials are only replaced when new ones were supplied.
+	updated.CreatedAt = existing.CreatedAt
+	updated.UpdatedAt = time.Now()
+	updated.LastSyncedAt = existing.LastSyncedAt
+	updated.LastSuccessAt = existing.LastSuccessAt
+	updated.NextSyncAt = existing.NextSyncAt
+	updated.Scopes = existing.Scopes
+	updated.CertificatesSeen = existing.CertificatesSeen
+	updated.UnmanagedSeen = existing.UnmanagedSeen
+	if updated.ConfigEncrypted == "" {
+		updated.ConfigEncrypted = existing.ConfigEncrypted
+	}
+	m.cloudConnections[conn.ID] = updated
+	return nil
+}
+
+func (m *MemoryStore) DeleteCloudConnection(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.cloudConnections[id]; !ok {
+		return fmt.Errorf("cloud connection %s not found", id)
+	}
+	delete(m.cloudConnections, id)
+
+	kept := m.cloudCertificates[:0]
+	for _, c := range m.cloudCertificates {
+		if c.ConnectionID != id {
+			kept = append(kept, c)
+		}
+	}
+	m.cloudCertificates = kept
+	return nil
+}
+
+func (m *MemoryStore) GetDueCloudConnections(ctx context.Context, now time.Time) ([]*CloudConnection, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*CloudConnection, 0)
+	for _, conn := range m.cloudConnections {
+		if conn.Due(now) {
+			out = append(out, clone(conn))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *MemoryStore) MarkCloudConnectionSynced(ctx context.Context, id string, syncedAt, nextSyncAt time.Time,
+	success bool, scopes []string, seen, unmanaged int, syncErr string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	conn, ok := m.cloudConnections[id]
+	if !ok {
+		return fmt.Errorf("cloud connection %s not found", id)
+	}
+	conn.LastSyncedAt = &syncedAt
+	conn.NextSyncAt = &nextSyncAt
+	conn.LastError = syncErr
+	if success {
+		// Only a sync that answered moves the success timestamp. This is the
+		// whole reason there are two of them.
+		conn.LastSuccessAt = &syncedAt
+		conn.Scopes = append([]string{}, scopes...)
+		conn.CertificatesSeen = seen
+		conn.UnmanagedSeen = unmanaged
+	}
+	conn.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryStore) UpsertCloudCertificates(ctx context.Context, certs []*CloudCertificate) ([]*CloudCertificate, error) {
+	added := make([]*CloudCertificate, 0, len(certs))
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	for _, c := range certs {
+		var existing *CloudCertificate
+		for _, stored := range m.cloudCertificates {
+			if stored.ConnectionID == c.ConnectionID && stored.ResourceID == c.ResourceID {
+				existing = stored
+				break
+			}
+		}
+
+		if existing != nil {
+			first, created := existing.FirstSeenAt, existing.CreatedAt
+			id := existing.ID
+			imported, importedID := existing.IsImported, existing.ImportedCertificateID
+			*existing = *clone(c)
+			existing.ID = id
+			// first_seen_at survives: a certificate that came back is the same
+			// certificate returning, and when it first appeared is the part
+			// worth keeping.
+			existing.FirstSeenAt, existing.CreatedAt = first, created
+			existing.LastSeenAt = c.LastSeenAt
+			existing.RemovedAt = nil
+			if imported {
+				existing.IsImported, existing.ImportedCertificateID = imported, importedID
+				existing.ManagementState = CloudManagedState(existing.ManagementState, true)
+			}
+			continue
+		}
+
+		stored := clone(c)
+		if stored.ID == "" {
+			stored.ID = uuid.New().String()
+		}
+		stored.FirstSeenAt = now
+		if stored.LastSeenAt.IsZero() {
+			stored.LastSeenAt = now
+		}
+		stored.CreatedAt = now
+		m.cloudCertificates = append(m.cloudCertificates, stored)
+
+		c.ID, c.FirstSeenAt, c.CreatedAt = stored.ID, stored.FirstSeenAt, stored.CreatedAt
+		added = append(added, clone(stored))
+	}
+	return added, nil
+}
+
+// CloudManagedState keeps an adopted certificate managed.
+//
+// Exported because the two store implementations must agree on it: a sync that
+// ran after somebody imported a certificate would otherwise reset the verdict
+// to unmanaged and put the same work back on the list.
+func CloudManagedState(state string, imported bool) string {
+	if imported {
+		return DiscoveryManaged
+	}
+	return state
+}
+
+func (m *MemoryStore) MarkCloudCertificatesRemoved(ctx context.Context, connectionID string,
+	seenResourceIDs []string, at time.Time) (int, error) {
+	// An empty seen list is not treated as "everything is gone". A provider
+	// that answered with nothing is possible, but so is a bug, and reporting an
+	// entire estate as deleted is the more expensive mistake of the two.
+	if len(seenResourceIDs) == 0 {
+		return 0, nil
+	}
+
+	seen := make(map[string]bool, len(seenResourceIDs))
+	for _, id := range seenResourceIDs {
+		seen[id] = true
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	count := 0
+	for _, c := range m.cloudCertificates {
+		if c.ConnectionID != connectionID || c.RemovedAt != nil || seen[c.ResourceID] {
+			continue
+		}
+		when := at
+		c.RemovedAt = &when
+		count++
+	}
+	return count, nil
+}
+
+func (m *MemoryStore) ListCloudCertificates(ctx context.Context, filter CloudCertificateFilter) ([]*CloudCertificate, int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	matched := make([]*CloudCertificate, 0)
+	for _, c := range m.cloudCertificates {
+		if filter.ConnectionID != "" && c.ConnectionID != filter.ConnectionID {
+			continue
+		}
+		if filter.ManagementState != "" && c.ManagementState != filter.ManagementState {
+			continue
+		}
+		if !filter.IncludeRemoved && c.RemovedAt != nil {
+			continue
+		}
+		if filter.UnimportedOnly && c.IsImported {
+			continue
+		}
+		if filter.FindingCode != "" && !hasFinding(c.Findings, filter.FindingCode) {
+			continue
+		}
+		matched = append(matched, clone(c))
+	}
+
+	// Soonest to expire first: the list is read to decide what to deal with
+	// today, not to browse an inventory.
+	sort.Slice(matched, func(i, j int) bool {
+		a, b := matched[i].NotAfter, matched[j].NotAfter
+		switch {
+		case a == nil && b == nil:
+			return matched[i].ResourceID < matched[j].ResourceID
+		case a == nil:
+			return false
+		case b == nil:
+			return true
+		case a.Equal(*b):
+			return matched[i].ResourceID < matched[j].ResourceID
+		}
+		return a.Before(*b)
+	})
+
+	total := int64(len(matched))
+	return paginate(matched, filter.Limit, filter.Offset), total, nil
+}
+
+func hasFinding(findings []Finding, code string) bool {
+	for _, f := range findings {
+		if f.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MemoryStore) GetCloudCertificate(ctx context.Context, id string) (*CloudCertificate, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, c := range m.cloudCertificates {
+		if c.ID == id {
+			return clone(c), nil
+		}
+	}
+	return nil, fmt.Errorf("cloud certificate %s not found", id)
+}
+
+func (m *MemoryStore) MarkCloudCertificateImported(ctx context.Context, id, certificateID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, c := range m.cloudCertificates {
+		if c.ID != id {
+			continue
+		}
+		c.IsImported = true
+		c.ImportedCertificateID = &certificateID
+		c.ManagementState = DiscoveryManaged
+		if c.MatchedCertificateID == nil {
+			c.MatchedCertificateID = &certificateID
+		}
+		return nil
+	}
+	return fmt.Errorf("cloud certificate %s not found", id)
 }

@@ -103,8 +103,9 @@ explicitly.
 | Kiosk display tokens | ✅ | Read-only, viewer-scoped, expiring, revocable credentials for a wall display |
 | CA hierarchy tree | ⚠️ | Position and lineage are shown per CA and a malformed hierarchy is flagged; the tree is not drawn as a tree |
 | Policy engine | ⚠️ | `key_size`, `max_lifetime`, `ca_restriction`; other rule types are not implemented |
-| Discovery | ⚠️ | Scans hosts, CIDR networks, and address ranges on a schedule; records the full handshake, says which certificates nobody manages, and reports what changed since last time. No cloud inventory yet |
+| Discovery | ✅ | Scans hosts, CIDR networks, and address ranges on a schedule; records the full handshake, says which certificates nobody manages, and reports what changed since last time |
 | Certificate Transparency | ✅ | Watches CT for certificates issued in your name — including ones never deployed anywhere you could scan. A check that could not run is never reported as a check that found nothing |
+| Cloud inventory | ✅ | Reads ACM, Azure Key Vault, Google Cloud, and Kubernetes TLS secrets. Reports which certificates the provider itself will not renew — the ones everybody assumes are automatic |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ❌ | Not started |
 | Host agent | ❌ | Not started |
@@ -372,6 +373,69 @@ not look like a check that found nothing.** Every monitor records when a check
 was last *attempted* and when one last *answered*, separately, and the list
 names the domains that have gone quiet. An on-demand check against an
 unreachable index answers 502 with its own words, never an empty list.
+
+### Certificates nobody is renewing
+
+A scan finds what is **served**. Certificate Transparency finds what was
+**issued**. Neither finds what is merely **stored** — a certificate sitting in
+ACM, in a Key Vault, in a Google load balancer, or in a Kubernetes secret,
+attached to an address nobody scanned or attached to nothing at all.
+
+```bash
+curl -X POST localhost:8080/api/v1/cloud/connections -H 'Content-Type: application/json' \
+  -d '{"name": "prod-eu", "provider": "aws_acm",
+       "config": {"region": "eu-west-1",
+                  "role_arn": "arn:aws:iam::1234:role/certpilot-read",
+                  "web_identity_token_file": "/var/run/secrets/eks.amazonaws.com/serviceaccount/token"}}'
+```
+
+The finding this exists for is not "here is another certificate". It is that
+**cloud certificate stores do not renew everything in them, and everybody
+believes they do**:
+
+| Provider | Renewed | Not renewed, and identical on the console |
+|:---|:---|:---|
+| AWS ACM | Amazon-issued, still validating | anything **imported** — `RenewalEligibility: INELIGIBLE` |
+| Azure Key Vault | a policy with an `AutoRenew` action | issuer `Unknown`, meaning it was uploaded as a PFX |
+| Google Cloud | `MANAGED` | `SELF_MANAGED` — uploaded once, by someone who may have left |
+| Kubernetes | secrets cert-manager owns | everything else in the namespace |
+
+```
+2 of the 3 certificate(s) in lab cluster are ones the provider itself does not
+renew. They expire on their own schedule and stop working. 1 of them already has.
+```
+
+Severity tracks **time, not category**: a self-managed certificate with a year
+left is a note and the same certificate with three weeks left is an emergency,
+because a finding that appears on every row is what stops people reading the
+list. The sharpest one is the inverse — a provider that says it renews a
+certificate and has not, days from expiry. Automatic renewal has failed and
+nothing else would have said so.
+
+Every connection records what it actually **enumerated**, in the provider's own
+words, and shows it beside the results:
+
+```
+scopes:
+  - AWS Certificate Manager in eu-west-1 only — certificates in other regions
+    are not visible to this connection
+  - compute sslCertificates in project demo, global and every region
+  - NOT Certificate Manager (certificatemanager.googleapis.com)
+```
+
+A tool that covers one corner of a provider while presenting itself as covering
+the provider commits this project's original sin in a new place: a short list
+that reads as a small estate when it is really a narrow search. And as with CT,
+a sync that could not run is never a sync that found nothing — `last_synced_at`
+and `last_success_at` are separate columns, a failed sync answers 502 carrying
+the provider's own words, and it never concludes that an estate it could not
+reach has been dismantled.
+
+Credentials are sealed with the keyring before they are stored, never returned
+by any endpoint, and never written to the audit log. No cloud SDK is vendored:
+the four providers are their REST APIs plus SigV4, OAuth2, and JWT-bearer
+signing written out, because two hundred transitive modules is a poor trade
+inside a process that holds every private key this system has issued.
 
 ## Security model
 

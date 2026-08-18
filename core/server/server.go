@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/certpilot/certpilot/core/api"
+	"github.com/certpilot/certpilot/core/engine/cloudsync"
 	"github.com/certpilot/certpilot/core/engine/ctlog"
 	"github.com/certpilot/certpilot/core/engine/discovery"
 	"github.com/certpilot/certpilot/core/engine/notifications"
@@ -37,6 +38,7 @@ type Server struct {
 	scanner      *discovery.Scanner
 	discoverySch *discovery.Scheduler
 	ctMonitor    *ctlog.Monitor
+	cloudEngine  *cloudsync.Engine
 	cfg          *config.CoreConfig
 }
 
@@ -121,6 +123,11 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	// Certificate Transparency reaches what a scan cannot: certificates issued
 	// for these domains that were never deployed anywhere CertPilot can see.
 	ctMonitor := ctlog.NewMonitor(st, ctlog.WithBroker(broker))
+	// And the third place: certificates that are stored rather than served —
+	// in ACM, a Key Vault, a GCP load balancer, a Kubernetes secret — which no
+	// scan has an address for and no transparency log will ever mention if
+	// they came from an internal CA.
+	cloudEngine := cloudsync.NewEngine(st, keyring, cloudsync.WithBroker(broker))
 
 	// The dispatcher is an ordinary broker subscriber. That is the point: it
 	// makes outbound HTTP and SMTP calls, and a wedged destination can only cost
@@ -149,6 +156,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		PolicyEngine:  policyEng,
 		Scanner:       scanner,
 		CTMonitor:     ctMonitor,
+		CloudEngine:   cloudEngine,
 		Keyring:       keyring,
 		Broker:        broker,
 		Dispatcher:    dispatcher,
@@ -177,6 +185,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		scanner:      scanner,
 		discoverySch: discoverySch,
 		ctMonitor:    ctMonitor,
+		cloudEngine:  cloudEngine,
 		cfg:          cfg,
 	}, nil
 }
@@ -233,6 +242,7 @@ func (s *Server) Start() error {
 	// this loop does nothing but one indexed query a minute.
 	s.discoverySch.Start()
 	s.ctMonitor.Start()
+	s.cloudEngine.Start()
 
 	// After the producers, so nothing is published before there is anything
 	// subscribed to deliver it.
@@ -249,6 +259,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.caMonitor.Stop()
 	s.discoverySch.Stop()
 	s.ctMonitor.Stop()
+	s.cloudEngine.Stop()
 	// A range scan can run for minutes. Left alone it would hold the grace
 	// period open and then be killed mid-write anyway; cancelled, it records
 	// what it found and stops.

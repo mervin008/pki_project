@@ -52,6 +52,18 @@ const (
 	// certificate in CT is one that exists, is valid for your domain, and whose
 	// private key is held by somebody who did not get it from this system.
 	TopicCTUnmanaged = "ct.unmanaged"
+	// TopicCloudUnmanaged carries a certificate found sitting in a cloud
+	// store — ACM, a Key Vault, a GCP load balancer, a Kubernetes secret —
+	// that this system did not put there and does not manage.
+	TopicCloudUnmanaged = "cloud.unmanaged"
+	// TopicCloudWillNotRenew carries the finding this part of discovery exists
+	// for: the provider itself says nothing renews this certificate.
+	//
+	// A separate topic from the one above, because they are separate news. An
+	// unmanaged certificate is an inventory gap. A certificate nothing renews
+	// is a dated outage, and a team may reasonably want it routed somewhere
+	// that wakes somebody up.
+	TopicCloudWillNotRenew = "cloud.will_not_renew"
 	// TopicDiscoveryProgress reports how far a running scan has got. Stream
 	// only — see IsNotifiable.
 	TopicDiscoveryProgress = "discovery.progress"
@@ -102,6 +114,8 @@ func AllTopics() []string {
 		TopicDiscoveryUnmanaged,
 		TopicDiscoveryChanged,
 		TopicCTUnmanaged,
+		TopicCloudUnmanaged,
+		TopicCloudWillNotRenew,
 	}
 }
 

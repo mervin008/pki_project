@@ -708,3 +708,168 @@ type DashboardStats struct {
 	UnknownCAs int64 `json:"unknown_cas"`
 	TotalScans int64 `json:"total_scans"`
 }
+
+// Cloud provider identifiers. The value is stored, so these are part of the
+// schema's check constraint and cannot be renamed casually.
+const (
+	CloudProviderAWSACM        = "aws_acm"
+	CloudProviderAzureKeyVault = "azure_key_vault"
+	CloudProviderGCP           = "gcp"
+	CloudProviderKubernetes    = "kubernetes"
+)
+
+// CloudConnection is one place certificates are stored that CertPilot did not
+// put them.
+//
+// Credentials never live on this type in the clear: ConfigEncrypted is sealed
+// with the keyring before it reaches the store, and carries `json:"-"` so that
+// no handler can return it by forgetting to strip it.
+type CloudConnection struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	// ConfigEncrypted holds the sealed provider credentials. Never serialised.
+	ConfigEncrypted string `json:"-"`
+
+	IsEnabled           bool `json:"is_enabled"`
+	SyncIntervalMinutes int  `json:"sync_interval_minutes"`
+
+	// LastSyncedAt is when a sync was last attempted; LastSuccessAt when one
+	// last answered.
+	//
+	// The same split CTMonitor carries, for the same reason. A connection whose
+	// credentials expired three weeks ago must not read like an account that
+	// simply has no certificates in it — one of those is an all-clear and the
+	// other is a blind spot.
+	LastSyncedAt  *time.Time `json:"last_synced_at,omitempty"`
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	NextSyncAt    *time.Time `json:"next_sync_at,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+
+	// Scopes is what the last successful sync actually enumerated, in the
+	// provider's own words.
+	//
+	// A cloud account has several places a certificate can sit, and a tool that
+	// covers one of them while presenting itself as covering the provider
+	// commits this product's original sin in a new place: a short list that
+	// reads as a small estate when it is really a narrow search.
+	Scopes []string `json:"scopes"`
+
+	CertificatesSeen int       `json:"certificates_seen"`
+	UnmanagedSeen    int       `json:"unmanaged_seen"`
+	CreatedBy        *string   `json:"created_by,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// Due reports whether this connection should be synced now.
+func (c *CloudConnection) Due(now time.Time) bool {
+	if c == nil || !c.IsEnabled {
+		return false
+	}
+	if c.NextSyncAt == nil {
+		return true
+	}
+	return !c.NextSyncAt.After(now)
+}
+
+// Stale reports that this connection has not answered in long enough that its
+// silence means nothing.
+//
+// Three intervals, matching CTMonitor: one missed sync is a blip, three in a
+// row is a connection nobody is maintaining.
+func (c *CloudConnection) Stale(now time.Time) bool {
+	if c == nil || !c.IsEnabled {
+		return false
+	}
+	if c.LastSuccessAt == nil {
+		// Never succeeded. Only stale once it has had time to try, so a
+		// connection added a minute ago is not immediately an alarm.
+		return c.CreatedAt.Add(2 * time.Duration(c.SyncIntervalMinutes) * time.Minute).Before(now)
+	}
+	return c.LastSuccessAt.Add(3 * time.Duration(c.SyncIntervalMinutes) * time.Minute).Before(now)
+}
+
+// CloudCertificate is one certificate found sitting in a cloud store.
+type CloudCertificate struct {
+	ID           string `json:"id"`
+	ConnectionID string `json:"connection_id"`
+	// ResourceID is the provider's own identifier — an ARN, a Key Vault
+	// certificate id, a GCP self-link, a namespace/name. Unique per connection,
+	// which is what makes a repeated sync an update rather than a duplicate.
+	ResourceID string `json:"resource_id"`
+	Name       string `json:"name,omitempty"`
+	// Location is region, vault, or cluster — wherever the provider says this
+	// lives. It is the first thing somebody needs in order to go and look.
+	Location string `json:"location,omitempty"`
+
+	CommonName        string     `json:"common_name,omitempty"`
+	SubjectDN         string     `json:"subject_dn,omitempty"`
+	IssuerDN          string     `json:"issuer_dn,omitempty"`
+	SerialNumber      string     `json:"serial_number,omitempty"`
+	SANs              []string   `json:"sans"`
+	NotBefore         *time.Time `json:"not_before,omitempty"`
+	NotAfter          *time.Time `json:"not_after,omitempty"`
+	KeyType           string     `json:"key_type,omitempty"`
+	KeySize           int        `json:"key_size,omitempty"`
+	FingerprintSHA256 string     `json:"fingerprint_sha256,omitempty"`
+	CertificatePEM    string     `json:"certificate_pem,omitempty"`
+
+	ManagementState      string  `json:"management_state"`
+	MatchedCertificateID *string `json:"matched_certificate_id,omitempty"`
+
+	// RenewalMode is what the provider says, verbatim — "IMPORTED",
+	// "SELF_MANAGED", "AutoRenew", "cert-manager". Kept as the provider's own
+	// word rather than reduced to a boolean, because that word is what somebody
+	// has to go and find in their own console.
+	RenewalMode string `json:"renewal_mode,omitempty"`
+	// WillRenew is whether the provider itself renews this. Nil means the
+	// provider did not say, which is not the same as no.
+	WillRenew *bool `json:"will_renew,omitempty"`
+
+	// Attached reports whether anything is using it. Nil means the provider
+	// could not be asked — a Key Vault has no notion of attachment at all — and
+	// that is deliberately distinct from false, which means nothing is using it.
+	Attached   *bool    `json:"attached,omitempty"`
+	AttachedTo []string `json:"attached_to"`
+
+	Findings []Finding `json:"findings"`
+
+	IsImported            bool    `json:"is_imported"`
+	ImportedCertificateID *string `json:"imported_certificate_id,omitempty"`
+
+	FirstSeenAt time.Time `json:"first_seen_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+	// RemovedAt is set when a sync that succeeded no longer found it. The row
+	// is kept: a certificate that disappeared from the store is information,
+	// and deleting it takes its own history along with it.
+	RemovedAt *time.Time `json:"removed_at,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
+// WorstSeverity returns the highest severity among this certificate's findings.
+func (c *CloudCertificate) WorstSeverity() string {
+	rank := map[string]int{"INFO": 1, "WARNING": 2, "CRITICAL": 3}
+	worst := ""
+	for _, f := range c.Findings {
+		if rank[f.Severity] > rank[worst] {
+			worst = f.Severity
+		}
+	}
+	return worst
+}
+
+// CloudCertificateFilter narrows a listing.
+type CloudCertificateFilter struct {
+	ConnectionID    string
+	ManagementState string
+	// FindingCode returns only certificates carrying this finding, which is how
+	// "show me everything nothing will renew" is asked.
+	FindingCode string
+	// IncludeRemoved brings back certificates that have since disappeared from
+	// the provider. Off by default: the list is about what is there now.
+	IncludeRemoved bool
+	UnimportedOnly bool
+	Limit          int
+	Offset         int
+}

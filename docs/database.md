@@ -78,8 +78,10 @@ make migrate
   applied  008_scan_cancellation.sql
   applied  009_discovery_schedules.sql
   applied  010_ct_monitoring.sql
+  applied  011_cloud_inventory.sql
+  applied  012_cloud_provenance.sql
 
-Applied 10 migration(s).
+Applied 12 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so
@@ -93,7 +95,8 @@ while the others still read the old shape. Run it as a job, an init container, o
 by hand.
 
 If you would rather paste the SQL into the Supabase SQL editor, apply the files
-in numeric order. `004`, `006`, `007`, and `008` add columns to tables `001` creates.
+in numeric order. `004`, `006`, `007`, `008`, and `012` add columns to or alter
+constraints on tables `001` creates.
 
 ### Migration 005 is not optional
 
@@ -234,3 +237,25 @@ recording because it is the argument for a container-backed test suite:
 Migration 001 also had to be made rerunnable: `create policy` has no
 `if not exists`, so applying the file to a database that already had the schema
 failed on the first policy and rolled back everything.
+
+### Migration 012 exists because a check constraint outlived its list
+
+`001` constrained `certificates.discovered_via` to `MANUAL`, `SCAN`, `CT_LOG`,
+`IMPORT`, and `REQUESTED`. Adopting a certificate found in a cloud store is none
+of those, and the insert was rejected outright.
+
+It is worth recording alongside the four defects below, because it is the same
+lesson arriving from a different direction: **the in-memory store enforces no
+check constraints**, so every automated test of the import path passed. It was
+found by importing a certificate against the real database.
+
+The tempting fix was to write `IMPORT` and move on. `discovered_via` exists to
+answer one question — which of these did we issue, and which did we merely find?
+— and answering it with the same word for a PEM somebody pasted and a
+certificate discovered sitting in a production Key Vault throws away the more
+interesting half.
+
+Migrations are append-only for the same reason the migrator checksums them: an
+edit to `001` would have left this database recording a file it no longer
+matches. Editing an applied migration prints a warning on every subsequent run,
+which is the migrator working correctly and worth not silencing.

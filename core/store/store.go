@@ -168,6 +168,41 @@ type Store interface {
 	RecordCTCertificates(ctx context.Context, certs []*CTCertificate) ([]*CTCertificate, error)
 	ListCTCertificates(ctx context.Context, filter CTCertificateFilter) ([]*CTCertificate, int64, error)
 
+	// ── Cloud inventory ─────────────────────────────────────
+	ListCloudConnections(ctx context.Context) ([]*CloudConnection, error)
+	GetCloudConnection(ctx context.Context, id string) (*CloudConnection, error)
+	CreateCloudConnection(ctx context.Context, conn *CloudConnection) error
+	UpdateCloudConnection(ctx context.Context, conn *CloudConnection) error
+	DeleteCloudConnection(ctx context.Context, id string) error
+	GetDueCloudConnections(ctx context.Context, now time.Time) ([]*CloudConnection, error)
+	// MarkCloudConnectionSynced records the outcome of one sync.
+	//
+	// syncedAt always moves; the success timestamp moves only when the provider
+	// actually answered. Everything on screen that says "this account is being
+	// watched" is really saying "we last heard from it at this time", and a
+	// connection with expired credentials must not read as a quiet one.
+	//
+	// scopes is what the sync enumerated, in the provider's own words, so a
+	// short result is never mistaken for a small estate.
+	MarkCloudConnectionSynced(ctx context.Context, id string, syncedAt, nextSyncAt time.Time,
+		success bool, scopes []string, seen, unmanaged int, syncErr string) error
+
+	// UpsertCloudCertificates writes what a sync found, keyed on the provider's
+	// own resource id. Returns only the certificates that were new to this
+	// connection — an alert is built from those, because a sync every six hours
+	// re-reporting the same ACM inventory is how a channel gets muted.
+	UpsertCloudCertificates(ctx context.Context, certs []*CloudCertificate) ([]*CloudCertificate, error)
+	// MarkCloudCertificatesRemoved flags the certificates a successful sync did
+	// not find any more. Called only after a sync that answered: marking
+	// everything removed because an API call failed would report an estate
+	// being dismantled.
+	MarkCloudCertificatesRemoved(ctx context.Context, connectionID string, seenResourceIDs []string, at time.Time) (int, error)
+	ListCloudCertificates(ctx context.Context, filter CloudCertificateFilter) ([]*CloudCertificate, int64, error)
+	GetCloudCertificate(ctx context.Context, id string) (*CloudCertificate, error)
+	// MarkCloudCertificateImported links a cloud certificate to the inventory
+	// record somebody adopted it into, and settles its verdict.
+	MarkCloudCertificateImported(ctx context.Context, id, certificateID string) error
+
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)
