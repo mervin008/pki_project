@@ -125,13 +125,29 @@ type CAAccount struct {
 	// to API clients: the ciphertext is not a secret by itself, but shipping
 	// it to every dashboard reader turns one compromised KEK into a total
 	// credential loss instead of requiring database access as well.
-	ConfigEncrypted string     `json:"-"`
-	IsDefault       bool       `json:"is_default"`
-	Status          string     `json:"status"` // CONNECTED, DISCONNECTED, ERROR
-	LastHealthAt    *time.Time `json:"last_health_at,omitempty"`
-	CreatedBy       *string    `json:"created_by,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	ConfigEncrypted string `json:"-"`
+	IsDefault       bool   `json:"is_default"`
+	Status          string `json:"status"` // CONNECTED, DISCONNECTED, ERROR
+
+	// RenewalRateLimit is how many certificates this account may successfully
+	// renew inside RenewalRateWindowHours. Zero means unlimited.
+	//
+	// Unlimited is the right default. Inventing a conservative limit for a CA
+	// whose real limits nobody has entered would delay renewals for a
+	// constraint that does not exist, and a certificate that expired because
+	// this tool was being cautious is the worst outcome available.
+	RenewalRateLimit int `json:"renewal_rate_limit"`
+	// RenewalRateWindowHours is the rolling window the limit is counted over.
+	//
+	// Hours rather than a named period, because providers do not agree on what
+	// a period is — a rolling week for certificates, a rolling three hours for
+	// orders — and hours is the only shape that describes all of them without
+	// lying about any of them.
+	RenewalRateWindowHours int        `json:"renewal_rate_window_hours"`
+	LastHealthAt           *time.Time `json:"last_health_at,omitempty"`
+	CreatedBy              *string    `json:"created_by,omitempty"`
+	CreatedAt              time.Time  `json:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
 }
 
 // Certificate represents a managed TLS certificate.
@@ -900,6 +916,17 @@ type RenewalAttempt struct {
 	Number     int       `json:"number"`
 	StartedAt  time.Time `json:"started_at"`
 	DurationMS int64     `json:"duration_ms"`
+	// Deferred marks an entry where no renewal was attempted at all — the CA's
+	// rate limit had no room, so the job was put back.
+	//
+	// Kept distinct from a failure, and not counted as an attempt, because they
+	// mean opposite things. A deferral is the system working: it declined to
+	// spend a limit that would have suspended issuance for everyone. Counting
+	// it as a failure would inflate the attempt count and escalate a
+	// certificate that is not broken, which teaches people that escalation does
+	// not mean anything.
+	Deferred bool   `json:"deferred,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 	// Worker names the process that made the attempt, so a failure isolated to
 	// one replica is visible as one.
 	Worker string `json:"worker,omitempty"`
@@ -935,6 +962,11 @@ type RenewalJob struct {
 	// at enqueue. Denormalised so the queue can be ordered by urgency on every
 	// claim without a join.
 	NotAfter *time.Time `json:"not_after,omitempty"`
+
+	// CAAccountID is which account's rate limit this renewal spends,
+	// denormalised at enqueue for the same reason NotAfter is: it is read on
+	// every pacing decision.
+	CAAccountID *string `json:"ca_account_id,omitempty"`
 
 	// FingerprintAtEnqueue is what the certificate was when the job was
 	// created. The crash guard: if the certificate has moved on its own, the

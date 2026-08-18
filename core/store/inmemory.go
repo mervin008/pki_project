@@ -2085,3 +2085,69 @@ func (m *MemoryStore) CancelRenewalJob(ctx context.Context, id string) error {
 	}
 	return fmt.Errorf("renewal job %s is not outstanding", id)
 }
+
+func (m *MemoryStore) DeferRenewalJob(ctx context.Context, id string, runAfter time.Time, reason string, escalate bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, job := range m.renewalJobs {
+		if job.ID != id {
+			continue
+		}
+		job.Status = RenewalPending
+		job.RunAfter = runAfter
+		// Decremented because the claim incremented it and no renewal
+		// happened. Restoring the truth rather than fiddling the number: the
+		// count means "times we tried to renew this", and a deferral is exactly
+		// the case where we did not.
+		if job.Attempts > 0 {
+			job.Attempts--
+		}
+		job.LockedBy, job.LockedUntil = nil, nil
+		// last_error is left alone. A deferral is not an error, and overwriting
+		// the real reason a job has been failing would hide the thing somebody
+		// needs to fix.
+		log := append(append([]RenewalAttempt{}, job.AttemptLog...), RenewalAttempt{
+			StartedAt: time.Now(), Deferred: true, Reason: reason,
+		})
+		if len(log) > maxAttemptLog {
+			log = log[len(log)-maxAttemptLog:]
+		}
+		job.AttemptLog = log
+		if escalate && job.EscalatedAt == nil {
+			// Set once and left. A quota that outlasts the certificate is
+			// announced the first time it is noticed, not on every deferral
+			// for the months until it expires.
+			when := time.Now()
+			job.EscalatedAt = &when
+		}
+		job.UpdatedAt = time.Now()
+		return nil
+	}
+	return fmt.Errorf("renewal job %s not found", id)
+}
+
+func (m *MemoryStore) CountRecentRenewals(ctx context.Context, caAccountID string, since time.Time) (int, *time.Time, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	count := 0
+	var oldest *time.Time
+	for _, job := range m.renewalJobs {
+		if job.Status != RenewalSucceeded || job.CompletedAt == nil {
+			continue
+		}
+		if job.CAAccountID == nil || *job.CAAccountID != caAccountID {
+			continue
+		}
+		if job.CompletedAt.Before(since) {
+			continue
+		}
+		count++
+		if oldest == nil || job.CompletedAt.Before(*oldest) {
+			when := *job.CompletedAt
+			oldest = &when
+		}
+	}
+	return count, oldest, nil
+}

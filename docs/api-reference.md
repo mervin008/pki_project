@@ -894,9 +894,26 @@ A failed attempt leaves the job **PENDING** with `run_after` moved forward.
 There is no attempt count at which a certificate stops needing to be renewed,
 and a queue that gives up on its own goes quiet exactly when it matters.
 
-Backoff is exponential from 2 minutes to a 6-hour ceiling, **jittered ±20%**.
-Forty renewals failing against one CA outage and all coming back at the same
-instant is how a transient failure becomes a rate-limit suspension.
+The delay is the **smaller** of two answers: what exponential backoff says
+(2 minutes doubling to a 6-hour ceiling), and what the deadline allows — the
+remaining runway divided into a budget of 24 more attempts.
+
+| Runway | Delay |
+|:---|:---|
+| a month | ~6 hours, the ordinary ceiling |
+| a day | ~1 hour |
+| an hour | a few minutes |
+| already expired | the 60-second floor |
+
+Every backoff library assumes there is no deadline. A certificate has one, and
+as it approaches the cost of *not* retrying grows without bound while the cost
+of retrying stays flat, so backing off further is exactly wrong. Never faster
+than 60 seconds, though: a CA answering the same error once a second will not
+answer differently on the two hundredth try.
+
+Jittered ±20% either way. Forty renewals failing against one CA outage and all
+coming back at the same instant is how a transient failure becomes a rate-limit
+suspension.
 
 `escalated_at` is set when a failure stops being a blip — three attempts, or a
 single failure with less than seven days of runway, because close to expiry
@@ -913,6 +930,53 @@ long enough to need attention … Each of these is a certificate on a countdown.
 The listing defaults to outstanding jobs only — the question is almost always
 "what is about to happen", not "what happened last month". `?outstanding=false`
 returns the history.
+
+### Rate limits: deferred is not failed
+
+```
+PUT /api/v1/ca-accounts/{id}/rate-limit          (operator)
+{ "renewal_rate_limit": 50, "renewal_rate_window_hours": 168 }
+```
+
+A public CA counts certificates per registered domain per week, and exhausting
+that suspends issuance for the whole organisation — at exactly the moment
+somebody is reissuing to fix an outage. `0` means unlimited and is the default,
+deliberately: inventing a limit for a CA whose real limits nobody entered would
+delay renewals for a constraint that does not exist.
+
+A renewal with no slot available is **deferred**, and a deferral is carefully
+not a failure:
+
+- `attempts` is not incremented — the claim's increment is undone, because
+  nothing was tried
+- `last_error` is left holding whatever real failure came before it
+- nothing escalates: a job that waited nine times has not failed nine times
+- `run_after` is set to the moment the oldest renewal ages out of the window, so
+  it returns exactly once rather than polling
+
+```json
+{ "attempt_log": [ { "deferred": true,
+    "reason": "letsencrypt-prod has renewed 50 certificate(s) in the last 168 hours, which is its limit of 50. A slot opens at 2026-08-25T20:53:33+02:00." } ] }
+```
+
+The listing counts them separately as `waiting_on_rate_limit`, because a waiting
+renewal is the pacing working and a stuck one is a certificate on a countdown.
+
+Counted in the database rather than in a per-process token bucket: N replicas
+each holding their own would allow N times the limit. A limit that cannot be
+*read* never blocks a renewal — turning a database hiccup into an expiry is a
+much worse trade than being one certificate over a quota.
+
+**When the quota outlasts the certificate** it is not a deferral at all, and the
+alert says so in different words, because retrying will not fix it:
+
+> `step7-filter-probe.example.com` cannot be renewed because the CA account's
+> renewal rate limit is full until 29 November 2028, and it expires on
+> 18 August 2027. Retrying will not fix this: the limit has to be raised, or
+> this certificate moved to another CA account.
+
+Published once, when it is first noticed — months before the day, not on the
+morning it happens.
 
 ### Ordering, leases, and why there is no leader
 

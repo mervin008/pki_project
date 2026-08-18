@@ -242,6 +242,20 @@ type Store interface {
 	// CancelRenewalJob stops an outstanding job. Never used for failures — a
 	// renewal nobody cancelled must keep trying.
 	CancelRenewalJob(ctx context.Context, id string) error
+	// DeferRenewalJob puts a claimed job back without counting the claim as an
+	// attempt.
+	//
+	// Used when a CA's rate limit has no room. A deferral is not a failure —
+	// nothing was tried — and recording it as one would inflate the attempt
+	// count and escalate a certificate that is not broken.
+	DeferRenewalJob(ctx context.Context, id string, runAfter time.Time, reason string, escalate bool) error
+	// CountRecentRenewals reports how many renewals this CA account has
+	// completed inside the window, and when the oldest of them ages out of it.
+	//
+	// Counted in the database rather than per process: N replicas each holding
+	// their own token bucket would allow N times the limit, which for a public
+	// CA means the whole organisation loses issuance for a week.
+	CountRecentRenewals(ctx context.Context, caAccountID string, since time.Time) (count int, oldest *time.Time, err error)
 
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error

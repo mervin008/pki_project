@@ -69,6 +69,28 @@ func AlertFromEvent(evt events.Event) Alert {
 		alert.Summary = fmt.Sprintf(
 			"%s could not be renewed and will expire unless this is resolved.",
 			fallback(cn, "A certificate"))
+
+		// A renewal blocked by a quota that outlasts the certificate is a
+		// different message, because it needs a different action. Nothing is
+		// broken and retrying will not help — somebody has to raise the limit,
+		// move the certificate to another account, or stop renewing something
+		// else. Saying "renewal failed, retrying" would send them looking for
+		// a fault that does not exist.
+		if blocked := str(payload, "blocked_by"); blocked != "" {
+			alert.Title = fmt.Sprintf("Renewal blocked until after expiry: %s", fallback(cn, "a certificate"))
+			alert.Summary = fmt.Sprintf(
+				"%s cannot be renewed because %s is full until %s, and it expires on %s. Retrying will not fix this: the limit has to be raised, or this certificate moved to another CA account.",
+				fallback(cn, "A certificate"), blocked,
+				dateText(str(payload, "blocked_until")), dateText(str(payload, "not_after")))
+			alert.Fields = []Field{
+				{Label: "Common name", Value: fallback(cn, "—")},
+				{Label: "Expires", Value: dateText(str(payload, "not_after"))},
+				{Label: "Limit frees up", Value: dateText(str(payload, "blocked_until"))},
+				{Label: "Blocked by", Value: blocked},
+			}
+			break
+		}
+
 		alert.Fields = []Field{
 			{Label: "Common name", Value: fallback(cn, "—")},
 			{Label: "Days remaining", Value: daysText(num(payload, "days_remaining"))},

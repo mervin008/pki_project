@@ -68,7 +68,16 @@ func (h *RenewalHandler) List(c *gin.Context) {
 		stuck = append(stuck, describeJob(job, name, now))
 	}
 
-	body := gin.H{"data": jobs, "total": total}
+	// Counted separately, because they mean opposite things. A waiting renewal
+	// is the pacing working; a stuck one is a certificate on a countdown.
+	waiting := 0
+	for _, job := range jobs {
+		if last, ok := lastAttempt(job); ok && last.Deferred && job.Outstanding() {
+			waiting++
+		}
+	}
+
+	body := gin.H{"data": jobs, "total": total, "waiting_on_rate_limit": waiting}
 	if len(stuck) > 0 {
 		body["warning"] = fmt.Sprintf(
 			"%d renewal(s) have been failing long enough to need attention: %s. Each of these is a certificate on a countdown.",
@@ -189,6 +198,15 @@ func summarizeRenewal(job *store.RenewalJob, now time.Time) string {
 		return fmt.Sprintf("Attempt %d is running now.", job.Attempts)
 	}
 
+	// A deferral is not a failure and must not read as one. A job waiting for a
+	// CA's quota is the system working — it declined to spend a limit that
+	// would have suspended issuance for everyone — and reporting it as "failed
+	// 0 times, retrying" would send somebody looking for a fault.
+	if last, ok := lastAttempt(job); ok && last.Deferred {
+		return fmt.Sprintf("Waiting for the CA's rate limit, not failing. %s Next try %s.",
+			last.Reason, "in "+humanUntil(job.RunAfter, now))
+	}
+
 	if job.Attempts == 0 {
 		return "Queued, not attempted yet."
 	}
@@ -234,4 +252,12 @@ func humanUntil(t, now time.Time) string {
 	default:
 		return fmt.Sprintf("%d days", int(d.Hours()/24))
 	}
+}
+
+// lastAttempt returns the most recent entry in a job's log.
+func lastAttempt(job *store.RenewalJob) (store.RenewalAttempt, bool) {
+	if job == nil || len(job.AttemptLog) == 0 {
+		return store.RenewalAttempt{}, false
+	}
+	return job.AttemptLog[len(job.AttemptLog)-1], true
 }

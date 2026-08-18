@@ -116,6 +116,9 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/ca-accounts", middleware.RequireRole(middleware.RoleOperator), caAccHandler.Create)
 		v1.POST("/ca-accounts/:id/health", middleware.RequireRole(middleware.RoleOperator), caAccHandler.HealthCheck)
 		v1.DELETE("/ca-accounts/:id", middleware.RequireRole(middleware.RoleAdmin), caAccHandler.Delete)
+		// Narrow on purpose: the only field on a CA account that can change
+		// without re-validating the configuration through the gateway.
+		v1.PUT("/ca-accounts/:id/rate-limit", middleware.RequireRole(middleware.RoleOperator), caAccHandler.SetRateLimit)
 		v1.GET("/gateways", caAccHandler.ListGateways)
 
 		// ── Discovery ──

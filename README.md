@@ -106,7 +106,7 @@ explicitly.
 | Discovery | ✅ | Scans hosts, CIDR networks, and address ranges on a schedule; records the full handshake, says which certificates nobody manages, and reports what changed since last time |
 | Certificate Transparency | ✅ | Watches CT for certificates issued in your name — including ones never deployed anywhere you could scan. A check that could not run is never reported as a check that found nothing |
 | Cloud inventory | ✅ | Reads ACM, Azure Key Vault, Google Cloud, and Kubernetes TLS secrets. Reports which certificates the provider itself will not renew — the ones everybody assumes are automatic |
-| Renewal queue | ⚠️ | Durable jobs with leases, retries, and an attempt log; safe on N replicas with no leader. Backoff does not yet tighten towards the deadline |
+| Renewal queue | ✅ | Durable jobs with leases, an attempt log, and backoff that tightens as expiry approaches. Safe on N replicas with no leader. Per-CA rate limits defer rather than fail |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ❌ | Not started |
 | Host agent | ❌ | Not started |
@@ -485,6 +485,58 @@ needing to be renewed. Instead it **escalates** — after three failures, or aft
 one if there is less than a week of runway — and the alert fires once at that
 moment rather than every few minutes for a fortnight.
 
+#### Backoff that tightens instead of loosening
+
+Every backoff library assumes there is no deadline. A certificate has one, and
+as it approaches, the cost of *not* retrying grows without bound while the cost
+of retrying stays flat — so backing off further is exactly wrong.
+
+The delay is the **smaller** of the exponential curve and the runway divided
+into a budget of 24 more attempts:
+
+| Runway | Delay |
+|:---|:---|
+| a month | ~6 hours (the ordinary ceiling) |
+| a day | ~1 hour |
+| an hour | a few minutes |
+| already expired | the 60-second floor |
+
+#### A renewal held back is not a renewal that failed
+
+A public CA counts certificates per week, and exhausting that suspends issuance
+for the whole organisation — at exactly the moment somebody is reissuing to fix
+an outage. So set the account's limit and the queue paces itself:
+
+```bash
+curl -X PUT localhost:8080/api/v1/ca-accounts/$ID/rate-limit \
+  -d '{"renewal_rate_limit": 50, "renewal_rate_window_hours": 168}'
+```
+
+A renewal with no slot is **deferred**, not failed: the attempt is un-counted,
+the last real error is left intact, nothing escalates, and it returns exactly
+when a slot opens rather than polling for one.
+
+```
+Waiting for the CA's rate limit, not failing. letsencrypt-prod has renewed
+50 certificate(s) in the last 168 hours, which is its limit of 50.
+A slot opens at 2026-08-25T20:53:33+02:00. Next try in 7 days.
+```
+
+Counted in the database, not in a per-process bucket — N replicas each holding
+their own would allow N times the limit. Unlimited is the default: inventing a
+limit for a CA whose real limits nobody entered would delay renewals for a
+constraint that does not exist.
+
+And when the quota does not free up until after the certificate expires, that is
+not a deferral at all. It is a loss with a date on it, months in advance:
+
+```
+step7-filter-probe.example.com cannot be renewed because the CA account's
+renewal rate limit is full until 29 November 2028, and it expires on
+18 August 2027. Retrying will not fix this: the limit has to be raised, or
+this certificate moved to another CA account.
+```
+
 ## Security model
 
 Read this before deploying anything.
@@ -559,10 +611,10 @@ travel to production unnoticed.
 
 - The audit log is an ordinary table. It is not yet hash-chained, so a database
   writer can rewrite history.
-- Renewal retries are paced by a fixed exponential curve. A certificate three
-  days from expiry backs off exactly as far as one with a month left, which is
-  wrong in both directions; a deadline-aware curve and per-CA rate limiting are
-  the next step.
+- Rate limits are per CA account, not per registered domain. That is the right
+  granularity for an internal CA and coarser than Let's Encrypt actually counts,
+  so an account holding certificates for several registered domains will be
+  paced more conservatively than it needs to be.
 - The OCSP responder check is an HTTP GET, not an RFC 6960 request, and reports
   a responder as healthy when it should not.
 - `migrations/001_initial_schema.sql` defines `get_user_role()` in terms of

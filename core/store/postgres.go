@@ -611,7 +611,8 @@ func (s *PostgresStore) GetCAChain(ctx context.Context, id string) ([]*CAAuthori
 func (s *PostgresStore) ListCAAccounts(ctx context.Context) ([]*CAAccount, error) {
 	query := `
 		SELECT id, name, provider_type, gateway_addr, config_encrypted, is_default,
-		       status, last_health_at, created_by, created_at, updated_at
+		       status, last_health_at, coalesce(renewal_rate_limit, 0),
+		       coalesce(renewal_rate_window_hours, 168), created_by, created_at, updated_at
 		FROM public.ca_accounts ORDER BY name ASC
 	`
 	rows, err := s.pool.Query(ctx, query)
@@ -625,7 +626,8 @@ func (s *PostgresStore) ListCAAccounts(ctx context.Context) ([]*CAAccount, error
 		acc := &CAAccount{}
 		err := rows.Scan(
 			&acc.ID, &acc.Name, &acc.ProviderType, &acc.GatewayAddr, &acc.ConfigEncrypted,
-			&acc.IsDefault, &acc.Status, &acc.LastHealthAt, &acc.CreatedBy,
+			&acc.IsDefault, &acc.Status, &acc.LastHealthAt,
+			&acc.RenewalRateLimit, &acc.RenewalRateWindowHours, &acc.CreatedBy,
 			&acc.CreatedAt, &acc.UpdatedAt,
 		)
 		if err != nil {
@@ -639,13 +641,15 @@ func (s *PostgresStore) ListCAAccounts(ctx context.Context) ([]*CAAccount, error
 func (s *PostgresStore) GetCAAccount(ctx context.Context, id string) (*CAAccount, error) {
 	query := `
 		SELECT id, name, provider_type, gateway_addr, config_encrypted, is_default,
-		       status, last_health_at, created_by, created_at, updated_at
+		       status, last_health_at, coalesce(renewal_rate_limit, 0),
+		       coalesce(renewal_rate_window_hours, 168), created_by, created_at, updated_at
 		FROM public.ca_accounts WHERE id::text = $1 OR name = $1
 	`
 	acc := &CAAccount{}
 	err := s.pool.QueryRow(ctx, query, id).Scan(
 		&acc.ID, &acc.Name, &acc.ProviderType, &acc.GatewayAddr, &acc.ConfigEncrypted,
-		&acc.IsDefault, &acc.Status, &acc.LastHealthAt, &acc.CreatedBy,
+		&acc.IsDefault, &acc.Status, &acc.LastHealthAt,
+		&acc.RenewalRateLimit, &acc.RenewalRateWindowHours, &acc.CreatedBy,
 		&acc.CreatedAt, &acc.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
@@ -656,12 +660,14 @@ func (s *PostgresStore) GetCAAccount(ctx context.Context, id string) (*CAAccount
 
 func (s *PostgresStore) CreateCAAccount(ctx context.Context, acc *CAAccount) error {
 	query := `
-		INSERT INTO public.ca_accounts (name, provider_type, gateway_addr, config_encrypted, is_default, status)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO public.ca_accounts (name, provider_type, gateway_addr, config_encrypted,
+			is_default, status, renewal_rate_limit, renewal_rate_window_hours)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, created_at, updated_at
 	`
 	return s.pool.QueryRow(ctx, query,
 		acc.Name, acc.ProviderType, acc.GatewayAddr, acc.ConfigEncrypted, acc.IsDefault, acc.Status,
+		acc.RenewalRateLimit, defaultWindowHours(acc.RenewalRateWindowHours),
 	).Scan(&acc.ID, &acc.CreatedAt, &acc.UpdatedAt)
 }
 
@@ -669,12 +675,14 @@ func (s *PostgresStore) UpdateCAAccount(ctx context.Context, acc *CAAccount) err
 	query := `
 		UPDATE public.ca_accounts SET
 			name = $2, provider_type = $3, gateway_addr = $4, config_encrypted = $5,
-			is_default = $6, status = $7, last_health_at = $8, updated_at = now()
+			is_default = $6, status = $7, last_health_at = $8,
+			renewal_rate_limit = $9, renewal_rate_window_hours = $10, updated_at = now()
 		WHERE id = $1
 	`
 	_, err := s.pool.Exec(ctx, query,
 		acc.ID, acc.Name, acc.ProviderType, acc.GatewayAddr, acc.ConfigEncrypted,
 		acc.IsDefault, acc.Status, acc.LastHealthAt,
+		acc.RenewalRateLimit, defaultWindowHours(acc.RenewalRateWindowHours),
 	)
 	return err
 }
@@ -2405,7 +2413,7 @@ func (s *PostgresStore) MarkCloudCertificateImported(ctx context.Context, id, ce
 
 // ── Renewal queue ───────────────────────────────────────────
 
-const renewalJobColumns = `id, certificate_id, reason, status, run_after, coalesce(attempts, 0),
+const renewalJobColumns = `id, certificate_id, ca_account_id, reason, status, run_after, coalesce(attempts, 0),
 		locked_by, locked_until, coalesce(last_error, ''), coalesce(attempt_log, '[]'::jsonb),
 		not_after, coalesce(fingerprint_at_enqueue, ''), escalated_at,
 		triggered_by, actor_email, started_at, completed_at, created_at, updated_at`
@@ -2414,7 +2422,7 @@ func scanRenewalJob(row pgx.Row) (*RenewalJob, error) {
 	j := &RenewalJob{}
 	var logJSON []byte
 	err := row.Scan(
-		&j.ID, &j.CertificateID, &j.Reason, &j.Status, &j.RunAfter, &j.Attempts,
+		&j.ID, &j.CertificateID, &j.CAAccountID, &j.Reason, &j.Status, &j.RunAfter, &j.Attempts,
 		&j.LockedBy, &j.LockedUntil, &j.LastError, &logJSON,
 		&j.NotAfter, &j.FingerprintAtEnqueue, &j.EscalatedAt,
 		&j.TriggeredBy, &j.ActorEmail, &j.StartedAt, &j.CompletedAt, &j.CreatedAt, &j.UpdatedAt,
@@ -2437,12 +2445,12 @@ func (s *PostgresStore) EnqueueRenewal(ctx context.Context, job *RenewalJob) (bo
 	// the existing job. No leader, no failover gap, no duplicate issuance.
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO public.renewal_jobs
-			(certificate_id, reason, status, run_after, not_after, fingerprint_at_enqueue,
-			 triggered_by, actor_email)
-		VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7)
+			(certificate_id, ca_account_id, reason, status, run_after, not_after,
+			 fingerprint_at_enqueue, triggered_by, actor_email)
+		VALUES ($1, $2, $3, 'PENDING', $4, $5, $6, $7, $8)
 		ON CONFLICT (certificate_id) WHERE status IN ('PENDING', 'RUNNING') DO NOTHING
 		RETURNING `+renewalJobColumns,
-		job.CertificateID, job.Reason, job.RunAfter, job.NotAfter,
+		job.CertificateID, job.CAAccountID, job.Reason, job.RunAfter, job.NotAfter,
 		nullIfEmpty(job.FingerprintAtEnqueue), job.TriggeredBy, job.ActorEmail)
 
 	created, err := scanRenewalJob(row)
@@ -2654,4 +2662,80 @@ func (s *PostgresStore) CancelRenewalJob(ctx context.Context, id string) error {
 		return fmt.Errorf("renewal job %s is not outstanding", id)
 	}
 	return nil
+}
+
+func (s *PostgresStore) DeferRenewalJob(ctx context.Context, id string, runAfter time.Time, reason string, escalate bool) error {
+	entry, err := json.Marshal([]RenewalAttempt{{
+		StartedAt: time.Now(),
+		Deferred:  true,
+		Reason:    reason,
+	}})
+	if err != nil {
+		return err
+	}
+
+	// attempts is decremented because the claim incremented it and no renewal
+	// happened. That is restoring the truth rather than fiddling the number:
+	// the count means "times we tried to renew this", and a deferral is
+	// precisely the case where we did not.
+	//
+	// last_error is left alone. A deferral is not an error, and overwriting the
+	// real reason a job has been failing with "waiting on a rate limit" would
+	// hide the thing somebody needs to fix.
+	query := `
+		UPDATE public.renewal_jobs
+		SET status = 'PENDING',
+		    run_after = $2,
+		    attempts = greatest(attempts - 1, 0),
+		    attempt_log = (
+		        SELECT coalesce(jsonb_agg(entry), '[]'::jsonb)
+		        FROM (
+		            SELECT entry FROM jsonb_array_elements(coalesce(attempt_log, '[]'::jsonb) || $3::jsonb) AS entry
+		            OFFSET greatest(jsonb_array_length(coalesce(attempt_log, '[]'::jsonb)) + 1 - 50, 0)
+		        ) trimmed
+		    ),
+		    locked_by = NULL,
+		    locked_until = NULL,
+		    updated_at = now()`
+	if escalate {
+		// Set once and left. A quota that outlasts the certificate is announced
+		// the first time it is noticed, not on every deferral for the months
+		// until it expires.
+		query += ", escalated_at = coalesce(escalated_at, now())"
+	}
+	query += " WHERE id = $1"
+
+	tag, err := s.pool.Exec(ctx, query, id, runAfter, entry)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("renewal job %s not found", id)
+	}
+	return nil
+}
+
+func (s *PostgresStore) CountRecentRenewals(ctx context.Context, caAccountID string, since time.Time) (int, *time.Time, error) {
+	var count int
+	var oldest *time.Time
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*), min(completed_at)
+		FROM public.renewal_jobs
+		WHERE ca_account_id = $1 AND status = 'SUCCEEDED' AND completed_at >= $2`,
+		caAccountID, since).Scan(&count, &oldest)
+	if err != nil {
+		return 0, nil, err
+	}
+	return count, oldest, nil
+}
+
+// defaultWindowHours keeps a zero window out of the database. The column has a
+// check constraint requiring it to be positive, and a caller that simply did
+// not set the field would otherwise have its whole write rejected for a value
+// it never meant to supply.
+func defaultWindowHours(hours int) int {
+	if hours <= 0 {
+		return 168
+	}
+	return hours
 }

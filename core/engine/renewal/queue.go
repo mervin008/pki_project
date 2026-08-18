@@ -35,12 +35,32 @@ const (
 	// failure mode of too many is an account suspended for a week.
 	defaultWorkers = 2
 
-	// Retry pacing. Replaced in step 2 by a curve that tightens as the
-	// certificate's expiry approaches; a fixed schedule is wrong in both
-	// directions, retrying a month-away certificate too eagerly and a
-	// three-day-away one nowhere near hard enough.
+	// Retry pacing.
+	//
+	// baseRetryDelay and maxRetryDelay bound the ordinary exponential curve,
+	// which handles the common case: a CA that is briefly unreachable should
+	// not be hammered.
+	//
+	// minRetryDelay is the floor even when the deadline is imminent. Retrying
+	// faster than this is hammering whatever the runway, and a CA that answers
+	// a request per second with the same error will not answer differently on
+	// the two hundredth.
 	baseRetryDelay = 2 * time.Minute
 	maxRetryDelay  = 6 * time.Hour
+	minRetryDelay  = 60 * time.Second
+
+	// attemptBudget is how many more tries the pacing aims to fit before the
+	// certificate expires.
+	//
+	// This is the number that makes renewal backoff different from every other
+	// kind. Ordinary exponential backoff assumes failures are transient,
+	// retrying costs something, and there is no deadline. A certificate
+	// violates the third outright: as expiry approaches, the cost of not
+	// retrying grows without bound while the cost of retrying stays flat. So
+	// the delay is bounded by the runway divided by this — with a day left it
+	// retries hourly, with an hour left every few minutes, and the curve
+	// tightens exactly when a fixed exponential would be backing off hardest.
+	attemptBudget = 24
 
 	// escalateAfterAttempts is when a failing renewal stops being noise and
 	// becomes somebody's problem. Two failures is a blip — a CA restarting, a
@@ -273,6 +293,33 @@ func (q *Queue) execute(ctx context.Context, job *store.RenewalJob) {
 		return
 	}
 
+	// Pacing against the CA's own limits, after the crash guard so a renewal
+	// that already happened is never held back by a limit it does not need.
+	if until, reason, limited := q.rateLimited(ctx, job, started); limited {
+		slog.Info("renewal deferred to stay inside a CA rate limit",
+			"job", job.ID, "common_name", cert.CommonName, "retry_at", until)
+
+		// Unless the limit outlasts the certificate, which is not a deferral at
+		// all — it is a certificate going to be lost to a quota, on a date that
+		// can be named now rather than discovered on the day.
+		doomed := job.NotAfter != nil && until.After(*job.NotAfter)
+
+		// A deferral is not an attempt, and the store un-counts the claim for
+		// exactly that reason. Recording it as a failure would inflate the
+		// attempt count and escalate a certificate that is not broken.
+		if err := q.store.DeferRenewalJob(ctx, job.ID, until, reason, doomed); err != nil {
+			slog.Error("a renewal was deferred but its job could not be updated", "job", job.ID, "error", err)
+		}
+
+		// Announced once. The escalation mark is persisted by the call above,
+		// so a job deferred every hour for a month does not send the same
+		// CRITICAL message every hour for a month.
+		if doomed && job.EscalatedAt == nil {
+			q.announceRateLimitOutlastsCertificate(job, cert, until)
+		}
+		return
+	}
+
 	// Keep the lease alive while the renewal runs. An ACME order waiting on DNS
 	// propagation can outlive the lease, and a stolen job means one renewal
 	// becomes two certificates.
@@ -302,6 +349,65 @@ func (q *Queue) execute(ctx context.Context, job *store.RenewalJob) {
 	finish(store.RenewalSucceeded, nil, false)
 }
 
+// rateLimited reports whether this renewal has to wait for the CA's quota, and
+// until when.
+//
+// Counted in the database rather than in a per-process token bucket. N replicas
+// each holding their own bucket would allow N times the limit — and for a
+// public CA that means the whole organisation loses issuance for a week, at
+// exactly the moment somebody is trying to fix an outage by reissuing.
+//
+// A lookup failure does not block the renewal. Refusing to renew because the
+// limit could not be read would turn a database hiccup into an expiry, and the
+// downside of being one over a quota is far smaller than the downside of being
+// one certificate short.
+func (q *Queue) rateLimited(ctx context.Context, job *store.RenewalJob, now time.Time) (time.Time, string, bool) {
+	if job.CAAccountID == nil || *job.CAAccountID == "" {
+		return time.Time{}, "", false
+	}
+
+	account, err := q.store.GetCAAccount(ctx, *job.CAAccountID)
+	if err != nil {
+		slog.Warn("could not read a CA account's rate limit; renewing anyway", "job", job.ID, "error", err)
+		return time.Time{}, "", false
+	}
+	if account.RenewalRateLimit <= 0 {
+		// Unlimited, which is the default. Inventing a conservative limit for a
+		// CA whose real limits nobody entered would delay renewals for a
+		// constraint that does not exist.
+		return time.Time{}, "", false
+	}
+
+	window := time.Duration(account.RenewalRateWindowHours) * time.Hour
+	if window <= 0 {
+		window = 168 * time.Hour
+	}
+
+	count, oldest, err := q.store.CountRecentRenewals(ctx, account.ID, now.Add(-window))
+	if err != nil {
+		slog.Warn("could not count recent renewals; renewing anyway", "job", job.ID, "error", err)
+		return time.Time{}, "", false
+	}
+	if count < account.RenewalRateLimit {
+		return time.Time{}, "", false
+	}
+
+	// When the oldest renewal in the window ages out is when a slot opens. That
+	// is a real time, not a guess, so the job comes back exactly once rather
+	// than polling the limit every few minutes.
+	until := now.Add(window)
+	if oldest != nil {
+		until = oldest.Add(window)
+	}
+	// A moment past, so the row has genuinely left the window by the time the
+	// job is claimed again.
+	until = until.Add(time.Minute)
+
+	reason := fmt.Sprintf("%s has renewed %d certificate(s) in the last %d hours, which is its limit of %d. A slot opens at %s.",
+		account.Name, count, account.RenewalRateWindowHours, account.RenewalRateLimit, until.Format(time.RFC3339))
+	return until, reason, true
+}
+
 // heartbeat extends the lease until the renewal finishes.
 func (q *Queue) heartbeat(ctx context.Context, jobID string, done <-chan struct{}) {
 	ticker := time.NewTicker(heartbeatInterval)
@@ -328,25 +434,45 @@ func (q *Queue) heartbeat(ctx context.Context, jobID string, done <-chan struct{
 
 // retryAt decides when a failed job may be attempted again.
 //
-// Exponential with a cap, and jittered so that forty renewals failing against
-// one CA outage do not all come back at the same instant and fail together
-// again — a thundering herd against a CA is how a transient outage becomes a
-// rate-limit suspension.
+// The delay is the *smaller* of two answers, which is the whole idea:
 //
-// Step 2 replaces this with a curve tied to the certificate's remaining life.
-// A fixed schedule is wrong in both directions: too eager for a certificate
-// with a month left, nowhere near urgent enough for one with three days.
+//   - What ordinary exponential backoff says. Right for a transient failure: a
+//     CA that is briefly down should not be hammered.
+//   - What the deadline allows. A certificate with six hours of life left
+//     cannot afford a six-hour wait, however many times it has already failed.
+//
+// Taking the minimum means the curve grows while there is time and tightens as
+// the runway shrinks — the opposite of what backoff normally does, and the only
+// shape that makes sense for work with a hard deadline. A certificate that has
+// already expired retries at the floor: it is an outage now, and getting it
+// back matters more than politeness.
+//
+// Jittered either way, because forty renewals failing against one CA outage and
+// all returning at the same instant is how a transient failure becomes a
+// rate-limit suspension.
 func (q *Queue) retryAt(job *store.RenewalJob, now time.Time) time.Time {
-	backoff := time.Duration(float64(baseRetryDelay) * math.Pow(2, float64(max(job.Attempts-1, 0))))
-	if backoff > maxRetryDelay || backoff <= 0 {
-		backoff = maxRetryDelay
+	delay := time.Duration(float64(baseRetryDelay) * math.Pow(2, float64(max(job.Attempts-1, 0))))
+	if delay > maxRetryDelay || delay <= 0 {
+		delay = maxRetryDelay
 	}
 
-	// Up to 20% either way. Deterministic sources of jitter would defeat the
-	// purpose, so this uses crypto/rand rather than a seeded generator that
-	// several replicas starting together would agree on.
-	jitter := time.Duration(float64(backoff) * 0.2 * randUnit())
-	return now.Add(backoff + jitter)
+	if job.NotAfter != nil {
+		runway := job.NotAfter.Sub(now)
+		switch {
+		case runway <= 0:
+			delay = minRetryDelay
+		default:
+			if budgeted := runway / attemptBudget; budgeted < delay {
+				delay = budgeted
+			}
+		}
+	}
+
+	jittered := delay + time.Duration(float64(delay)*0.2*randUnit())
+	if jittered < minRetryDelay {
+		jittered = minRetryDelay
+	}
+	return now.Add(jittered)
 }
 
 // randUnit returns a value in [-1, 1).
@@ -393,6 +519,36 @@ func (q *Queue) announceEscalation(job *store.RenewalJob, cert *store.Certificat
 			"runway_hours":   int(runway),
 			"job_id":         job.ID,
 			"error":          cause.Error(),
+		},
+	})
+}
+
+// announceRateLimitOutlastsCertificate is the sharpest thing this engine can
+// say: the CA's quota does not free up until after this certificate has expired.
+//
+// Not a deferral, and not an ordinary failure. It is a loss that can be named
+// now — with a date — instead of discovered on the morning it happens, and the
+// only fixes are human ones: raise the limit, move the certificate to another
+// account, or stop renewing something else.
+func (q *Queue) announceRateLimitOutlastsCertificate(job *store.RenewalJob, cert *store.Certificate, until time.Time) {
+	if q.broker == nil {
+		return
+	}
+	q.broker.Publish(events.Event{
+		Topic:    events.TopicCertRenewFail,
+		Severity: events.SeverityCritical,
+		EntityID: cert.ID,
+		Payload: map[string]any{
+			"common_name":    cert.CommonName,
+			"days_remaining": cert.DaysRemaining,
+			"attempts":       job.Attempts,
+			"job_id":         job.ID,
+			"blocked_by":     "the CA account's renewal rate limit",
+			"blocked_until":  until.Format(time.RFC3339),
+			"not_after":      job.NotAfter.Format(time.RFC3339),
+			"error": fmt.Sprintf(
+				"the rate limit does not free up until %s, which is after this certificate expires on %s",
+				until.Format(time.RFC3339), job.NotAfter.Format(time.RFC3339)),
 		},
 	})
 }

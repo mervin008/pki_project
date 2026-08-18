@@ -77,6 +77,11 @@ type CreateCAAccountInput struct {
 	// it reaches the database; it is never returned by any endpoint.
 	Config    map[string]any `json:"config"`
 	IsDefault bool           `json:"is_default"`
+	// RenewalRateLimit is how many certificates this account may successfully
+	// renew inside the window. Zero, the default, means unlimited.
+	RenewalRateLimit int `json:"renewal_rate_limit"`
+	// RenewalRateWindowHours is the rolling window, defaulting to a week.
+	RenewalRateWindowHours int `json:"renewal_rate_window_hours"`
 }
 
 // Create handles POST /api/v1/ca-accounts.
@@ -98,11 +103,13 @@ func (h *CAAccountHandler) Create(c *gin.Context) {
 	}
 
 	acc := &store.CAAccount{
-		Name:         input.Name,
-		ProviderType: input.ProviderType,
-		GatewayAddr:  input.GatewayAddr,
-		IsDefault:    input.IsDefault,
-		Status:       "DISCONNECTED",
+		Name:                   input.Name,
+		ProviderType:           input.ProviderType,
+		GatewayAddr:            input.GatewayAddr,
+		IsDefault:              input.IsDefault,
+		Status:                 "DISCONNECTED",
+		RenewalRateLimit:       input.RenewalRateLimit,
+		RenewalRateWindowHours: input.RenewalRateWindowHours,
 	}
 
 	// Connect first, so the gateway can vet the configuration before it is
@@ -210,4 +217,81 @@ func (h *CAAccountHandler) Delete(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "CA account removed"})
+}
+
+// RateLimitInput sets how hard this account may be renewed against.
+type RateLimitInput struct {
+	// Limit is certificates per window. Zero means unlimited.
+	Limit *int `json:"renewal_rate_limit" binding:"required"`
+	// WindowHours defaults to a week when not given.
+	WindowHours int `json:"renewal_rate_window_hours"`
+}
+
+// SetRateLimit handles PUT /api/v1/ca-accounts/:id/rate-limit.
+//
+// A narrow endpoint rather than a general update, because this is the only
+// field on a CA account that is safe to change without re-validating the
+// configuration through the gateway and re-sealing the credentials.
+//
+// It matters enough to be settable at all: a public CA counts certificates per
+// week, and exceeding that suspends issuance for the whole organisation — at
+// exactly the moment somebody is trying to fix an outage by reissuing.
+func (h *CAAccountHandler) SetRateLimit(c *gin.Context) {
+	id := c.Param("id")
+
+	acc, err := h.store.GetCAAccount(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	var input RateLimitInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if *input.Limit < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "renewal_rate_limit cannot be negative; use 0 for unlimited"})
+		return
+	}
+	if input.WindowHours < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "renewal_rate_window_hours cannot be negative"})
+		return
+	}
+
+	acc.RenewalRateLimit = *input.Limit
+	if input.WindowHours > 0 {
+		acc.RenewalRateWindowHours = input.WindowHours
+	}
+	if acc.RenewalRateWindowHours <= 0 {
+		acc.RenewalRateWindowHours = 168
+	}
+
+	if err := h.store.UpdateCAAccount(c.Request.Context(), acc); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	actorID := c.GetString(middleware.ContextUserID)
+	actorEmail := c.GetString(middleware.ContextUserEmail)
+	ip := c.ClientIP()
+	_ = h.store.CreateAuditLog(c.Request.Context(), &store.AuditLog{
+		Action:     "ca.rate_limit_changed",
+		EntityType: "ca_account",
+		EntityID:   &acc.ID,
+		ActorID:    &actorID,
+		ActorEmail: &actorEmail,
+		IPAddress:  &ip,
+		Details: fmt.Sprintf(`{"name":%q,"limit":%d,"window_hours":%d}`,
+			acc.Name, acc.RenewalRateLimit, acc.RenewalRateWindowHours),
+	})
+
+	message := fmt.Sprintf("%s may now renew %d certificate(s) per %d hours. Renewals beyond that wait for a slot rather than being refused.",
+		acc.Name, acc.RenewalRateLimit, acc.RenewalRateWindowHours)
+	if acc.RenewalRateLimit == 0 {
+		// Said explicitly, because "0" reading as "none allowed" would be a
+		// catastrophic misunderstanding of this field.
+		message = fmt.Sprintf("%s is now unlimited: CertPilot will not hold back any renewal against it.", acc.Name)
+	}
+	c.JSON(http.StatusOK, gin.H{"data": acc, "message": message})
 }

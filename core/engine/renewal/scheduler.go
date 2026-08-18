@@ -136,6 +136,11 @@ func (s *Scheduler) Enqueue(ctx context.Context, cert *store.Certificate, reason
 		Status:        store.RenewalPending,
 		RunAfter:      s.now(),
 		NotAfter:      cert.NotAfter,
+		// Which account's quota this renewal will spend, denormalised for the
+		// same reason NotAfter is: it is read on every pacing decision, and a
+		// join to a record that may have been edited underneath the job is the
+		// wrong source of truth for it.
+		CAAccountID: cert.CAAccountID,
 		// What the certificate is now, so a retry after a crash can tell
 		// whether the renewal already happened rather than issuing a second
 		// one.

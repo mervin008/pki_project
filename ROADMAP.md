@@ -412,7 +412,7 @@ phase widened what it has to renew.
 | Step | | |
 |:---|:---|:---|
 | 1 | Renewal as a durable job, not a function call | ✅ |
-| 2 | Backoff that tightens towards the deadline, and per-CA rate limiting | |
+| 2 | Backoff that tightens towards the deadline, and per-CA rate limiting | ✅ |
 | 3 | ARI: let the CA say when, and when it changes its mind | |
 | 4 | Post-renewal verification — confirm the new certificate is actually served | |
 
@@ -491,6 +491,64 @@ Verified against the live database across a deliberate outage: four failed
 attempts, a core restart in the middle, then success when the gateway came back
 — all one job, `['fail','fail','fail','fail','ok']`, with the escalation raised
 once on the third.
+
+**Step 2** fixed the pacing, which step 1 had left deliberately wrong.
+
+Ordinary exponential backoff rests on three assumptions: failures are transient,
+retrying costs something, and there is no deadline. A certificate violates the
+third outright. As expiry approaches, the cost of *not* retrying grows without
+bound while the cost of retrying stays flat — so backing off further, which is
+exactly what every backoff library does, is exactly wrong.
+
+The delay is now the **smaller** of what the exponential curve says and what the
+runway allows, where the runway is divided into a budget of twenty-four more
+attempts. With a month left it behaves like ordinary backoff and sits at the
+six-hour ceiling. With a day left it retries roughly hourly. With an hour left,
+every few minutes. A certificate that has already expired retries at the floor,
+because it is an outage now and getting it back matters more than politeness —
+but never below a minute, since a CA answering the same error once a second will
+not answer differently on the two hundredth try.
+
+The other half is rate limiting, and the thing worth getting right is not the
+counting. It is that **a renewal held back is not a renewal that failed.** A
+public CA counts certificates per registered domain per week, and exhausting
+that suspends issuance for the whole organisation — at exactly the moment
+somebody is trying to fix an outage by reissuing. So the queue declines to
+spend a slot it does not have, and records that as a deferral: `attempts` is
+un-counted, `last_error` is left holding whatever real failure came before, and
+nothing escalates. A job that waited nine times has not failed nine times, and a
+system that reported it that way would teach people that escalation means
+nothing.
+
+Counted in the database rather than in a per-process token bucket, for the same
+reason step 1 has no leader: N replicas each holding their own bucket would
+allow N times the limit. And a limit that cannot be *read* never blocks a
+renewal — turning a database hiccup into an expiry is a much worse trade than
+being one certificate over a quota.
+
+Unlimited is the default, deliberately. Inventing a conservative limit for a CA
+whose real limits nobody has entered would delay renewals for a constraint that
+does not exist, and a certificate that expired because this tool was being
+careful is the worst outcome available.
+
+Out of that falls the sharpest thing this engine can say — that the quota does
+not free up until *after* the certificate has expired:
+
+> step7-filter-probe.example.com cannot be renewed because the CA account's
+> renewal rate limit is full until 29 November 2028, and it expires on 18 August
+> 2027. Retrying will not fix this: the limit has to be raised, or this
+> certificate moved to another CA account.
+
+That is a loss with a date on it, months before the day, and it is deliberately
+worded away from "renewal failed, retrying" — nothing is broken and retrying
+will not help, so an alert that sent somebody hunting for a fault would waste
+the warning.
+
+One defect, found live rather than in the tests: the blocked-by-quota alert
+published correctly and never persisted its escalation mark, so a certificate
+deferred every hour would have sent the same CRITICAL message every hour until
+it expired — the precise noise failure the rest of the engine is built to avoid,
+reintroduced in the one path that had not been through it.
 
 The 47-day horizon is what forces the rest. When the CA/Browser Forum's maximum
 lifetime lands, a certificate is renewed roughly every fortnight rather than
