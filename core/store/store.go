@@ -203,6 +203,46 @@ type Store interface {
 	// record somebody adopted it into, and settles its verdict.
 	MarkCloudCertificateImported(ctx context.Context, id, certificateID string) error
 
+	// ── Renewal queue ───────────────────────────────────────
+	//
+	// Renewal is the only part of this system that changes the world, so it
+	// exists as durable rows rather than as calls: a process that dies
+	// mid-renewal leaves behind something another process can pick up.
+
+	// EnqueueRenewal creates a job unless one is already outstanding for this
+	// certificate.
+	//
+	// Returns the existing job and false when there is one. This — rather than
+	// leader election — is what makes the scheduler safe to run on every
+	// replica: two of them enqueueing the same renewal in the same second is a
+	// no-op for the second, not a duplicate issuance against a weekly rate
+	// limit.
+	EnqueueRenewal(ctx context.Context, job *RenewalJob) (created bool, err error)
+	// ClaimRenewalJob takes the most urgent ready job and leases it.
+	//
+	// Ready means pending and due, or running with an expired lease — a worker
+	// that was killed releases its job by the lease running out rather than by
+	// anything having to reap it. Returns nil when the queue has nothing ready,
+	// which is the ordinary case and not an error.
+	ClaimRenewalJob(ctx context.Context, worker string, lease time.Duration, now time.Time) (*RenewalJob, error)
+	// ExtendRenewalLease keeps a long-running job's claim alive. An ACME order
+	// waiting on DNS propagation can outlive a short lease, and having it
+	// stolen mid-flight is how one renewal becomes two certificates.
+	ExtendRenewalLease(ctx context.Context, id, worker string, until time.Time) error
+	// CompleteRenewalJob records the outcome of an attempt.
+	//
+	// A failed attempt that will be retried stays outstanding with run_after
+	// moved forward; a terminal one is closed. The attempt is appended to the
+	// log either way, because the history is what distinguishes a blip from a
+	// fortnight of the same error.
+	CompleteRenewalJob(ctx context.Context, id string, status string, attempt RenewalAttempt,
+		runAfter time.Time, escalate bool) error
+	GetRenewalJob(ctx context.Context, id string) (*RenewalJob, error)
+	ListRenewalJobs(ctx context.Context, filter RenewalJobFilter) ([]*RenewalJob, int64, error)
+	// CancelRenewalJob stops an outstanding job. Never used for failures — a
+	// renewal nobody cancelled must keep trying.
+	CancelRenewalJob(ctx context.Context, id string) error
+
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)

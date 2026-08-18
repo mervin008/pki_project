@@ -193,19 +193,14 @@ func (e *Executor) recordFailure(ctx context.Context, cert *store.Certificate, c
 		Details:    fmt.Sprintf(`{"error": %q, "cn": %q}`, errMsg, cert.CommonName),
 	})
 
-	// A failed renewal is a certificate on its way to expiry with nobody
-	// watching, so it is announced at critical severity rather than logged.
-	e.broker.Publish(events.Event{
-		Topic:    events.TopicCertRenewFail,
-		Severity: events.SeverityCritical,
-		EntityID: cert.ID,
-		Payload: map[string]any{
-			"common_name":    cert.CommonName,
-			"days_remaining": cert.DaysRemaining,
-			"error":          errMsg,
-		},
-	})
-
+	// Deliberately does not publish.
+	//
+	// A failed renewal is still a certificate on its way to expiry with nobody
+	// watching, but this function is now one attempt among many rather than the
+	// whole story. The queue owns the alert and raises it once, when a failure
+	// stops being a blip — announcing here would put a CRITICAL message in the
+	// channel every few minutes for a fortnight, and a channel people mute
+	// takes the CA expiry alerts sharing it along too.
 	return fmt.Errorf("renewal failed for %s: %w", cert.CommonName, cause)
 }
 

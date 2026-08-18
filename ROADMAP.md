@@ -407,13 +407,96 @@ arrives with the renewal engine in phase 4, which has the same gap.
 ### Phase 4 — A renewal engine that survives 47-day certificates
 
 Deferred deliberately: it is the last phase before deployment, and every earlier
-phase widens what it has to renew.
+phase widened what it has to renew.
 
-- Durable job queue with leader election (Postgres advisory locks)
-- Exponential backoff with jitter, per-CA rate limiting, idempotency keys
-- Renewal scheduled from the CA's ARI window where published, lead time otherwise
-- Post-renewal verification: re-scan the endpoint and confirm the new
-  certificate is actually being served
+| Step | | |
+|:---|:---|:---|
+| 1 | Renewal as a durable job, not a function call | ✅ |
+| 2 | Backoff that tightens towards the deadline, and per-CA rate limiting | |
+| 3 | ARI: let the CA say when, and when it changes its mind | |
+| 4 | Post-renewal verification — confirm the new certificate is actually served | |
+
+One sentence governs the phase:
+
+> **Renewal is the only part of this system that changes the world.
+> Everything else observes.**
+
+Every other engine can be wrong, retried, or restarted with no consequence
+beyond a stale screen. This one issues certificates, rotates private keys, and
+replaces working material with new material. A discovery scan that runs twice
+wastes a few seconds; a renewal that runs twice on two replicas issues two
+certificates against a rate limit that is counted per week.
+
+Which is why renewal stops being a call the scheduler makes and becomes a row
+somebody owns. A process that dies mid-renewal must leave behind something that
+can be picked up, not a certificate whose fate nobody recorded.
+
+**Step 1** made that literal. A renewal is a row in `renewal_jobs` with a lease,
+an attempt log, and a deadline it is racing.
+
+The thing worth arguing about is what is *not* there: **there is no leader
+election.** The roadmap said Postgres advisory locks, and building it that way
+would have been a mistake. A leader is a single point of failure with a window
+after it dies during which nothing renews at all, which is a strange thing to
+put inside the one component whose entire job is that nothing lapses. Instead
+the correctness comes from the schema: a partial unique index allows at most one
+outstanding job per certificate, so two replicas sweeping in the same second
+produce one job, and `FOR UPDATE SKIP LOCKED` means two workers never claim the
+same row. Every replica is an equal worker and none of them is special.
+
+The lease is the other half. A worker that is OOM-killed mid-renewal does not
+need reaping — its claim expires and somebody else takes the job. Long renewals
+heartbeat to extend it, because an ACME order waiting on DNS propagation can
+outlive a five-minute lease and a job stolen mid-flight is one renewal becoming
+two certificates.
+
+Three decisions that look small and are not:
+
+**A failed job stays outstanding.** There is no attempt count at which a
+certificate stops needing to be renewed, so nothing is ever abandoned. It
+escalates instead — after three failures, or after one when there is less than a
+week of runway — and the alert fires once at that moment. A renewal retrying
+every few minutes for a fortnight would otherwise put thousands of CRITICAL
+messages into the channel that also carries CA expiry alerts, and a muted
+channel takes those with it.
+
+**Every attempt is kept, not just the last error.** "This has failed eleven
+times in six days with the same DNS error" is a sentence somebody can act on;
+`last_error: timeout` cannot distinguish a blip from a fortnight of silence.
+Each entry names the replica that made it, because one replica failing and every
+replica failing are different problems.
+
+**The crash guard checks the outcome rather than trusting a key.** A worker that
+finalised an order and died before writing the result would otherwise issue a
+second certificate on retry. So the next attempt compares the certificate's
+fingerprint against what it was at enqueue: if it moved on its own, the renewal
+already happened. Verifying what actually changed beats an idempotency token,
+because it is true however the world changed.
+
+`POST /certificates/:id/renew` now answers 202 with a job. It used to call the
+gateway inline and return the renewed certificate, which read well and was wrong
+three ways: an ACME order with a DNS challenge outlives the 30-second write
+timeout, so the caller got a truncated response for a renewal still running; a
+failure meant one attempt and no record of it; and a restart mid-request left
+nothing behind. Pressing it twice now returns the same job rather than spending
+a weekly rate limit twice.
+
+Two defects came out of reading the live output rather than the tests. A warning
+that read *"8759 hours left"* — technically correct, and a number nobody parses
+at a glance, which in a list of things needing attention means it does not get
+read at all. And the same warning named certificates by UUID, so it could tell
+somebody a renewal was broken without telling them which certificate it was.
+
+Verified against the live database across a deliberate outage: four failed
+attempts, a core restart in the middle, then success when the gateway came back
+— all one job, `['fail','fail','fail','fail','ok']`, with the escalation raised
+once on the third.
+
+The 47-day horizon is what forces the rest. When the CA/Browser Forum's maximum
+lifetime lands, a certificate is renewed roughly every fortnight rather than
+twice a year — renewal stops being an event and becomes a heartbeat, failures
+become routine rather than exceptional, and anything that quietly stops working
+has weeks rather than months before it is noticed.
 
 ### Phase 6 — Deployment, then the agent
 

@@ -72,6 +72,8 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 		CAMonitor:     pki.NewCAMonitor(st, broker),
 		ChainResolver: pki.NewChainResolver(st),
 		RenewalExec:   renewal.NewExecutor(st, pm, keyring, broker),
+		RenewalSched:  renewal.NewScheduler(st, 30),
+		RenewalQueue:  renewal.NewQueue(st, renewal.NewExecutor(st, pm, keyring, broker), broker),
 		PolicyEngine:  policy.NewEngine(st),
 		// A real broker on the scanner: background scans publish their findings
 		// themselves, so a scanner without one would silently drop them.

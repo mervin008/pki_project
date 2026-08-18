@@ -106,6 +106,7 @@ explicitly.
 | Discovery | ✅ | Scans hosts, CIDR networks, and address ranges on a schedule; records the full handshake, says which certificates nobody manages, and reports what changed since last time |
 | Certificate Transparency | ✅ | Watches CT for certificates issued in your name — including ones never deployed anywhere you could scan. A check that could not run is never reported as a check that found nothing |
 | Cloud inventory | ✅ | Reads ACM, Azure Key Vault, Google Cloud, and Kubernetes TLS secrets. Reports which certificates the provider itself will not renew — the ones everybody assumes are automatic |
+| Renewal queue | ⚠️ | Durable jobs with leases, retries, and an attempt log; safe on N replicas with no leader. Backoff does not yet tighten towards the deadline |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ❌ | Not started |
 | Host agent | ❌ | Not started |
@@ -437,6 +438,53 @@ the four providers are their REST APIs plus SigV4, OAuth2, and JWT-bearer
 signing written out, because two hundred transitive modules is a poor trade
 inside a process that holds every private key this system has issued.
 
+### Renewal is the only part that changes the world
+
+Everything else in CertPilot observes. A discovery scan that runs twice wastes a
+few seconds; a renewal that runs twice on two replicas issues two certificates
+against a rate limit counted per week.
+
+So a renewal is a **row somebody owns**, not a call the scheduler makes:
+
+```bash
+curl -X POST localhost:8080/api/v1/certificates/$ID/renew
+```
+```json
+202 Accepted
+{ "data": { "id": "1ade1796…", "status": "PENDING", "reason": "MANUAL" },
+  "message": "Queued. Watch it at GET /api/v1/renewals/1ade1796…" }
+```
+
+Press it twice and you get the same job back, not a second certificate. A core
+that restarts mid-renewal leaves a row another replica picks up when the lease
+expires, rather than a certificate whose fate nobody recorded.
+
+**There is no leader.** Enqueues collide on a partial unique index — at most one
+outstanding job per certificate — and claims use `FOR UPDATE SKIP LOCKED`, so
+every replica runs the sweep and runs workers without duplicating anything.
+Electing a leader would put a single point of failure, and a window after it
+dies during which nothing renews at all, inside the component whose entire job
+is that nothing lapses.
+
+Failure is recorded rather than retried blindly:
+
+```
+Failed 3 time(s), with 41 hours left before this certificate expires.
+Retrying in 8 minutes. The most recent error was: dial tcp 10.0.0.5:9091:
+connection refused
+```
+
+Every attempt is kept — when, how long, which replica, and what went wrong —
+because *"this has failed eleven times in six days with the same DNS error"* is
+a sentence somebody can act on and `last_error: timeout` cannot tell a blip from
+a fortnight of silence. Backoff is jittered, so forty renewals failing against
+one CA outage do not all come back at the same instant and fail together again.
+
+A job is never abandoned. There is no attempt count at which a certificate stops
+needing to be renewed. Instead it **escalates** — after three failures, or after
+one if there is less than a week of runway — and the alert fires once at that
+moment rather than every few minutes for a fortnight.
+
 ## Security model
 
 Read this before deploying anything.
@@ -511,8 +559,10 @@ travel to production unnoticed.
 
 - The audit log is an ordinary table. It is not yet hash-chained, so a database
   writer can rewrite history.
-- Renewal has no retry, backoff, or distributed lock. Two core replicas will
-  renew the same certificate concurrently.
+- Renewal retries are paced by a fixed exponential curve. A certificate three
+  days from expiry backs off exactly as far as one with a month left, which is
+  wrong in both directions; a deadline-aware curve and per-CA rate limiting are
+  the next step.
 - The OCSP responder check is an HTTP GET, not an RFC 6960 request, and reports
   a responder as healthy when it should not.
 - `migrations/001_initial_schema.sql` defines `get_user_role()` in terms of

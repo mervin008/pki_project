@@ -29,6 +29,8 @@ type RouterDeps struct {
 	CAMonitor     *pki.CAMonitor
 	ChainResolver *pki.ChainResolver
 	RenewalExec   *renewal.Executor
+	RenewalSched  *renewal.Scheduler
+	RenewalQueue  *renewal.Queue
 	PolicyEngine  *policy.Engine
 	Scanner       *discovery.Scanner
 	CTMonitor     *ctlog.Monitor
@@ -51,7 +53,8 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		c.JSON(200, gin.H{"status": "ok", "service": "certpilot-core"})
 	})
 
-	certHandler := NewCertificateHandler(deps.Store, deps.PluginMgr, deps.RenewalExec, deps.PolicyEngine, deps.Keyring, deps.Broker)
+	certHandler := NewCertificateHandler(deps.Store, deps.PluginMgr, deps.RenewalExec, deps.RenewalSched, deps.PolicyEngine, deps.Keyring, deps.Broker)
+	renewalHandler := NewRenewalHandler(deps.Store, deps.RenewalSched)
 	caHandler := NewCAHandler(deps.Store, deps.CAMonitor, deps.ChainResolver)
 	caAccHandler := NewCAAccountHandler(deps.Store, deps.PluginMgr, deps.Keyring)
 	dashHandler := NewDashboardHandler(deps.Store)
@@ -161,6 +164,16 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/cloud/connections/:id/sync", middleware.RequireRole(middleware.RoleOperator), cloudHandler.SyncConnection)
 		v1.GET("/cloud/certificates", cloudHandler.ListCertificates)
 		v1.POST("/cloud/import", middleware.RequireRole(middleware.RoleOperator), cloudHandler.ImportCertificate)
+
+		// ── Renewal queue ──
+		// Renewal is the only part of this system that changes the world, so
+		// what it is about to do is readable rather than inferred from logs.
+		v1.GET("/renewals", renewalHandler.List)
+		v1.GET("/renewals/:id", renewalHandler.Get)
+		// Cancelling stops a renewal somebody asked for. Admin, because the
+		// certificate then goes back to expiring on its own with nothing
+		// scheduled to stop it.
+		v1.DELETE("/renewals/:id", middleware.RequireRole(middleware.RoleAdmin), renewalHandler.Cancel)
 
 		// ── Display Tokens ──
 		// Admin-only throughout: minting a credential that authenticates to

@@ -2402,3 +2402,256 @@ func (s *PostgresStore) MarkCloudCertificateImported(ctx context.Context, id, ce
 	}
 	return nil
 }
+
+// ── Renewal queue ───────────────────────────────────────────
+
+const renewalJobColumns = `id, certificate_id, reason, status, run_after, coalesce(attempts, 0),
+		locked_by, locked_until, coalesce(last_error, ''), coalesce(attempt_log, '[]'::jsonb),
+		not_after, coalesce(fingerprint_at_enqueue, ''), escalated_at,
+		triggered_by, actor_email, started_at, completed_at, created_at, updated_at`
+
+func scanRenewalJob(row pgx.Row) (*RenewalJob, error) {
+	j := &RenewalJob{}
+	var logJSON []byte
+	err := row.Scan(
+		&j.ID, &j.CertificateID, &j.Reason, &j.Status, &j.RunAfter, &j.Attempts,
+		&j.LockedBy, &j.LockedUntil, &j.LastError, &logJSON,
+		&j.NotAfter, &j.FingerprintAtEnqueue, &j.EscalatedAt,
+		&j.TriggeredBy, &j.ActorEmail, &j.StartedAt, &j.CompletedAt, &j.CreatedAt, &j.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(logJSON) > 0 {
+		_ = json.Unmarshal(logJSON, &j.AttemptLog)
+	}
+	if j.AttemptLog == nil {
+		j.AttemptLog = []RenewalAttempt{}
+	}
+	return j, nil
+}
+
+func (s *PostgresStore) EnqueueRenewal(ctx context.Context, job *RenewalJob) (bool, error) {
+	// ON CONFLICT against the partial unique index. Two replicas scanning in
+	// the same second both try; one wins, the other gets no row back and reads
+	// the existing job. No leader, no failover gap, no duplicate issuance.
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO public.renewal_jobs
+			(certificate_id, reason, status, run_after, not_after, fingerprint_at_enqueue,
+			 triggered_by, actor_email)
+		VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7)
+		ON CONFLICT (certificate_id) WHERE status IN ('PENDING', 'RUNNING') DO NOTHING
+		RETURNING `+renewalJobColumns,
+		job.CertificateID, job.Reason, job.RunAfter, job.NotAfter,
+		nullIfEmpty(job.FingerprintAtEnqueue), job.TriggeredBy, job.ActorEmail)
+
+	created, err := scanRenewalJob(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, findErr := s.outstandingRenewalJob(ctx, job.CertificateID)
+		if findErr != nil {
+			return false, findErr
+		}
+		if existing != nil {
+			*job = *existing
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	*job = *created
+	return true, nil
+}
+
+func (s *PostgresStore) outstandingRenewalJob(ctx context.Context, certificateID string) (*RenewalJob, error) {
+	job, err := scanRenewalJob(s.pool.QueryRow(ctx,
+		"SELECT "+renewalJobColumns+` FROM public.renewal_jobs
+		 WHERE certificate_id = $1 AND status IN ('PENDING', 'RUNNING')
+		 ORDER BY created_at DESC LIMIT 1`, certificateID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return job, err
+}
+
+func (s *PostgresStore) ClaimRenewalJob(ctx context.Context, worker string, lease time.Duration, now time.Time) (*RenewalJob, error) {
+	// FOR UPDATE SKIP LOCKED is what lets every replica be a worker. Two
+	// claiming at once do not block each other and do not take the same row;
+	// the second simply picks the next one.
+	//
+	// The WHERE clause takes pending-and-due jobs, and running jobs whose lease
+	// has expired — a worker that was killed mid-renewal releases its job by
+	// the clock rather than by anything having to notice it died.
+	//
+	// Ordered by the deadline being raced, not by age. A certificate expiring
+	// tomorrow outranks one enqueued an hour earlier with a month left.
+	row := s.pool.QueryRow(ctx, `
+		UPDATE public.renewal_jobs
+		SET status = 'RUNNING',
+		    locked_by = $1,
+		    locked_until = $2,
+		    attempts = attempts + 1,
+		    started_at = coalesce(started_at, $3),
+		    updated_at = now()
+		WHERE id = (
+			SELECT id FROM public.renewal_jobs
+			WHERE (status = 'PENDING' AND run_after <= $3)
+			   OR (status = 'RUNNING' AND locked_until IS NOT NULL AND locked_until < $3)
+			ORDER BY not_after ASC NULLS LAST, run_after ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING `+renewalJobColumns,
+		worker, now.Add(lease), now)
+
+	job, err := scanRenewalJob(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// An empty queue is the ordinary case, not an error.
+		return nil, nil
+	}
+	return job, err
+}
+
+func (s *PostgresStore) ExtendRenewalLease(ctx context.Context, id, worker string, until time.Time) error {
+	// Scoped to the holder. A worker whose lease already expired and was taken
+	// by somebody else must not be able to extend it back out from under them.
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.renewal_jobs
+		SET locked_until = $3, updated_at = now()
+		WHERE id = $1 AND locked_by = $2 AND status = 'RUNNING'`, id, worker, until)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("renewal job %s is no longer held by %s", id, worker)
+	}
+	return nil
+}
+
+func (s *PostgresStore) CompleteRenewalJob(ctx context.Context, id, status string,
+	attempt RenewalAttempt, runAfter time.Time, escalate bool) error {
+	attemptJSON, err := json.Marshal([]RenewalAttempt{attempt})
+	if err != nil {
+		return err
+	}
+
+	// The attempt log is appended to and trimmed in one statement, so a job
+	// retrying for weeks does not grow without limit. The newest entries are
+	// kept: what it is doing now matters more than what it did a fortnight ago,
+	// and the count of attempts survives separately.
+	query := `
+		UPDATE public.renewal_jobs
+		SET status = $2,
+		    last_error = $3,
+		    attempt_log = (
+		        SELECT coalesce(jsonb_agg(entry), '[]'::jsonb)
+		        FROM (
+		            SELECT entry FROM jsonb_array_elements(coalesce(attempt_log, '[]'::jsonb) || $4::jsonb) AS entry
+		            OFFSET greatest(jsonb_array_length(coalesce(attempt_log, '[]'::jsonb)) + 1 - 50, 0)
+		        ) trimmed
+		    ),
+		    locked_by = NULL,
+		    locked_until = NULL,
+		    updated_at = now()`
+	args := []any{id, status, nullIfEmpty(attempt.Error), attemptJSON}
+
+	if status == RenewalPending {
+		query += ", run_after = $5"
+		args = append(args, runAfter)
+	} else {
+		query += ", completed_at = now()"
+	}
+	if escalate {
+		// Set once and left. When a job first became somebody's problem is more
+		// useful than when it most recently was.
+		query += ", escalated_at = coalesce(escalated_at, now())"
+	}
+	query += " WHERE id = $1"
+
+	tag, err := s.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("renewal job %s not found", id)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetRenewalJob(ctx context.Context, id string) (*RenewalJob, error) {
+	job, err := scanRenewalJob(s.pool.QueryRow(ctx,
+		"SELECT "+renewalJobColumns+" FROM public.renewal_jobs WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("renewal job %s not found", id)
+	}
+	return job, err
+}
+
+func (s *PostgresStore) ListRenewalJobs(ctx context.Context, filter RenewalJobFilter) ([]*RenewalJob, int64, error) {
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(clause string, value any) {
+		args = append(args, value)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
+
+	if filter.CertificateID != "" {
+		add("certificate_id = $%d", filter.CertificateID)
+	}
+	if filter.Status != "" {
+		add("status = $%d", filter.Status)
+	}
+	if filter.OutstandingOnly {
+		where = append(where, "status IN ('PENDING', 'RUNNING')")
+	}
+	if filter.EscalatedOnly {
+		where = append(where, "escalated_at IS NOT NULL")
+	}
+	clause := strings.Join(where, " AND ")
+
+	var total int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT count(*) FROM public.renewal_jobs WHERE "+clause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	args = append(args, limit, filter.Offset)
+	// Urgency first, the same order the workers claim in, so the screen agrees
+	// with what is actually happening next.
+	query := "SELECT " + renewalJobColumns + " FROM public.renewal_jobs WHERE " + clause +
+		fmt.Sprintf(" ORDER BY not_after ASC NULLS LAST, created_at DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]*RenewalJob, 0)
+	for rows.Next() {
+		job, err := scanRenewalJob(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, job)
+	}
+	return out, total, rows.Err()
+}
+
+func (s *PostgresStore) CancelRenewalJob(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.renewal_jobs
+		SET status = 'CANCELLED', completed_at = now(), locked_by = NULL, locked_until = NULL, updated_at = now()
+		WHERE id = $1 AND status IN ('PENDING', 'RUNNING')`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("renewal job %s is not outstanding", id)
+	}
+	return nil
+}

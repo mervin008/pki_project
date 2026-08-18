@@ -35,6 +35,7 @@ type Server struct {
 	dispatcher   *notifications.Dispatcher
 	broker       *events.Broker
 	renewalSched *renewal.Scheduler
+	renewalQueue *renewal.Queue
 	scanner      *discovery.Scanner
 	discoverySch *discovery.Scheduler
 	ctMonitor    *ctlog.Monitor
@@ -113,7 +114,12 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	caMonitor := pki.NewCAMonitor(st, broker)
 	chainResolver := pki.NewChainResolver(st)
 	renewalExec := renewal.NewExecutor(st, pm, keyring, broker)
-	renewalSched := renewal.NewScheduler(st, renewalExec, cfg.Renewal.DefaultLeadDays)
+	// The sweep finds what is due and enqueues it; the queue runs it. Both
+	// safe on every replica: enqueues collide on a partial unique index and
+	// claims use FOR UPDATE SKIP LOCKED, so nothing here needs a leader — and
+	// so nothing here has a failover window during which no certificate renews.
+	renewalSched := renewal.NewScheduler(st, cfg.Renewal.DefaultLeadDays)
+	renewalQueue := renewal.NewQueue(st, renewalExec, broker)
 	policyEng := policy.NewEngine(st)
 	// The scanner publishes progress so a range scan is visible while it runs,
 	// not only once it is over.
@@ -153,6 +159,8 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		CAMonitor:     caMonitor,
 		ChainResolver: chainResolver,
 		RenewalExec:   renewalExec,
+		RenewalSched:  renewalSched,
+		RenewalQueue:  renewalQueue,
 		PolicyEngine:  policyEng,
 		Scanner:       scanner,
 		CTMonitor:     ctMonitor,
@@ -182,6 +190,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		dispatcher:   dispatcher,
 		broker:       broker,
 		renewalSched: renewalSched,
+		renewalQueue: renewalQueue,
 		scanner:      scanner,
 		discoverySch: discoverySch,
 		ctMonitor:    ctMonitor,
@@ -228,6 +237,7 @@ func (s *Server) Start() error {
 		scanInterval = time.Hour
 	}
 	s.renewalSched.Start(scanInterval)
+	s.renewalQueue.Start()
 
 	// An expiring CA takes down everything it signs, so this sweep has to run
 	// on a timer rather than waiting for someone to open the dashboard.
@@ -255,7 +265,12 @@ func (s *Server) Start() error {
 // Shutdown gracefully stops the server, background schedulers, and store pool.
 func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("shutting down CertPilot Core")
+	// The sweep first, so nothing new is enqueued while the queue drains. A job
+	// enqueued during shutdown is not lost — that is the point of the table —
+	// but a worker claiming one it has no time to finish leaves a lease to
+	// expire before another replica can pick it up.
 	s.renewalSched.Stop()
+	s.renewalQueue.Stop()
 	s.caMonitor.Stop()
 	s.discoverySch.Stop()
 	s.ctMonitor.Stop()

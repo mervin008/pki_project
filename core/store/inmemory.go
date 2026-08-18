@@ -43,6 +43,7 @@ type MemoryStore struct {
 	ctCertificates     []*CTCertificate
 	cloudConnections   map[string]*CloudConnection
 	cloudCertificates  []*CloudCertificate
+	renewalJobs        []*RenewalJob
 }
 
 // clone returns a shallow copy of a stored record.
@@ -1852,4 +1853,235 @@ func (m *MemoryStore) MarkCloudCertificateImported(ctx context.Context, id, cert
 		return nil
 	}
 	return fmt.Errorf("cloud certificate %s not found", id)
+}
+
+// ── Renewal queue ───────────────────────────────────────────
+
+// maxAttemptLog bounds the history kept on one job, so a renewal retrying for
+// weeks does not grow without limit. The newest are kept: what a job is doing
+// now matters more than what it did a fortnight ago, and the attempt count
+// survives separately.
+const maxAttemptLog = 50
+
+func (m *MemoryStore) EnqueueRenewal(ctx context.Context, job *RenewalJob) (bool, error) {
+	if job.CertificateID == "" {
+		return false, fmt.Errorf("a renewal job needs a certificate")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// The in-memory stand-in for the partial unique index: at most one
+	// outstanding job per certificate.
+	for _, existing := range m.renewalJobs {
+		if existing.CertificateID == job.CertificateID && existing.Outstanding() {
+			*job = *clone(existing)
+			return false, nil
+		}
+	}
+
+	stored := clone(job)
+	if stored.ID == "" {
+		stored.ID = uuid.New().String()
+	}
+	if stored.Status == "" {
+		stored.Status = RenewalPending
+	}
+	if stored.Reason == "" {
+		stored.Reason = RenewalReasonScheduled
+	}
+	if stored.RunAfter.IsZero() {
+		stored.RunAfter = time.Now()
+	}
+	if stored.AttemptLog == nil {
+		stored.AttemptLog = []RenewalAttempt{}
+	}
+	now := time.Now()
+	stored.CreatedAt, stored.UpdatedAt = now, now
+
+	m.renewalJobs = append(m.renewalJobs, stored)
+	*job = *clone(stored)
+	return true, nil
+}
+
+func (m *MemoryStore) ClaimRenewalJob(ctx context.Context, worker string, lease time.Duration, now time.Time) (*RenewalJob, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var best *RenewalJob
+	for _, job := range m.renewalJobs {
+		ready := (job.Status == RenewalPending && !job.RunAfter.After(now)) ||
+			// A worker that was killed releases its job by the lease running
+			// out rather than by anything having to reap it.
+			(job.Status == RenewalRunning && job.LockedUntil != nil && job.LockedUntil.Before(now))
+		if !ready {
+			continue
+		}
+		if best == nil || moreUrgent(job, best) {
+			best = job
+		}
+	}
+	if best == nil {
+		// An empty queue is the ordinary case, not an error.
+		return nil, nil
+	}
+
+	until := now.Add(lease)
+	holder := worker
+	best.Status = RenewalRunning
+	best.LockedBy = &holder
+	best.LockedUntil = &until
+	best.Attempts++
+	if best.StartedAt == nil {
+		started := now
+		best.StartedAt = &started
+	}
+	best.UpdatedAt = time.Now()
+	return clone(best), nil
+}
+
+// moreUrgent ranks by the deadline being raced rather than by age. A
+// certificate expiring tomorrow outranks one enqueued an hour earlier with a
+// month left.
+func moreUrgent(a, b *RenewalJob) bool {
+	switch {
+	case a.NotAfter == nil && b.NotAfter == nil:
+		return a.RunAfter.Before(b.RunAfter)
+	case a.NotAfter == nil:
+		return false
+	case b.NotAfter == nil:
+		return true
+	case a.NotAfter.Equal(*b.NotAfter):
+		return a.RunAfter.Before(b.RunAfter)
+	}
+	return a.NotAfter.Before(*b.NotAfter)
+}
+
+func (m *MemoryStore) ExtendRenewalLease(ctx context.Context, id, worker string, until time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, job := range m.renewalJobs {
+		if job.ID != id {
+			continue
+		}
+		// Scoped to the holder: a worker whose lease already expired and was
+		// taken by somebody else must not extend it back out from under them.
+		if job.Status != RenewalRunning || job.LockedBy == nil || *job.LockedBy != worker {
+			return fmt.Errorf("renewal job %s is no longer held by %s", id, worker)
+		}
+		when := until
+		job.LockedUntil = &when
+		job.UpdatedAt = time.Now()
+		return nil
+	}
+	return fmt.Errorf("renewal job %s not found", id)
+}
+
+func (m *MemoryStore) CompleteRenewalJob(ctx context.Context, id, status string,
+	attempt RenewalAttempt, runAfter time.Time, escalate bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, job := range m.renewalJobs {
+		if job.ID != id {
+			continue
+		}
+		job.Status = status
+		job.LastError = attempt.Error
+		job.LockedBy, job.LockedUntil = nil, nil
+
+		log := append(append([]RenewalAttempt{}, job.AttemptLog...), attempt)
+		if len(log) > maxAttemptLog {
+			log = log[len(log)-maxAttemptLog:]
+		}
+		job.AttemptLog = log
+
+		if status == RenewalPending {
+			job.RunAfter = runAfter
+		} else {
+			done := time.Now()
+			job.CompletedAt = &done
+		}
+		if escalate && job.EscalatedAt == nil {
+			// Set once and left: when a job first became somebody's problem is
+			// more useful than when it most recently was.
+			when := time.Now()
+			job.EscalatedAt = &when
+		}
+		job.UpdatedAt = time.Now()
+		return nil
+	}
+	return fmt.Errorf("renewal job %s not found", id)
+}
+
+func (m *MemoryStore) GetRenewalJob(ctx context.Context, id string) (*RenewalJob, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, job := range m.renewalJobs {
+		if job.ID == id {
+			return clone(job), nil
+		}
+	}
+	return nil, fmt.Errorf("renewal job %s not found", id)
+}
+
+func (m *MemoryStore) ListRenewalJobs(ctx context.Context, filter RenewalJobFilter) ([]*RenewalJob, int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	matched := make([]*RenewalJob, 0)
+	for _, job := range m.renewalJobs {
+		if filter.CertificateID != "" && job.CertificateID != filter.CertificateID {
+			continue
+		}
+		if filter.Status != "" && job.Status != filter.Status {
+			continue
+		}
+		if filter.OutstandingOnly && !job.Outstanding() {
+			continue
+		}
+		if filter.EscalatedOnly && job.EscalatedAt == nil {
+			continue
+		}
+		matched = append(matched, clone(job))
+	}
+
+	// The same order the workers claim in, so the screen agrees with what is
+	// actually happening next.
+	sort.Slice(matched, func(i, j int) bool {
+		if matched[i].NotAfter != nil && matched[j].NotAfter != nil &&
+			!matched[i].NotAfter.Equal(*matched[j].NotAfter) {
+			return matched[i].NotAfter.Before(*matched[j].NotAfter)
+		}
+		if (matched[i].NotAfter == nil) != (matched[j].NotAfter == nil) {
+			return matched[j].NotAfter == nil
+		}
+		return matched[i].CreatedAt.After(matched[j].CreatedAt)
+	})
+
+	total := int64(len(matched))
+	return paginate(matched, filter.Limit, filter.Offset), total, nil
+}
+
+func (m *MemoryStore) CancelRenewalJob(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, job := range m.renewalJobs {
+		if job.ID != id {
+			continue
+		}
+		if !job.Outstanding() {
+			return fmt.Errorf("renewal job %s is not outstanding", id)
+		}
+		job.Status = RenewalCancelled
+		job.LockedBy, job.LockedUntil = nil, nil
+		done := time.Now()
+		job.CompletedAt = &done
+		job.UpdatedAt = done
+		return nil
+	}
+	return fmt.Errorf("renewal job %s is not outstanding", id)
 }

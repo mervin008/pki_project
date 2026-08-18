@@ -33,6 +33,7 @@ var requiredTables = []string{
 	"display_tokens",
 	"notification_channels",
 	"policies",
+	"renewal_jobs",
 }
 
 // Preflight verifies that the connected database can actually serve the core,
@@ -207,6 +208,13 @@ func warnOnStaleSchema(ctx context.Context, pool *pgxpool.Pool) {
 				SELECT 1 FROM information_schema.tables
 				WHERE table_schema = 'public' AND table_name = 'cloud_connections')`,
 			consequence: "there is no cloud_connections table (migration 011); certificates stored in ACM, Key Vault, GCP, or Kubernetes will not be inventoried",
+		},
+		{
+			// Migration 013.
+			query: `SELECT NOT EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = 'public' AND table_name = 'renewal_jobs')`,
+			consequence: "there is no renewal_jobs table (migration 013); the renewal sweep will find certificates due and be unable to queue any of them",
 		},
 		{
 			// Migration 005. This one is a hard failure at write time rather

@@ -22,17 +22,19 @@ type CertificateHandler struct {
 	store     store.Store
 	pluginMgr *pluginmgr.Manager
 	executor  *renewal.Executor
+	renewals  *renewal.Scheduler
 	policyEng *policy.Engine
 	keyring   *secrets.Keyring
 	broker    *events.Broker
 }
 
 // NewCertificateHandler creates a new handler.
-func NewCertificateHandler(s store.Store, pm *pluginmgr.Manager, exec *renewal.Executor, pe *policy.Engine, kr *secrets.Keyring, broker *events.Broker) *CertificateHandler {
+func NewCertificateHandler(s store.Store, pm *pluginmgr.Manager, exec *renewal.Executor, sched *renewal.Scheduler, pe *policy.Engine, kr *secrets.Keyring, broker *events.Broker) *CertificateHandler {
 	return &CertificateHandler{
 		store:     s,
 		pluginMgr: pm,
 		executor:  exec,
+		renewals:  sched,
 		policyEng: pe,
 		keyring:   kr,
 		broker:    broker,
@@ -279,14 +281,83 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 }
 
 // Renew handles POST /api/v1/certificates/:id/renew.
+//
+// Enqueues rather than renews. It used to call the gateway inline and return
+// the renewed certificate, which read well and was wrong in three ways: an ACME
+// order with a DNS challenge outlives the server's write timeout, so the caller
+// got a truncated response for a renewal that was still running; a failure
+// meant one attempt and no record of it; and a core that restarted mid-request
+// left nothing behind at all.
+//
+// 202 with the job, so the caller has something to watch. A renewal already in
+// flight returns the same job rather than starting a second one — two
+// certificates issued because somebody clicked twice is a real way to spend a
+// weekly rate limit.
 func (h *CertificateHandler) Renew(c *gin.Context) {
 	id := c.Param("id")
-	renewed, err := h.executor.RenewCertificate(c.Request.Context(), id)
+
+	cert, err := h.store.GetCertificate(c.Request.Context(), id)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, renewed)
+	if cert.CAAccountID == nil || *cert.CAAccountID == "" {
+		// Caught here rather than three minutes later in a worker: a
+		// certificate imported from a scan or a cloud store has no CA account
+		// and no private key, so nothing can renew it, and saying so now is the
+		// difference between an answer and a job that fails forever.
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "this certificate has no CA account, so nothing can renew it. " +
+				"Certificates that were discovered rather than issued have to be replaced by issuing a new one",
+		})
+		return
+	}
+
+	actorID := c.GetString(middleware.ContextUserID)
+	actorEmail := c.GetString(middleware.ContextUserEmail)
+	var actor, email *string
+	if actorID != "" {
+		actor = &actorID
+	}
+	if actorEmail != "" {
+		email = &actorEmail
+	}
+
+	job := &store.RenewalJob{}
+	created, err := h.renewals.Enqueue(c.Request.Context(), cert, store.RenewalReasonManual, actor, email)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	jobs, _, err := h.store.ListRenewalJobs(c.Request.Context(), store.RenewalJobFilter{
+		CertificateID: id, OutstandingOnly: true, Limit: 1,
+	})
+	if err == nil && len(jobs) > 0 {
+		job = jobs[0]
+	}
+
+	if !created {
+		c.JSON(http.StatusAccepted, gin.H{
+			"data":    job,
+			"message": "A renewal for this certificate is already queued; this did not start a second one.",
+		})
+		return
+	}
+
+	_ = h.store.CreateAuditLog(c.Request.Context(), &store.AuditLog{
+		Action:     "cert.renewal_requested",
+		EntityType: "certificate",
+		EntityID:   &cert.ID,
+		ActorID:    actor,
+		ActorEmail: email,
+		Details:    fmt.Sprintf(`{"cn":%q,"job_id":%q}`, cert.CommonName, job.ID),
+	})
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"data":    job,
+		"message": "Queued. Watch it at GET /api/v1/renewals/" + job.ID + ".",
+	})
 }
 
 // PrivateKey handles GET /api/v1/certificates/:id/private-key.

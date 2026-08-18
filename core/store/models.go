@@ -873,3 +873,113 @@ type CloudCertificateFilter struct {
 	Limit          int
 	Offset         int
 }
+
+// Renewal job states.
+const (
+	RenewalPending   = "PENDING"
+	RenewalRunning   = "RUNNING"
+	RenewalSucceeded = "SUCCEEDED"
+	RenewalFailed    = "FAILED"
+	RenewalCancelled = "CANCELLED"
+)
+
+// Why a renewal job exists.
+const (
+	RenewalReasonScheduled = "SCHEDULED"
+	RenewalReasonManual    = "MANUAL"
+	RenewalReasonARI       = "ARI"
+	RenewalReasonRetry     = "RETRY"
+)
+
+// RenewalAttempt is one try at a renewal, kept whether it worked or not.
+//
+// The list of these is the point. "This has failed eleven times in six days
+// with the same DNS error" is a sentence somebody can act on; "last error:
+// timeout" cannot distinguish a blip from a fortnight of silence.
+type RenewalAttempt struct {
+	Number     int       `json:"number"`
+	StartedAt  time.Time `json:"started_at"`
+	DurationMS int64     `json:"duration_ms"`
+	// Worker names the process that made the attempt, so a failure isolated to
+	// one replica is visible as one.
+	Worker string `json:"worker,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// RenewalJob is one renewal that has been asked for and not yet finished.
+//
+// Renewal is the only part of this system that changes the world; everything
+// else observes. So it exists as a row rather than as a call: a process that
+// dies mid-renewal leaves behind something another process can pick up, rather
+// than a certificate whose fate nobody recorded.
+type RenewalJob struct {
+	ID            string `json:"id"`
+	CertificateID string `json:"certificate_id"`
+	Reason        string `json:"reason"`
+	Status        string `json:"status"`
+
+	// RunAfter is when this job may next be attempted. Retries move it
+	// forward; nothing else does.
+	RunAfter time.Time `json:"run_after"`
+	Attempts int       `json:"attempts"`
+
+	// LockedBy and LockedUntil are the lease. A worker that is killed does not
+	// need reaping — its claim expires and another worker takes the job.
+	LockedBy    *string    `json:"locked_by,omitempty"`
+	LockedUntil *time.Time `json:"locked_until,omitempty"`
+
+	LastError  string           `json:"last_error,omitempty"`
+	AttemptLog []RenewalAttempt `json:"attempt_log"`
+
+	// NotAfter is the deadline this job is racing, copied from the certificate
+	// at enqueue. Denormalised so the queue can be ordered by urgency on every
+	// claim without a join.
+	NotAfter *time.Time `json:"not_after,omitempty"`
+
+	// FingerprintAtEnqueue is what the certificate was when the job was
+	// created. The crash guard: if the certificate has moved on its own, the
+	// renewal already happened and a retry must not issue a second one.
+	FingerprintAtEnqueue string `json:"fingerprint_at_enqueue,omitempty"`
+
+	// EscalatedAt marks a job a person should look at, so alerting does not
+	// have to re-derive that from attempt counts.
+	EscalatedAt *time.Time `json:"escalated_at,omitempty"`
+
+	TriggeredBy *string `json:"triggered_by,omitempty"`
+	ActorEmail  *string `json:"actor_email,omitempty"`
+
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+// Outstanding reports whether this job still has work left in it.
+func (j *RenewalJob) Outstanding() bool {
+	return j != nil && (j.Status == RenewalPending || j.Status == RenewalRunning)
+}
+
+// RunwayHours is how long is left before the certificate this job is renewing
+// expires. Negative once it has.
+//
+// The number that should decide everything about how this job is treated: how
+// urgently it is retried, how loudly it is reported, and whether a failure is a
+// nuisance or an outage in waiting.
+func (j *RenewalJob) RunwayHours(now time.Time) float64 {
+	if j == nil || j.NotAfter == nil {
+		return 0
+	}
+	return j.NotAfter.Sub(now).Hours()
+}
+
+// RenewalJobFilter narrows a listing.
+type RenewalJobFilter struct {
+	CertificateID string
+	Status        string
+	// OutstandingOnly returns the queue rather than its history.
+	OutstandingOnly bool
+	// EscalatedOnly returns the jobs somebody needs to look at.
+	EscalatedOnly bool
+	Limit         int
+	Offset        int
+}

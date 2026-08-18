@@ -73,7 +73,11 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "Common name", Value: fallback(cn, "—")},
 			{Label: "Days remaining", Value: daysText(num(payload, "days_remaining"))},
 			{Label: "Error", Value: fallback(str(payload, "error"), "—")},
-			{Label: "Attempts", Value: countText(num(payload, "renewal_count"))},
+			// The queue's count, not the certificate's lifetime renewal_count.
+			// This alert fires once when a renewal stops being a blip, so how
+			// many times it has already failed is the fact that says whether
+			// this is a hiccup or a fortnight of the same error.
+			{Label: "Failed attempts", Value: countText(num(payload, "attempts"))},
 		}
 
 	case events.TopicCertExpiring:

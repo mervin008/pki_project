@@ -823,6 +823,125 @@ asked for. CertPilot holds no private key for something it read out of somebody
 else's store. The response says so, and adds the reason it was found in the
 first place: *"Note that the provider does not renew it either."*
 
+## Renewal queue
+
+```
+GET    /api/v1/renewals                     What is queued, most urgent first
+GET    /api/v1/renewals/:id                 One job, with every attempt
+DELETE /api/v1/renewals/:id                 Cancel it                       (admin)
+POST   /api/v1/certificates/:id/renew       Queue a renewal                 (operator)
+```
+
+Renewal is the only part of this system that changes the world. Everything else
+observes. So it is not a call the scheduler makes — it is a durable row that
+somebody owns, and a process that dies mid-renewal leaves behind something
+another process can pick up.
+
+### Asking for one
+
+```json
+POST /api/v1/certificates/{id}/renew
+→ 202 Accepted
+{ "data": { "id": "…", "status": "PENDING", "reason": "MANUAL", "attempts": 0 },
+  "message": "Queued. Watch it at GET /api/v1/renewals/…" }
+```
+
+**202, not 200.** This endpoint used to call the gateway inline and return the
+renewed certificate, which read well and was wrong in three ways: an ACME order
+with a DNS challenge outlives the server's 30-second write timeout, so the
+caller got a truncated response for a renewal that was still running; a failure
+meant one attempt and no record of it; and a core that restarted mid-request
+left nothing behind at all.
+
+Pressing it twice returns **the same job**:
+
+```json
+{ "data": { "id": "…same id…" },
+  "message": "A renewal for this certificate is already queued; this did not start a second one." }
+```
+
+Two certificates issued because somebody clicked twice is a real way to spend a
+weekly rate limit. A certificate with no CA account — anything discovered rather
+than issued — is refused with **400** at this point rather than becoming a job
+that fails forever.
+
+### Where a job stands
+
+```json
+GET /api/v1/renewals/{id}
+{ "data": { "status": "PENDING", "attempts": 3, "run_after": "…",
+            "escalated_at": "…", "not_after": "…",
+            "attempt_log": [
+              { "number": 1, "started_at": "…", "duration_ms": 412,
+                "worker": "core-7c9f/1", "error": "dial tcp 10.0.0.5:9091: connection refused" }
+            ] },
+  "summary": "Failed 3 time(s), with 41 hours left before this certificate expires. Retrying in 8 minutes. The most recent error was: …" }
+```
+
+The **whole attempt log**, not just the last error. "This has failed eleven
+times in six days with the same DNS error" is a sentence somebody can act on;
+`last_error: timeout` cannot tell a blip from a fortnight of silence. Each entry
+names the worker that made it, because one replica failing and every replica
+failing are different problems.
+
+The log is capped at the 50 most recent attempts, so a renewal retrying for
+weeks does not grow without limit inside a row a dashboard reads constantly. The
+attempt count is kept separately and is not capped.
+
+### What the queue does with failure
+
+A failed attempt leaves the job **PENDING** with `run_after` moved forward.
+There is no attempt count at which a certificate stops needing to be renewed,
+and a queue that gives up on its own goes quiet exactly when it matters.
+
+Backoff is exponential from 2 minutes to a 6-hour ceiling, **jittered ±20%**.
+Forty renewals failing against one CA outage and all coming back at the same
+instant is how a transient failure becomes a rate-limit suspension.
+
+`escalated_at` is set when a failure stops being a blip — three attempts, or a
+single failure with less than seven days of runway, because close to expiry
+there may not be room for many more attempts. The `cert.renewal_failed` alert
+fires **once**, on escalation, not per attempt.
+
+```
+GET /api/v1/renewals?escalated=true
+```
+
+The listing surfaces a `warning` naming them: *"3 renewal(s) have been failing
+long enough to need attention … Each of these is a certificate on a countdown."*
+
+The listing defaults to outstanding jobs only — the question is almost always
+"what is about to happen", not "what happened last month". `?outstanding=false`
+returns the history.
+
+### Ordering, leases, and why there is no leader
+
+Jobs are claimed **by the deadline being raced, not by age**. A certificate
+expiring tomorrow outranks one enqueued an hour earlier with a month left.
+
+A claim is a **lease** — `locked_by` and `locked_until`. A worker killed
+mid-renewal does not need to be cleaned up after: its claim expires and another
+worker takes the job. Long renewals heartbeat to extend it, so an ACME order
+waiting on DNS propagation is not stolen mid-flight.
+
+There is no leader election and no advisory lock. Enqueues collide on a partial
+unique index (`at most one outstanding job per certificate`) and claims use
+`FOR UPDATE SKIP LOCKED`, so N replicas can all run the sweep and all run
+workers without duplicating anything. A leader would be a single point of
+failure with a window after it dies during which nothing renews at all, which is
+a strange thing to build into the component whose entire job is that nothing
+lapses.
+
+### Cancelling
+
+```
+DELETE /api/v1/renewals/{id}
+{ "message": "Renewal cancelled. Nothing is now scheduled to replace this certificate before it expires." }
+```
+
+Admin, and the response says what it costs. Cancelling is never how a failure is
+handled — a renewal nobody cancelled keeps trying.
+
 ## Ownership and acknowledgement
 
 ```

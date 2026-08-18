@@ -80,8 +80,9 @@ make migrate
   applied  010_ct_monitoring.sql
   applied  011_cloud_inventory.sql
   applied  012_cloud_provenance.sql
+  applied  013_renewal_jobs.sql
 
-Applied 12 migration(s).
+Applied 13 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so
@@ -259,3 +260,38 @@ Migrations are append-only for the same reason the migrator checksums them: an
 edit to `001` would have left this database recording a file it no longer
 matches. Editing an applied migration prints a warning on every subsequent run,
 which is the migrator working correctly and worth not silencing.
+
+### Migration 013 replaces leader election with two constraints
+
+`renewal_jobs` is the one table in this schema that exists to make concurrency
+safe rather than to record something. Two things in it do that work, and both
+are cheaper and more robust than the advisory-lock leader the roadmap originally
+called for:
+
+```sql
+create unique index idx_renewal_jobs_one_outstanding
+  on public.renewal_jobs (certificate_id)
+  where status in ('PENDING', 'RUNNING');
+```
+
+At most one outstanding job per certificate. Every replica can run the renewal
+sweep; the second one to enqueue a given certificate loses the race on this
+index and its insert is discarded by `ON CONFLICT … DO NOTHING`.
+
+```sql
+SELECT id FROM public.renewal_jobs
+WHERE (status = 'PENDING' AND run_after <= $3)
+   OR (status = 'RUNNING' AND locked_until < $3)
+ORDER BY not_after ASC NULLS LAST, run_after ASC
+FOR UPDATE SKIP LOCKED
+LIMIT 1
+```
+
+`SKIP LOCKED` means two workers claiming at the same instant never collide —
+the second takes the next row rather than blocking or duplicating. The second
+`OR` arm is the lease: a worker that was killed releases its job when
+`locked_until` passes, with nothing needing to notice it died.
+
+A leader would have given one replica all the work and a failover window during
+which no certificate renews at all. These two lines give N equal workers and no
+window.
