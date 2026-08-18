@@ -205,6 +205,15 @@ func (e *Executor) recordFailure(ctx context.Context, cert *store.Certificate, c
 }
 
 func (e *Executor) decryptCAConfig(acc *store.CAAccount) (string, error) {
+	return decryptCAConfig(e.keyring, acc)
+}
+
+// decryptCAConfig opens a CA account's sealed configuration.
+//
+// Shared by the executor and the renewal information poller: both have to hand
+// the same provider config to the same gateway, and two copies of this would be
+// two places for the pre-encryption fallback below to drift.
+func decryptCAConfig(keyring *secrets.Keyring, acc *store.CAAccount) (string, error) {
 	if acc.ConfigEncrypted == "" {
 		return "", nil
 	}
@@ -212,7 +221,7 @@ func (e *Executor) decryptCAConfig(acc *store.CAAccount) (string, error) {
 	if !secrets.IsEnvelope(acc.ConfigEncrypted) {
 		return acc.ConfigEncrypted, nil
 	}
-	plaintext, err := e.keyring.DecryptString(acc.ConfigEncrypted, secrets.ContextCAAccountConfig)
+	plaintext, err := keyring.DecryptString(acc.ConfigEncrypted, secrets.ContextCAAccountConfig)
 	if err != nil {
 		return "", fmt.Errorf("failed to decrypt the configuration for CA account %q: %w", acc.Name, err)
 	}

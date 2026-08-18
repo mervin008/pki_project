@@ -85,7 +85,9 @@ const certificateColumns = `id, fingerprint_sha256, common_name,
 		last_renewal_attempt, renewal_error, coalesce(renewal_count, 0),
 		ca_account_id, ca_authority_id, deployment_target_id, certificate_pem, chain_pem,
 		coalesce(discovered_via, 'MANUAL'), coalesce(environment, ''), coalesce(team, ''),
-		coalesce(tags, '[]'::jsonb), created_by, created_at, updated_at`
+		coalesce(tags, '[]'::jsonb), created_by, created_at, updated_at,
+		renewal_scheduled_at, ari_window_start, ari_window_end,
+		coalesce(ari_explanation_url, ''), ari_checked_at, ari_next_check_at, ari_supported`
 
 // scanCertificate reads one row of certificateColumns.
 func scanCertificate(row pgx.Row) (*Certificate, error) {
@@ -97,6 +99,8 @@ func scanCertificate(row pgx.Row) (*Certificate, error) {
 		&cert.AutoRenew, &cert.RenewalLeadDays, &cert.LastRenewalAttempt, &cert.RenewalError, &cert.RenewalCount,
 		&cert.CAAccountID, &cert.CAAuthorityID, &cert.DeploymentTargetID, &cert.CertificatePEM, &cert.ChainPEM,
 		&cert.DiscoveredVia, &cert.Environment, &cert.Team, &tagsJSON, &cert.CreatedBy, &cert.CreatedAt, &cert.UpdatedAt,
+		&cert.RenewalScheduledAt, &cert.ARIWindowStart, &cert.ARIWindowEnd,
+		&cert.ARIExplanationURL, &cert.ARICheckedAt, &cert.ARINextCheckAt, &cert.ARISupported,
 	)
 	if err != nil {
 		return nil, err
@@ -332,14 +336,29 @@ func (s *PostgresStore) DeleteCertificate(ctx context.Context, id string) error 
 }
 
 func (s *PostgresStore) GetCertificatesDueForRenewal(ctx context.Context, defaultLeadDays int) ([]*Certificate, error) {
+	// Two ways to be due, and the CA's advice takes precedence over the lead
+	// time when there is any — it is better information, because the CA knows
+	// things about the certificate that the certificate does not say.
+	//
+	// But never off a cliff. The safety floor is the second half of the CASE:
+	// however far out the CA suggests renewing, a certificate inside the
+	// hard-floor window renews anyway. A CA that publishes a bad window, or a
+	// poller that stopped running and left a stale one, must not be able to
+	// talk this system out of renewing something that is about to expire.
 	query := `
 		SELECT ` + certificateColumns + `
 		FROM public.certificates
 		WHERE auto_renew = true
 		  AND status IN ('ISSUED', 'EXPIRING', 'RENEWAL_FAILED')
-		  AND not_after <= (now() + (COALESCE(renewal_lead_days, $1) || ' days')::interval)
+		  AND CASE
+		        WHEN renewal_scheduled_at IS NOT NULL THEN
+		          renewal_scheduled_at <= now()
+		          OR not_after <= (now() + make_interval(days => $2))
+		        ELSE
+		          not_after <= (now() + (COALESCE(renewal_lead_days, $1) || ' days')::interval)
+		      END
 	`
-	rows, err := s.pool.Query(ctx, query, defaultLeadDays)
+	rows, err := s.pool.Query(ctx, query, defaultLeadDays, RenewalSafetyFloorDays)
 	if err != nil {
 		return nil, err
 	}
@@ -2738,4 +2757,67 @@ func defaultWindowHours(hours int) int {
 		return 168
 	}
 	return hours
+}
+
+// UpdateCertificateRenewalInfo records what the CA last said about when to
+// renew one certificate.
+//
+// Separate from UpdateCertificate, which writes the whole record: the ARI
+// poller runs continuously and concurrently with everything else, and letting
+// it write a full certificate row would let a stale copy in its hand overwrite
+// a renewal that completed while it was asking.
+func (s *PostgresStore) UpdateCertificateRenewalInfo(ctx context.Context, id string, info RenewalInfoUpdate) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.certificates
+		SET renewal_scheduled_at = $2,
+		    ari_window_start = $3,
+		    ari_window_end = $4,
+		    ari_explanation_url = $5,
+		    ari_checked_at = $6,
+		    ari_next_check_at = $7,
+		    ari_supported = $8,
+		    updated_at = now()
+		WHERE id = $1`,
+		id, info.RenewalScheduledAt, info.WindowStart, info.WindowEnd,
+		nullIfEmpty(info.ExplanationURL), info.CheckedAt, info.NextCheckAt, info.Supported)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("certificate %s not found", id)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetCertificatesDueForARICheck(ctx context.Context, now time.Time, limit int) ([]*Certificate, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	// Only certificates that could act on the answer: renewed automatically,
+	// issued by a CA account, and with a body to name to that CA. Asking about
+	// anything else spends somebody's rate limit to learn nothing.
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+certificateColumns+`
+		FROM public.certificates
+		WHERE auto_renew = true
+		  AND ca_account_id IS NOT NULL
+		  AND certificate_pem IS NOT NULL
+		  AND status IN ('ISSUED', 'EXPIRING', 'RENEWAL_FAILED')
+		  AND (ari_next_check_at IS NULL OR ari_next_check_at <= $1)
+		ORDER BY not_after ASC NULLS LAST
+		LIMIT $2`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	certs := []*Certificate{}
+	for rows.Next() {
+		cert, err := scanCertificate(rows)
+		if err != nil {
+			return nil, err
+		}
+		certs = append(certs, cert)
+	}
+	return certs, rows.Err()
 }

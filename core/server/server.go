@@ -36,6 +36,7 @@ type Server struct {
 	broker       *events.Broker
 	renewalSched *renewal.Scheduler
 	renewalQueue *renewal.Queue
+	ariPoller    *renewal.ARIPoller
 	scanner      *discovery.Scanner
 	discoverySch *discovery.Scheduler
 	ctMonitor    *ctlog.Monitor
@@ -120,6 +121,11 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	// so nothing here has a failover window during which no certificate renews.
 	renewalSched := renewal.NewScheduler(st, cfg.Renewal.DefaultLeadDays)
 	renewalQueue := renewal.NewQueue(st, renewalExec, broker)
+	// The gateway has been able to read RFC 9773 renewal information since
+	// phase 2; nothing ever asked. This is the part that asks — and that
+	// notices when a CA pulls a window forward, which during a mass revocation
+	// is the only automated warning anybody gets.
+	ariPoller := renewal.NewARIPoller(st, pm, keyring, broker)
 	policyEng := policy.NewEngine(st)
 	// The scanner publishes progress so a range scan is visible while it runs,
 	// not only once it is over.
@@ -161,6 +167,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		RenewalExec:   renewalExec,
 		RenewalSched:  renewalSched,
 		RenewalQueue:  renewalQueue,
+		ARIPoller:     ariPoller,
 		PolicyEngine:  policyEng,
 		Scanner:       scanner,
 		CTMonitor:     ctMonitor,
@@ -191,6 +198,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		broker:       broker,
 		renewalSched: renewalSched,
 		renewalQueue: renewalQueue,
+		ariPoller:    ariPoller,
 		scanner:      scanner,
 		discoverySch: discoverySch,
 		ctMonitor:    ctMonitor,
@@ -238,6 +246,7 @@ func (s *Server) Start() error {
 	}
 	s.renewalSched.Start(scanInterval)
 	s.renewalQueue.Start()
+	s.ariPoller.Start()
 
 	// An expiring CA takes down everything it signs, so this sweep has to run
 	// on a timer rather than waiting for someone to open the dashboard.
@@ -271,6 +280,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// expire before another replica can pick it up.
 	s.renewalSched.Stop()
 	s.renewalQueue.Stop()
+	s.ariPoller.Stop()
 	s.caMonitor.Stop()
 	s.discoverySch.Stop()
 	s.ctMonitor.Stop()

@@ -17,11 +17,64 @@ import (
 type RenewalHandler struct {
 	store store.Store
 	sched *renewal.Scheduler
+	ari   *renewal.ARIPoller
 }
 
 // NewRenewalHandler creates the handler.
-func NewRenewalHandler(s store.Store, sched *renewal.Scheduler) *RenewalHandler {
-	return &RenewalHandler{store: s, sched: sched}
+func NewRenewalHandler(s store.Store, sched *renewal.Scheduler, ari *renewal.ARIPoller) *RenewalHandler {
+	return &RenewalHandler{store: s, sched: sched, ari: ari}
+}
+
+// RefreshRenewalInfo handles POST /api/v1/certificates/:id/renewal-info.
+//
+// Synchronous, because the answer is the point: somebody checking whether their
+// CA has moved a window wants to know now, not at the next poll.
+func (h *RenewalHandler) RefreshRenewalInfo(c *gin.Context) {
+	cert, err := h.store.GetCertificate(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	if cert.CAAccountID == nil || cert.CertificatePEM == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "this certificate has no CA account or no stored body, so there is no CA to ask about it",
+		})
+		return
+	}
+
+	h.ari.Refresh(c.Request.Context(), cert)
+
+	updated, err := h.store.GetCertificate(c.Request.Context(), cert.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data":    updated,
+		"summary": summarizeRenewalInfo(updated, time.Now()),
+	})
+}
+
+// summarizeRenewalInfo says what the CA's advice amounts to.
+//
+// The three-valued support flag is the reason this is a sentence rather than a
+// field: "never asked", "asked and this CA says nothing", and "asked and here
+// is the window" are three different states, and only the last one means the
+// renewal date on screen came from the CA.
+func summarizeRenewalInfo(cert *store.Certificate, now time.Time) string {
+	switch {
+	case cert.ARISupported == nil:
+		return "This certificate's CA has not been asked for renewal advice yet, so the renewal date comes from the configured lead time."
+	case !*cert.ARISupported:
+		return "This CA does not publish renewal information (RFC 9773), so the renewal date comes from the configured lead time. It will not be able to warn you if it revokes this certificate in bulk."
+	case cert.RenewalScheduledAt == nil:
+		return "The CA published a window but no renewal time was recorded from it."
+	case !cert.RenewalScheduledAt.After(now):
+		return "The CA wants this certificate replaced now. It is queued for renewal."
+	default:
+		return fmt.Sprintf("The CA suggests renewing this certificate in %s, and CertPilot picked a random moment inside its window rather than the start so that renewals do not cluster.",
+			humanUntil(*cert.RenewalScheduledAt, now))
+	}
 }
 
 // List handles GET /api/v1/renewals.

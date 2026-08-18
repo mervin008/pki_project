@@ -102,6 +102,25 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "Failed attempts", Value: countText(num(payload, "attempts"))},
 		}
 
+	case events.TopicCertRenewalWindowMoved:
+		cn := str(payload, "common_name")
+		hours := int(num(payload, "moved_by_hours"))
+		alert.Title = fmt.Sprintf("%s: the CA wants this replaced sooner", fallback(cn, "A certificate"))
+		// Worded as what it means, not what changed. "The renewal window moved"
+		// is a fact about a JSON field; a CA bringing a window forward is the
+		// CA telling you something is wrong with a certificate it issued, and
+		// during a mass revocation it is the only automated warning there is.
+		alert.Summary = fmt.Sprintf(
+			"%s has brought this certificate's renewal window forward by about %s. A CA does that when something is wrong with a certificate it issued — most often a bulk revocation. CertPilot has rescheduled the renewal; check the explanation before assuming it is routine.",
+			fallback(issuerShortName(str(payload, "issuer_dn")), "The CA"),
+			humanHours(hours))
+		alert.Fields = []Field{
+			{Label: "Common name", Value: fallback(cn, "—")},
+			{Label: "Renewing at", Value: momentText(str(payload, "renew_at"))},
+			{Label: "Brought forward by", Value: humanHours(hours)},
+			{Label: "Explanation", Value: fallback(str(payload, "explanation_url"), "the CA gave none")},
+		}
+
 	case events.TopicCertExpiring:
 		cn := str(payload, "common_name")
 		alert.Title = fmt.Sprintf("Certificate expiring: %s", fallback(cn, "unnamed"))
@@ -459,4 +478,46 @@ func providerText(provider string) string {
 	default:
 		return provider
 	}
+}
+
+// humanHours says "3 days" rather than "72 hours".
+func humanHours(hours int) string {
+	switch {
+	case hours >= 48:
+		return fmt.Sprintf("%d days", hours/24)
+	case hours == 1:
+		return "1 hour"
+	default:
+		return fmt.Sprintf("%d hours", hours)
+	}
+}
+
+// issuerShortName pulls the CA's common name out of a full issuer DN, so an
+// alert reads "R11" rather than "C=US, O=Let's Encrypt, CN=R11".
+func issuerShortName(dn string) string {
+	for _, part := range strings.Split(dn, ",") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(strings.ToUpper(part), "CN=") {
+			return strings.TrimSpace(part[3:])
+		}
+	}
+	return dn
+}
+
+// momentText renders a date *and* time.
+//
+// dateText is right for an expiry, which is a day. It is wrong for a renewal a
+// CA has just brought forward: rendering "18 August 2026" for something
+// happening in fifty-five minutes makes an imminent action read like a
+// whole-day one, which during a revocation is the difference between acting now
+// and acting tomorrow.
+func momentText(value string) string {
+	if value == "" {
+		return "—"
+	}
+	ts, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return value
+	}
+	return ts.Local().Format("2 January 2006, 15:04 MST")
 }

@@ -28,8 +28,16 @@ const (
 	TopicCertIssued    = "cert.issued"
 	TopicCertRenewed   = "cert.renewed"
 	TopicCertRenewFail = "cert.renewal_failed"
-	TopicCertExpiring  = "cert.expiring"
-	TopicGatewayStatus = "gateway.status"
+	// TopicCertRenewalWindowMoved carries the CA changing its mind about when
+	// a certificate should be replaced.
+	//
+	// Routinely this is load spreading and not worth an alert. When a window is
+	// pulled materially forward it is something else: a CA facing mass
+	// revocation moves the affected windows into the past, and this is the only
+	// automated warning anybody gets.
+	TopicCertRenewalWindowMoved = "cert.renewal_window_moved"
+	TopicCertExpiring           = "cert.expiring"
+	TopicGatewayStatus          = "gateway.status"
 	// TopicDiscoveryUnmanaged carries the one finding a discovery scan exists
 	// to produce: an endpoint serving a certificate this system has never seen.
 	// Published so it reaches the channels a team already configured, rather
@@ -109,6 +117,7 @@ func AllTopics() []string {
 		TopicCertIssued,
 		TopicCertRenewed,
 		TopicCertRenewFail,
+		TopicCertRenewalWindowMoved,
 		TopicCertExpiring,
 		TopicGatewayStatus,
 		TopicDiscoveryUnmanaged,

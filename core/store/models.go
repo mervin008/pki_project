@@ -185,6 +185,30 @@ type Certificate struct {
 	CreatedBy           *string   `json:"created_by,omitempty"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+	// RenewalScheduledAt is when this certificate should next be renewed,
+	// whoever decided it. Nil means nobody has been told anything and the lead
+	// time applies.
+	//
+	// When ARI supplied it, this is a random instant inside the CA's suggested
+	// window rather than its start. The randomness is the point of the window:
+	// if every client renewed at the start, ARI would move the thundering herd
+	// rather than disperse it.
+	RenewalScheduledAt *time.Time `json:"renewal_scheduled_at,omitempty"`
+
+	// The CA's renewal advice, as last read. ARIWindowStart and ARIWindowEnd
+	// bound the window; ARIExplanationURL is the CA's link to a reason, set
+	// when a window has been brought forward — which is exactly when somebody
+	// wants to know why.
+	ARIWindowStart    *time.Time `json:"ari_window_start,omitempty"`
+	ARIWindowEnd      *time.Time `json:"ari_window_end,omitempty"`
+	ARIExplanationURL string     `json:"ari_explanation_url,omitempty"`
+	ARICheckedAt      *time.Time `json:"ari_checked_at,omitempty"`
+	ARINextCheckAt    *time.Time `json:"ari_next_check_at,omitempty"`
+	// ARISupported is three-valued on purpose. Nil means nobody has asked yet;
+	// false means the CA was asked and does not publish renewal information.
+	// Collapsing those would make a CA that has never been checked look
+	// identical to one that has nothing to say.
+	ARISupported *bool `json:"ari_supported,omitempty"`
 }
 
 // DeploymentTarget represents where certs are installed.

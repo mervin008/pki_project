@@ -86,7 +86,7 @@ explicitly.
 | Wildcard certificates | ✅ | Over `dns-01` |
 | External Account Binding | ✅ | Required by ZeroSSL, Google Trust Services, SSL.com |
 | ACME revocation | ✅ | Real revocation; already-revoked is treated as success |
-| Renewal information (RFC 9773) | ✅ | Reads the CA's suggested renewal window where published |
+| Renewal information (RFC 9773) | ✅ | Renews inside the CA's suggested window, at a random instant within it. A window pulled forward — what a CA does during a mass revocation — is a CRITICAL alert carrying the CA's own explanation |
 | Self-signed gateway | ✅ | Development and testing |
 | Secrets encrypted at rest | ✅ | AES-256-GCM envelope encryption, context-bound, rotatable |
 | Mutual TLS, core ↔ gateway | ✅ | Required by default; `make dev-certs` to get started |
@@ -500,6 +500,41 @@ into a budget of 24 more attempts:
 | a day | ~1 hour |
 | an hour | a few minutes |
 | already expired | the 60-second floor |
+
+#### Letting the CA decide, and letting it change its mind
+
+A CA publishes a window it would like each certificate replaced inside
+(RFC 9773). CertPilot picks a **random instant** within it rather than renewing
+at the start — renewing at the start would move the thundering herd instead of
+dispersing it — and honours the CA's `Retry-After` when polling.
+
+The advice beats the configured lead time in both directions, because the CA
+knows things about the certificate that the certificate does not say. But never
+off a cliff: inside a seven-day safety floor the advice stops being able to defer
+anything, so a bad window — or a stale one left by a poller that stopped
+running — cannot talk this system out of renewing something about to expire.
+
+The reason this matters is not load spreading. When a CA has to revoke in bulk,
+it pulls the affected windows into the past, and that is **the only automated
+warning you get**:
+
+```
+CRITICAL — ari-lab.example.com: the CA wants this replaced sooner
+
+ARI Lab Issuing CA has brought this certificate's renewal window forward by
+about 3 days. A CA does that when something is wrong with a certificate it
+issued — most often a bulk revocation. CertPilot has rescheduled the renewal;
+check the explanation before assuming it is routine.
+
+  Renewing at:        19 August 2026, 02:35 CEST
+  Brought forward by: 3 days
+  Explanation:        https://letsencrypt.status.io/incidents/…
+```
+
+Support is three-valued — never asked, asked and unsupported, asked with an
+answer — because a CA nobody has reached must not read as one with nothing to
+say. A CA that publishes no renewal information is told so plainly: *"it will
+not be able to warn you if it revokes this certificate in bulk."*
 
 #### A renewal held back is not a renewal that failed
 

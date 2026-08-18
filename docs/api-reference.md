@@ -931,6 +931,73 @@ The listing defaults to outstanding jobs only — the question is almost always
 "what is about to happen", not "what happened last month". `?outstanding=false`
 returns the history.
 
+### Renewal information (RFC 9773)
+
+```
+POST /api/v1/certificates/{id}/renewal-info      Ask the CA now      (operator)
+```
+
+A CA publishes a window it would like each certificate replaced inside.
+CertPilot polls it, picks a **random instant** within the window rather than
+renewing at its start — renewing at the start would move the thundering herd
+rather than disperse it — and honours the CA's `Retry-After` when polling again,
+floored at 15 minutes.
+
+```json
+{ "data": { "ari_supported": true,
+            "ari_window_start": "2026-08-19T21:16:26Z",
+            "ari_window_end":   "2026-08-20T09:16:26Z",
+            "renewal_scheduled_at": "2026-08-20T03:03:48Z",
+            "ari_next_check_at": "2026-08-19T03:16:26Z",
+            "ari_explanation_url": "" },
+  "summary": "The CA suggests renewing this certificate in 29 hours, and CertPilot picked a random moment inside its window rather than the start so that renewals do not cluster." }
+```
+
+`ari_supported` is **three-valued** and the summary says which state you are in:
+
+| Value | Meaning |
+|:---|:---|
+| `null` | nobody has asked this CA yet; the lead time applies |
+| `false` | asked, and this CA publishes nothing — *"it will not be able to warn you if it revokes this certificate in bulk"* |
+| `true` | asked, and `renewal_scheduled_at` came from the CA |
+
+Collapsing the first two would make a CA nobody has reached look identical to
+one with nothing to say. A gateway that is *down* is recorded as neither: the
+existing advice is left alone and retried, because a window does not stop being
+true because the next call failed.
+
+The advice overrides the configured lead time in both directions — it can bring
+a renewal forward and hold one back — but **never past a seven-day safety
+floor**. Inside that window a certificate renews regardless of what the CA
+suggested, so a bad window, or a stale one left by a poller that stopped
+running, cannot defer something about to expire.
+
+Only certificates that could act on the answer are polled: renewed
+automatically, issued by a CA account, and with a stored body to name to that
+CA. Asking about anything else spends somebody's rate limit to learn nothing.
+
+#### When the CA changes its mind
+
+This is what the feature is for. A CA facing mass revocation pulls the affected
+windows into the past, and for anyone not reading ARI that is an email to
+whatever address is on the account.
+
+A window brought **materially** forward — more than 12 hours, so an ordinary
+re-draw inside an unchanged window is not mistaken for one — publishes
+`cert.renewal_window_moved`, CRITICAL when the window has already opened:
+
+> **ari-lab.example.com: the CA wants this replaced sooner**
+>
+> ARI Lab Issuing CA has brought this certificate's renewal window forward by
+> about 3 days. A CA does that when something is wrong with a certificate it
+> issued — most often a bulk revocation. CertPilot has rescheduled the renewal;
+> check the explanation before assuming it is routine.
+
+The alert carries the CA's own `explanationURL` when it sends one, and the
+renewal moment with a **time** on it rather than only a date — during a
+revocation, "in 55 minutes" and "sometime on 18 August" are different
+instructions.
+
 ### Rate limits: deferred is not failed
 
 ```

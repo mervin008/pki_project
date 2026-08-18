@@ -413,7 +413,7 @@ phase widened what it has to renew.
 |:---|:---|:---|
 | 1 | Renewal as a durable job, not a function call | ✅ |
 | 2 | Backoff that tightens towards the deadline, and per-CA rate limiting | ✅ |
-| 3 | ARI: let the CA say when, and when it changes its mind | |
+| 3 | ARI: let the CA say when, and when it changes its mind | ✅ |
 | 4 | Post-renewal verification — confirm the new certificate is actually served | |
 
 One sentence governs the phase:
@@ -549,6 +549,67 @@ published correctly and never persisted its escalation mark, so a certificate
 deferred every hour would have sent the same CRITICAL message every hour until
 it expired — the precise noise failure the rest of the engine is built to avoid,
 reintroduced in the one path that had not been through it.
+
+**Step 3** let the CA decide, and — the part that matters — let it change its
+mind.
+
+The ACME gateway has read RFC 9773 renewal information since phase 2. Nothing in
+the core ever asked, so the advice was fetched during a status call, logged, and
+thrown away. That is a strange thing to find in a tool whose entire subject is
+knowing when certificates need replacing.
+
+Routinely, honouring the window lets the CA spread load in a way a lead time
+cannot: thirty days means every certificate issued in one week renews in one
+week, forever. The client is meant to pick a **random instant inside** the
+window rather than renewing at its start, and that randomness is the point of
+the window rather than an implementation detail — renewing at the start would
+move the thundering herd instead of dispersing it.
+
+In an incident it is something else entirely. A CA facing mass revocation — a
+CAA rechecking bug, a mis-issued intermediate, a broken validation path — pulls
+the affected windows into the past. Clients that read ARI replace their
+certificates within hours. Clients that do not find out by email, if the address
+on the account still belongs to somebody, and otherwise find out when the
+certificate stops working. **It is the only automated warning there is**, which
+is why a window brought materially forward is a CRITICAL alert carrying the CA's
+own explanation link, worded as what it means rather than what changed.
+
+Three decisions worth naming.
+
+**The CA's advice beats the lead time in both directions — but never off a
+cliff.** It can bring a renewal forward and it can hold one back, because the CA
+knows things about the certificate that the certificate does not say. Inside a
+seven-day safety floor it stops being able to defer anything at all: a CA
+publishing a bad window, or a poller that stopped running and left a stale one
+behind, must not be able to talk this system out of renewing something that is
+about to stop working.
+
+**Support is three-valued.** Never asked, asked and unsupported, and asked with
+an answer are three different states. Collapsing the first two would make a CA
+nobody has reached look identical to one that has nothing to say — the same
+mistake as a monitor with a single timestamp, in a new place. A gateway that is
+down is likewise not recorded as "this CA publishes nothing", and it never
+clears advice already given: a window does not stop being true because the next
+call failed.
+
+**The alert has a threshold.** The selected instant is a fresh random draw each
+check, so two consecutive polls of an unchanged window differ by hours for no
+reason at all. Alerting on that would mute the one message that matters during
+an incident before the incident.
+
+Verified live against the real database, driving the real gateway over the real
+proto with a stand-in ACME directory: the RFC 9773 certificate identifier was
+built correctly from the AKI and serial, the window was recorded with a random
+instant inside it, Retry-After was honoured, a window pulled forward produced one
+CRITICAL naming the CA and linking its explanation, moving it *further* into an
+already-open window produced no second alert, and a certificate with sixty days
+left — which the thirty-day lead time would never have queued — was renewed
+because the CA asked.
+
+One defect found by reading the delivered alert: it rendered the renewal moment
+as a date, so something happening in fifty-five minutes read as "18 August
+2026". During a revocation that is the difference between acting now and acting
+tomorrow.
 
 The 47-day horizon is what forces the rest. When the CA/Browser Forum's maximum
 lifetime lands, a certificate is renewed roughly every fortnight rather than

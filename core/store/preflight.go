@@ -217,6 +217,14 @@ func warnOnStaleSchema(ctx context.Context, pool *pgxpool.Pool) {
 			consequence: "there is no renewal_jobs table (migration 013); the renewal sweep will find certificates due and be unable to queue any of them",
 		},
 		{
+			// Migration 015.
+			query: `SELECT NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'certificates'
+				  AND column_name = 'renewal_scheduled_at')`,
+			consequence: "certificates has no renewal_scheduled_at column (migration 015); the CA's renewal advice will be fetched and discarded, including a window pulled forward for a revocation",
+		},
+		{
 			// Migration 005. This one is a hard failure at write time rather
 			// than a slow query, so it is worth naming precisely.
 			query: `SELECT EXISTS (

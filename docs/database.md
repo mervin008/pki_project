@@ -82,8 +82,9 @@ make migrate
   applied  012_cloud_provenance.sql
   applied  013_renewal_jobs.sql
   applied  014_renewal_pacing.sql
+  applied  015_renewal_information.sql
 
-Applied 14 migration(s).
+Applied 15 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so

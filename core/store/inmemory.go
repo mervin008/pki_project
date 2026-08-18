@@ -384,9 +384,29 @@ func (m *MemoryStore) DeleteCertificate(ctx context.Context, id string) error {
 func (m *MemoryStore) GetCertificatesDueForRenewal(ctx context.Context, leadDays int) ([]*Certificate, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	now := time.Now()
+	floor := now.Add(RenewalSafetyFloorDays * 24 * time.Hour)
+
 	due := make([]*Certificate, 0)
 	for _, c := range m.certificates {
-		if c.AutoRenew && (c.DaysRemaining <= leadDays || c.Status == "EXPIRING" || c.Status == "RENEWAL_FAILED") {
+		if !c.AutoRenew {
+			continue
+		}
+		// The CA's advice takes precedence over the lead time when there is
+		// any — it is better information, because the CA knows things about the
+		// certificate that the certificate does not say.
+		//
+		// But never off a cliff: however far out the advice points, a
+		// certificate inside the safety floor renews anyway. A bad window, or a
+		// stale one left behind by a poller that stopped running, must not talk
+		// this system out of renewing something about to stop working.
+		if c.RenewalScheduledAt != nil {
+			if !c.RenewalScheduledAt.After(now) || (c.NotAfter != nil && !c.NotAfter.After(floor)) {
+				due = append(due, clone(c))
+			}
+			continue
+		}
+		if c.DaysRemaining <= leadDays || c.Status == "EXPIRING" || c.Status == "RENEWAL_FAILED" {
 			due = append(due, clone(c))
 		}
 	}
@@ -2150,4 +2170,57 @@ func (m *MemoryStore) CountRecentRenewals(ctx context.Context, caAccountID strin
 		}
 	}
 	return count, oldest, nil
+}
+
+func (m *MemoryStore) GetCertificatesDueForARICheck(ctx context.Context, now time.Time, limit int) ([]*Certificate, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 100
+	}
+	out := make([]*Certificate, 0)
+	for _, c := range m.certificates {
+		// Only certificates that could act on the answer. Asking about
+		// anything else spends somebody's rate limit to learn nothing.
+		if !c.AutoRenew || c.CAAccountID == nil || c.CertificatePEM == nil {
+			continue
+		}
+		if c.ARINextCheckAt != nil && c.ARINextCheckAt.After(now) {
+			continue
+		}
+		out = append(out, clone(c))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		switch {
+		case out[i].NotAfter == nil:
+			return false
+		case out[j].NotAfter == nil:
+			return true
+		}
+		return out[i].NotAfter.Before(*out[j].NotAfter)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *MemoryStore) UpdateCertificateRenewalInfo(ctx context.Context, id string, info RenewalInfoUpdate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cert, ok := m.certificates[id]
+	if !ok {
+		return fmt.Errorf("certificate %s not found", id)
+	}
+	cert.RenewalScheduledAt = info.RenewalScheduledAt
+	cert.ARIWindowStart = info.WindowStart
+	cert.ARIWindowEnd = info.WindowEnd
+	cert.ARIExplanationURL = info.ExplanationURL
+	cert.ARICheckedAt = info.CheckedAt
+	cert.ARINextCheckAt = info.NextCheckAt
+	cert.ARISupported = info.Supported
+	cert.UpdatedAt = time.Now()
+	return nil
 }

@@ -257,6 +257,20 @@ type Store interface {
 	// CA means the whole organisation loses issuance for a week.
 	CountRecentRenewals(ctx context.Context, caAccountID string, since time.Time) (count int, oldest *time.Time, err error)
 
+	// ── Renewal information (RFC 9773) ──────────────────────
+
+	// GetCertificatesDueForARICheck returns certificates whose renewal advice
+	// should be refreshed — only ones that could act on the answer.
+	GetCertificatesDueForARICheck(ctx context.Context, now time.Time, limit int) ([]*Certificate, error)
+	// UpdateCertificateRenewalInfo records what the CA last said about when to
+	// renew one certificate.
+	//
+	// Narrow rather than a full UpdateCertificate: the poller runs continuously
+	// and concurrently with everything else, and a full-row write would let a
+	// stale copy in its hand overwrite a renewal that completed while it was
+	// asking.
+	UpdateCertificateRenewalInfo(ctx context.Context, id string, info RenewalInfoUpdate) error
+
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)
@@ -337,3 +351,27 @@ type AuditLogFilter struct {
 	// offset walked slowly will re-show rows; for a feed, filter by Since.
 	Offset int
 }
+
+// RenewalInfoUpdate is what one ARI check learned.
+type RenewalInfoUpdate struct {
+	// RenewalScheduledAt is the instant chosen inside the CA's window. Nil when
+	// the CA had no advice, which clears any stale schedule and returns the
+	// certificate to lead-time renewal.
+	RenewalScheduledAt *time.Time
+	WindowStart        *time.Time
+	WindowEnd          *time.Time
+	ExplanationURL     string
+	CheckedAt          *time.Time
+	NextCheckAt        *time.Time
+	// Supported is three-valued: nil unknown, false asked and unsupported.
+	Supported *bool
+}
+
+// RenewalSafetyFloorDays is the point past which the CA's advice stops being
+// able to defer a renewal.
+//
+// However far out a CA suggests renewing, a certificate this close to expiry
+// renews anyway. A CA that publishes a bad window — or a poller that stopped
+// running and left a stale one behind — must not be able to talk this system
+// out of renewing something that is about to stop working.
+const RenewalSafetyFloorDays = 7
