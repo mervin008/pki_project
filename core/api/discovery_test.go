@@ -448,3 +448,147 @@ func TestScanRecordsWhatWasTypedNotWhatItExpandedTo(t *testing.T) {
 		t.Errorf("the audit entry does not say how far the range expanded: %s", logs[0].Details)
 	}
 }
+
+// A schedule is validated where it is entered, not on the night it matters.
+// One that looks configured on screen and silently never scans is worse than
+// no schedule at all.
+func TestScheduleIsValidatedAtCreation(t *testing.T) {
+	r, st := realRouter(t)
+
+	cases := map[string]struct {
+		body gin.H
+		want string
+	}{
+		"targets that do not parse": {
+			gin.H{"name": "typo", "targets": []string{"https://example.com"}, "interval_minutes": 1440},
+			"looks like a URL",
+		},
+		"a range past the expansion limit": {
+			gin.H{"name": "huge", "targets": []string{"10.0.0.0/8"}, "interval_minutes": 1440},
+			"past the",
+		},
+		"an interval short enough to be a denial of service": {
+			gin.H{"name": "hammer", "targets": []string{"example.com"}, "interval_minutes": 1},
+			"shortest interval",
+		},
+		"a run that cannot finish before the next starts": {
+			gin.H{"name": "overlap", "targets": []string{"10.0.0.0/20"}, "interval_minutes": 15},
+			"overlap",
+		},
+	}
+	for name, tc := range cases {
+		w := do(r, http.MethodPost, "/api/v1/discovery/schedules", tc.body, nil)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400 (%s)", name, w.Code, w.Body.String())
+			continue
+		}
+		if !strings.Contains(w.Body.String(), tc.want) {
+			t.Errorf("%s: response does not mention %q: %s", name, tc.want, w.Body.String())
+		}
+	}
+
+	schedules, err := st.ListDiscoverySchedules(context.Background())
+	if err != nil {
+		t.Fatalf("ListDiscoverySchedules: %v", err)
+	}
+	if len(schedules) != 0 {
+		t.Errorf("%d rejected schedules were stored anyway", len(schedules))
+	}
+}
+
+func TestScheduleLifecycle(t *testing.T) {
+	r, st := realRouter(t)
+	target := startScanTarget(t)
+
+	w := do(r, http.MethodPost, "/api/v1/discovery/schedules",
+		gin.H{"name": "nightly perimeter", "targets": []string{target}, "interval_minutes": 1440}, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d (%s)", w.Code, w.Body.String())
+	}
+	var created struct {
+		Data *store.DiscoverySchedule `json:"data"`
+		Next string                   `json:"next"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if !created.Data.IsEnabled {
+		t.Error("a newly written schedule should be enabled")
+	}
+	if !strings.Contains(created.Next, "1 day(s)") {
+		t.Errorf("the response does not say how often it will run: %q", created.Next)
+	}
+
+	// Running it now must not move its real schedule: someone testing what they
+	// just wrote should not silently push tonight's run to tomorrow.
+	run := do(r, http.MethodPost, "/api/v1/discovery/schedules/"+created.Data.ID+"/run", nil, nil)
+	if run.Code != http.StatusAccepted {
+		t.Fatalf("run status = %d (%s)", run.Code, run.Body.String())
+	}
+	after, err := st.GetDiscoverySchedule(context.Background(), created.Data.ID)
+	if err != nil {
+		t.Fatalf("GetDiscoverySchedule: %v", err)
+	}
+	if after.LastRunAt != nil || after.NextRunAt != nil {
+		t.Error("running a schedule on demand moved its schedule")
+	}
+
+	upd := do(r, http.MethodPut, "/api/v1/discovery/schedules/"+created.Data.ID,
+		gin.H{"name": "nightly perimeter", "targets": []string{target}, "interval_minutes": 720,
+			"is_enabled": false}, nil)
+	if upd.Code != http.StatusOK {
+		t.Fatalf("update status = %d (%s)", upd.Code, upd.Body.String())
+	}
+
+	del := do(r, http.MethodDelete, "/api/v1/discovery/schedules/"+created.Data.ID, nil, nil)
+	if del.Code != http.StatusOK {
+		t.Fatalf("delete status = %d (%s)", del.Code, del.Body.String())
+	}
+	// Deleting is not neutral: those targets stop being watched by anything.
+	if !strings.Contains(del.Body.String(), "no longer being watched") {
+		t.Errorf("the delete response does not say what stops happening: %s", del.Body.String())
+	}
+
+	logs, _, err := st.ListAuditLogs(context.Background(), store.AuditLogFilter{
+		Actions: []string{"discovery.schedule_created", "discovery.schedule_updated", "discovery.schedule_deleted"},
+	})
+	if err != nil {
+		t.Fatalf("ListAuditLogs: %v", err)
+	}
+	if len(logs) != 3 {
+		t.Errorf("got %d schedule audit entries, want 3", len(logs))
+	}
+}
+
+// The outstanding-work list defaults to the latest observation per endpoint.
+// A nightly schedule records the same unmanaged certificate every night, and
+// counting each as a separate finding turns one problem into thirty.
+func TestResultsDefaultToTheLatestObservation(t *testing.T) {
+	r, _ := realRouter(t)
+	target := startScanTarget(t)
+
+	for i := 0; i < 3; i++ {
+		if w := do(r, http.MethodPost, "/api/v1/discovery/scan", gin.H{"targets": []string{target}}, nil); w.Code != http.StatusOK {
+			t.Fatalf("scan %d: %d (%s)", i, w.Code, w.Body.String())
+		}
+	}
+
+	latest := do(r, http.MethodGet, "/api/v1/discovery/results", nil, nil)
+	var latestBody struct {
+		Total int64 `json:"total"`
+	}
+	_ = json.Unmarshal(latest.Body.Bytes(), &latestBody)
+	if latestBody.Total != 1 {
+		t.Errorf("default results total = %d, want 1 — three scans of one endpoint is one finding", latestBody.Total)
+	}
+
+	// The history is still reachable, which is what an investigation wants.
+	all := do(r, http.MethodGet, "/api/v1/discovery/results?latest=false", nil, nil)
+	var allBody struct {
+		Total int64 `json:"total"`
+	}
+	_ = json.Unmarshal(all.Body.Bytes(), &allBody)
+	if allBody.Total != 3 {
+		t.Errorf("history total = %d, want 3", allBody.Total)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -1462,9 +1463,23 @@ func (s *PostgresStore) ListDiscoveryResults(ctx context.Context, filter Discove
 	}
 	clause := strings.Join(where, " AND ")
 
+	// LatestPerEndpoint collapses an endpoint's history to its newest
+	// observation *before* the filters apply, not after.
+	//
+	// The order matters and is easy to get backwards. Filtering first would
+	// answer "the most recent time this endpoint was unmanaged", which keeps
+	// reporting an endpoint that has since been adopted. Collapsing first
+	// answers "endpoints that are unmanaged now", which is the question the
+	// outstanding-work list is actually asking.
+	source := "public.discovery_results"
+	if filter.LatestPerEndpoint {
+		source = `(SELECT DISTINCT ON (host, port) * FROM public.discovery_results
+			   ORDER BY host, port, scanned_at DESC) latest`
+	}
+
 	var total int64
 	if err := s.pool.QueryRow(ctx,
-		"SELECT count(*) FROM public.discovery_results WHERE "+clause, args...).Scan(&total); err != nil {
+		"SELECT count(*) FROM "+source+" WHERE "+clause, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
@@ -1473,7 +1488,7 @@ func (s *PostgresStore) ListDiscoveryResults(ctx context.Context, filter Discove
 		limit = 200
 	}
 	args = append(args, limit, filter.Offset)
-	query := "SELECT " + discoveryResultColumns + " FROM public.discovery_results WHERE " + clause +
+	query := "SELECT " + discoveryResultColumns + " FROM " + source + " WHERE " + clause +
 		fmt.Sprintf(" ORDER BY created_at DESC, host ASC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
 
 	rows, err := s.pool.Query(ctx, query, args...)
@@ -1516,6 +1531,209 @@ func (s *PostgresStore) MarkDiscoveryResultImported(ctx context.Context, id, cer
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("discovery result %s not found", id)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetLatestDiscoveryResults(ctx context.Context, endpoints []string) (map[string]*DiscoveryResult, error) {
+	out := map[string]*DiscoveryResult{}
+
+	hosts := make([]string, 0, len(endpoints))
+	seen := map[string]bool{}
+	for _, e := range endpoints {
+		host, _, err := net.SplitHostPort(e)
+		if err != nil {
+			continue
+		}
+		if !seen[host] {
+			seen[host] = true
+			hosts = append(hosts, host)
+		}
+	}
+
+	// DISTINCT ON gives the newest row per endpoint in one pass, on the
+	// (host, port, scanned_at desc) index from migration 009. The alternative —
+	// one query per endpoint — is 254 round trips for a /24.
+	query := "SELECT DISTINCT ON (host, port) " + discoveryResultColumns +
+		` FROM public.discovery_results`
+	args := []any{}
+	if len(hosts) > 0 {
+		query += " WHERE host = ANY($1)"
+		args = append(args, hosts)
+	}
+	query += " ORDER BY host, port, scanned_at DESC"
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		r, err := scanDiscoveryResult(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[fmt.Sprintf("%s:%d", r.Host, r.Port)] = r
+	}
+	return out, rows.Err()
+}
+
+// ── Discovery schedules ─────────────────────────────────
+
+const discoveryScheduleColumns = `id, name, coalesce(targets, '[]'::jsonb), coalesce(ports, '[443]'::jsonb),
+		interval_minutes, coalesce(is_enabled, true), last_run_at, next_run_at, last_scan_id,
+		coalesce(last_error, ''), created_by, created_at, updated_at`
+
+func scanDiscoverySchedule(row pgx.Row) (*DiscoverySchedule, error) {
+	sched := &DiscoverySchedule{}
+	var targetsJSON, portsJSON []byte
+	err := row.Scan(
+		&sched.ID, &sched.Name, &targetsJSON, &portsJSON,
+		&sched.IntervalMinutes, &sched.IsEnabled, &sched.LastRunAt, &sched.NextRunAt, &sched.LastScanID,
+		&sched.LastError, &sched.CreatedBy, &sched.CreatedAt, &sched.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(targetsJSON) > 0 {
+		_ = json.Unmarshal(targetsJSON, &sched.Targets)
+	}
+	if len(portsJSON) > 0 {
+		_ = json.Unmarshal(portsJSON, &sched.Ports)
+	}
+	if sched.Targets == nil {
+		sched.Targets = []string{}
+	}
+	if sched.Ports == nil {
+		sched.Ports = []int{}
+	}
+	return sched, nil
+}
+
+func (s *PostgresStore) ListDiscoverySchedules(ctx context.Context) ([]*DiscoverySchedule, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+discoveryScheduleColumns+" FROM public.discovery_schedules ORDER BY name ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*DiscoverySchedule, 0)
+	for rows.Next() {
+		sched, err := scanDiscoverySchedule(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sched)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) GetDiscoverySchedule(ctx context.Context, id string) (*DiscoverySchedule, error) {
+	sched, err := scanDiscoverySchedule(s.pool.QueryRow(ctx,
+		"SELECT "+discoveryScheduleColumns+" FROM public.discovery_schedules WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("discovery schedule %s not found", id)
+	}
+	return sched, err
+}
+
+func (s *PostgresStore) CreateDiscoverySchedule(ctx context.Context, sched *DiscoverySchedule) error {
+	targetsJSON, err := json.Marshal(sched.Targets)
+	if err != nil {
+		return err
+	}
+	portsJSON, err := json.Marshal(sched.Ports)
+	if err != nil {
+		return err
+	}
+	return s.pool.QueryRow(ctx, `
+		INSERT INTO public.discovery_schedules
+			(name, targets, ports, interval_minutes, is_enabled, next_run_at, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, created_at, updated_at`,
+		sched.Name, targetsJSON, portsJSON, sched.IntervalMinutes, sched.IsEnabled,
+		sched.NextRunAt, sched.CreatedBy).
+		Scan(&sched.ID, &sched.CreatedAt, &sched.UpdatedAt)
+}
+
+func (s *PostgresStore) UpdateDiscoverySchedule(ctx context.Context, sched *DiscoverySchedule) error {
+	targetsJSON, err := json.Marshal(sched.Targets)
+	if err != nil {
+		return err
+	}
+	portsJSON, err := json.Marshal(sched.Ports)
+	if err != nil {
+		return err
+	}
+	// Deliberately does not write last_run_at, next_run_at, or last_scan_id.
+	// Editing a schedule and recording that it ran are different acts by
+	// different actors, and letting an edit carry stale scheduling state would
+	// let saving a name change quietly reschedule or re-run the scan.
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.discovery_schedules
+		SET name = $2, targets = $3, ports = $4, interval_minutes = $5,
+		    is_enabled = $6, updated_at = now()
+		WHERE id = $1`,
+		sched.ID, sched.Name, targetsJSON, portsJSON, sched.IntervalMinutes, sched.IsEnabled)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("discovery schedule %s not found", sched.ID)
+	}
+	return nil
+}
+
+func (s *PostgresStore) DeleteDiscoverySchedule(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, "DELETE FROM public.discovery_schedules WHERE id = $1", id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("discovery schedule %s not found", id)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetDueDiscoverySchedules(ctx context.Context, now time.Time) ([]*DiscoverySchedule, error) {
+	// A schedule that has never run is due immediately: someone who has just
+	// created one wants to know it works, not to find out tomorrow.
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+discoveryScheduleColumns+` FROM public.discovery_schedules
+		 WHERE is_enabled AND (next_run_at IS NULL OR next_run_at <= $1)
+		 ORDER BY name ASC`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*DiscoverySchedule, 0)
+	for rows.Next() {
+		sched, err := scanDiscoverySchedule(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sched)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) MarkDiscoveryScheduleRun(ctx context.Context, id string, ranAt, nextRunAt time.Time, scanID *string, runErr string) error {
+	// coalesce keeps the previous scan id when a run failed before producing
+	// one: "the last time this worked" is the more useful of the two facts.
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.discovery_schedules
+		SET last_run_at = $2, next_run_at = $3,
+		    last_scan_id = coalesce($4, last_scan_id),
+		    last_error = $5, updated_at = now()
+		WHERE id = $1`, id, ranAt, nextRunAt, scanID, nullIfEmpty(runErr))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("discovery schedule %s not found", id)
 	}
 	return nil
 }

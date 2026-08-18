@@ -93,6 +93,12 @@ func ExpandTargets(specs []string, ports []int, limit int) ([]Target, error) {
 // expandOne returns the hosts an entry names, and the ports it named itself.
 func expandOne(spec string, limit int) ([]string, []int, error) {
 	switch {
+	// Checked before the CIDR branch: a URL contains a slash too, and routing
+	// `https://example.com` to the network parser answers with a complaint
+	// about colon-separated fields instead of the one thing the reader needs
+	// to know, which is that they pasted a URL.
+	case strings.Contains(spec, "://"):
+		return nil, nil, fmt.Errorf("target %q looks like a URL; give a host, host:port, CIDR, or range", spec)
 	case strings.Contains(spec, "/"):
 		return expandCIDR(spec, limit)
 	case isRange(spec):

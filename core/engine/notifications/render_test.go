@@ -232,3 +232,52 @@ func TestDiscoveryAlertNamesTheConsequence(t *testing.T) {
 		t.Errorf("the alert does not name the hosts found: %+v", alert.Fields)
 	}
 }
+
+// An alert must only say the things that happened.
+//
+// A fixed sentence covering both halves opens with "0 endpoints are serving a
+// different certificate … so something is renewing certificates outside this
+// system" — a claim about zero things, with a conclusion drawn from it.
+// Reading one of those teaches people that this alert's words mean nothing.
+func TestDiscoveryChangeAlertOnlySaysWhatHappened(t *testing.T) {
+	onlyGone := AlertFromEvent(events.Event{
+		Topic:    events.TopicDiscoveryChanged,
+		Severity: events.SeverityWarning,
+		Payload: map[string]any{
+			"changed_count": 0, "disappeared_count": 1, "scanned_count": 2,
+			"disappeared_hosts": []any{"10.0.0.4:443"},
+		},
+	})
+	if strings.Contains(onlyGone.Summary, "0 endpoint(s) are serving") {
+		t.Errorf("the summary asserts something about zero endpoints:\n%s", onlyGone.Summary)
+	}
+	if strings.Contains(onlyGone.Title, "0 certificate") {
+		t.Errorf("the title counts something that did not happen: %q", onlyGone.Title)
+	}
+	if !strings.Contains(onlyGone.Summary, "no longer do") {
+		t.Errorf("the summary does not say what did happen:\n%s", onlyGone.Summary)
+	}
+	if _, ok := fieldValue(onlyGone, "Changed"); ok {
+		t.Error("an empty Changed field was included")
+	}
+
+	onlyChanged := AlertFromEvent(events.Event{
+		Topic:    events.TopicDiscoveryChanged,
+		Severity: events.SeverityWarning,
+		Payload: map[string]any{
+			"changed_count": 2, "disappeared_count": 0, "scanned_count": 9,
+			"changed_hosts": []any{"10.0.0.4:443", "10.0.0.9:8443"},
+		},
+	})
+	if strings.Contains(onlyChanged.Summary, "no longer do") {
+		t.Errorf("the summary reports endpoints disappearing when none did:\n%s", onlyChanged.Summary)
+	}
+	// The consequence, which is the part that makes it worth reading.
+	if !strings.Contains(onlyChanged.Summary, "outside this system") {
+		t.Errorf("the summary does not say what a rotation means:\n%s", onlyChanged.Summary)
+	}
+	hosts, ok := fieldValue(onlyChanged, "Changed")
+	if !ok || !strings.Contains(hosts, "10.0.0.9:8443") {
+		t.Errorf("the alert does not name the endpoints that changed: %+v", onlyChanged.Fields)
+	}
+}

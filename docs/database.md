@@ -76,8 +76,9 @@ make migrate
   applied  006_ownership_and_acknowledgement.sql
   applied  007_discovery.sql
   applied  008_scan_cancellation.sql
+  applied  009_discovery_schedules.sql
 
-Applied 8 migration(s).
+Applied 9 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so
@@ -173,7 +174,7 @@ path with a different threat model.
 
 ## Plain PostgreSQL
 
-Migrations `002` through `008` apply anywhere. **`001` does not**: it defines
+Migrations `002` through `009` apply anywhere. **`001` does not**: it defines
 `get_user_role()` in terms of `auth.jwt()` and its RLS policies grant to the
 `authenticated` role, neither of which exists outside Supabase. A portable `001`
 is a known gap, tracked in the README.

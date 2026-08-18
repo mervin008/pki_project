@@ -280,8 +280,14 @@ func (h *DiscoveryHandler) ListResults(c *gin.Context) {
 		TrustState:      strings.ToUpper(c.Query("trust_state")),
 		Host:            c.Query("host"),
 		UnimportedOnly:  c.Query("unimported") == "true",
-		Limit:           limit,
-		Offset:          offset,
+		// Defaults to the latest observation per endpoint. A nightly schedule
+		// records the same unmanaged certificate every night, and a list that
+		// counted each of those as a separate finding would turn one problem
+		// into thirty and stop meaning anything. `latest=false` asks for the
+		// full history, which is what an investigation wants.
+		LatestPerEndpoint: c.DefaultQuery("latest", "true") == "true",
+		Limit:             limit,
+		Offset:            offset,
 	}
 
 	results, total, err := h.store.ListDiscoveryResults(c.Request.Context(), filter)

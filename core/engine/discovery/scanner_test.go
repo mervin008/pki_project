@@ -12,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
@@ -809,4 +810,81 @@ func waitFor(t *testing.T, limit time.Duration, cond func() bool, what string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out after %s waiting for %s", limit, what)
+}
+
+// startSwappableTLSServer holds one port and can be made to serve a different
+// certificate on it, which is how a test reproduces the thing a repeated scan
+// exists to catch: the same endpoint, a new certificate.
+func startSwappableTLSServer(t *testing.T, leaf *testLeaf) (Target, func(*testLeaf)) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	var current *httptest.Server
+	serve := func(l *testLeaf, listener net.Listener) {
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		_ = srv.Listener.Close()
+		srv.Listener = listener
+		srv.TLS = &tls.Config{
+			Certificates: []tls.Certificate{l.tls},
+			MinVersion:   tls.VersionTLS12,
+		}
+		srv.StartTLS()
+		current = srv
+	}
+	serve(leaf, ln)
+	t.Cleanup(func() { current.Close() })
+
+	swap := func(l *testLeaf) {
+		current.Close()
+		// The port frees as soon as the listener closes, but a retry keeps this
+		// from being flaky on a loaded machine.
+		var next net.Listener
+		for attempt := 0; attempt < 20; attempt++ {
+			next, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+			if err == nil {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		if next == nil {
+			t.Fatalf("could not re-listen on %d: %v", port, err)
+		}
+		serve(l, next)
+	}
+
+	return Target{Host: "127.0.0.1", Port: port}, swap
+}
+
+// startClosableTLSServer returns the target and a function that takes the
+// server away, so a test can make an endpoint stop answering.
+func startClosableTLSServer(t *testing.T, leaf *testLeaf) (Target, func()) {
+	t.Helper()
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{
+		Certificates: []tls.Certificate{leaf.tls},
+		MinVersion:   tls.VersionTLS12,
+	}
+	srv.StartTLS()
+
+	addr := srv.Listener.Addr().(*net.TCPAddr)
+	closed := false
+	stop := func() {
+		if !closed {
+			closed = true
+			srv.Close()
+		}
+	}
+	t.Cleanup(stop)
+
+	return Target{Host: "127.0.0.1", Port: addr.Port}, stop
 }

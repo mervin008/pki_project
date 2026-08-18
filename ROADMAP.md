@@ -177,7 +177,7 @@ The rest:
 |:---|:---|:---|
 | 1 | Scans that persist, and the verdict that matters | ✅ |
 | 2 | CIDR expansion, worker pool, cancellation, progress on the stream | ✅ |
-| 3 | Scheduled scans and re-scan reconciliation | |
+| 3 | Scheduled scans and re-scan reconciliation | ✅ |
 | 4 | CT log monitoring | |
 | 5 | Cloud inventory: ACM, Azure Key Vault, GCP, Kubernetes secrets | |
 
@@ -264,10 +264,51 @@ of what they expanded to. A scan is repeated by re-running what was asked for
 and found again by the range someone remembers typing; 254 addresses in an audit
 entry answer neither question.
 
-**Still open in this phase:** the same endpoint appears once per scan in the
-cross-scan results list, so "everything we have found and not adopted" over-counts.
-Deduplicating to the latest observation per endpoint belongs with step 3, which
-is where re-scan reconciliation lives.
+**Step 3** made it monitoring rather than a snapshot, which is the difference
+between finding what was there the morning somebody ran a scan and finding what
+is there now. Schedules run scans on an interval — not a cron expression, since
+a cron field is a small language whose mistakes are silent and a schedule meant
+to run nightly that instead runs yearly looks identical on screen to one that
+works.
+
+The important half is not the timer, it is what a *second* run is for. The
+second scan of a range is not worth much as a list; it is worth what it says has
+changed. Three findings exist only on a re-scan, and one of them is the reason
+to bother:
+
+> A certificate that changed on an endpoint CertPilot does not manage means
+> something out there renewed it without going through any of this. **Somebody
+> knows how to replace that certificate** — find out who.
+
+The same rotation on a managed endpoint is a renewal CertPilot performed, and is
+reported at INFO. Alerting on its own renewals is how a system teaches people to
+ignore the alert that matters. An endpoint that used to answer and no longer
+does is the third: either it moved and the scan no longer covers it, or it is
+down, and both are invisible to a first scan. A first scan reports none of them,
+because every endpoint is new the first time and a run whose findings are all
+"this is new" is one nobody reads twice.
+
+This also closed the gap step 1 left open. The results list now returns the
+latest observation per endpoint, so a nightly schedule stops turning one
+unmanaged certificate into thirty findings. The collapse happens *before* the
+filters — the other order answers "the most recent time this endpoint was
+unmanaged" and keeps asking for work already done — and the full history is
+still one query parameter away.
+
+Two smaller rules, both learned by reading what the system actually said. A
+schedule advances even when its run fails, because one that only advanced on
+success would retry a permanently broken target every tick, turning a single bad
+entry into a scan running continuously against somebody else's network; the
+error is recorded on the schedule rather than only logged, since a schedule that
+fails every night and is never read is the appearance of coverage. And the
+change alert is composed from the parts that happened: the first version said
+"0 endpoints are serving a different certificate … so something is renewing
+certificates outside this system", which asserts a claim about zero things and
+then draws a conclusion from it.
+
+**Still open in this phase:** two replicas both run every schedule. Leader
+election over Postgres advisory locks arrives with the renewal engine in phase
+4, which has the same gap.
 
 ### Phase 4 — A renewal engine that survives 47-day certificates
 

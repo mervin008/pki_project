@@ -387,12 +387,17 @@ omit it to derive from the host part of `gateway_addr`.
 ## Discovery
 
 ```
-POST /api/v1/discovery/scan              Scan endpoints and judge what they serve  (operator)
-POST /api/v1/discovery/import            Adopt a finding into inventory            (operator)
-POST /api/v1/discovery/scans/:id/cancel  Stop a running scan                       (operator)
-GET  /api/v1/discovery/scans             Scan history
-GET  /api/v1/discovery/scans/:id         One run and its results
-GET  /api/v1/discovery/results           Findings across every scan
+POST   /api/v1/discovery/scan                Scan endpoints and judge what they serve  (operator)
+POST   /api/v1/discovery/import              Adopt a finding into inventory            (operator)
+POST   /api/v1/discovery/scans/:id/cancel    Stop a running scan                       (operator)
+GET    /api/v1/discovery/scans               Scan history
+GET    /api/v1/discovery/scans/:id           One run and its results
+GET    /api/v1/discovery/results             Current findings, one row per endpoint
+GET    /api/v1/discovery/schedules           Scheduled scans
+POST   /api/v1/discovery/schedules           Create one                                (operator)
+PUT    /api/v1/discovery/schedules/:id       Edit one                                  (operator)
+DELETE /api/v1/discovery/schedules/:id       Remove one                                (admin)
+POST   /api/v1/discovery/schedules/:id/run   Run it now, without moving its schedule   (operator)
 ```
 
 Scanning is operator-gated because it opens connections to third-party
@@ -532,8 +537,67 @@ Publishes `discovery.unmanaged` (WARNING) when a run finds anything unmanaged,
 so the finding reaches the channels a team already configured instead of waiting
 to be noticed on a page nobody has open.
 
-> CIDR ranges, scheduled scans, CT log monitoring, and cloud inventory are not
-> implemented yet.
+### Scheduled scans
+
+```json
+POST /api/v1/discovery/schedules
+{ "name": "nightly perimeter", "targets": ["10.0.0.0/24"], "interval_minutes": 1440 }
+```
+
+An interval, not a cron expression. A cron field is a small language whose
+mistakes are silent, and a schedule meant to run nightly that instead runs
+yearly looks identical on screen to one that works. The floor is 15 minutes;
+below that a scan of the same range is indistinguishable from a denial of
+service aimed at your own estate.
+
+Targets are expanded and validated **when the schedule is saved**, not when it
+first fires — including a check that the run can finish before the next one
+starts. A schedule that looks configured and silently never scans is worse than
+no schedule, and 3am on the night it mattered is the wrong time to find out its
+targets do not parse.
+
+A new schedule runs within the minute, so you can see it work rather than find
+out tomorrow. `last_run_at`, `next_run_at`, `last_scan_id`, and `last_error` are
+on every schedule: one that fails every night and is never read is the
+appearance of coverage. `POST …/run` starts it immediately **without** moving
+its schedule — testing what you just wrote should not silently push tonight's
+run to tomorrow.
+
+> Two replicas both run every schedule. Leader election over Postgres advisory
+> locks arrives with the renewal engine in phase 4, which has the same gap.
+
+### What a repeated scan adds
+
+The second run of a scan is not worth much as a list. It is worth what it says
+has **changed**, and three findings exist only on a re-scan:
+
+| Code | |
+|:---|:---|
+| `certificate_changed` | The endpoint is serving a different certificate. **WARNING** when CertPilot manages neither the old nor the new one — something out there is renewing certificates without going through this system, so somebody knows how to replace it. **INFO** when the new one is managed, because that is a renewal it performed |
+| `endpoint_disappeared` | It answered last time and does not now: either it moved and the scan no longer covers it, or it is down |
+| `endpoint_appeared` | It did not answer last time and does now |
+
+A first scan reports none of these. Every endpoint is new the first time, and a
+run whose findings are all "this is new" is one nobody reads twice.
+
+Changes publish `discovery.changed` (WARNING), separate from
+`discovery.unmanaged`: "there is an endpoint you do not manage" may have been
+true for years, while "the certificate on it changed last night" is a fact about
+somebody actively operating it.
+
+### One row per endpoint
+
+`GET /discovery/results` returns the **latest observation of each endpoint** by
+default. A nightly schedule records the same unmanaged certificate every night,
+and counting each of those as a separate finding turns one problem into thirty
+until the number stops meaning anything.
+
+The collapse happens *before* the filters, which is the part that is easy to get
+backwards: filtering first would answer "the most recent time this endpoint was
+unmanaged" and keep asking for work that has already been done. Pass
+`latest=false` for the full history, which is what an investigation wants.
+
+> CT log monitoring and cloud inventory are not implemented yet.
 
 ## Ownership and acknowledgement
 

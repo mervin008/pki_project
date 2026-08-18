@@ -123,6 +123,14 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// is: it changes what CertPilot is doing to somebody else's network.
 		v1.POST("/discovery/scans/:id/cancel", middleware.RequireRole(middleware.RoleOperator), discHandler.CancelScan)
 		v1.GET("/discovery/results", discHandler.ListResults)
+		// Schedules. Reading is open to any authenticated user; writing is
+		// operator, because a schedule is a standing instruction to connect to
+		// somebody else's network on a timer.
+		v1.GET("/discovery/schedules", discHandler.ListSchedules)
+		v1.POST("/discovery/schedules", middleware.RequireRole(middleware.RoleOperator), discHandler.CreateSchedule)
+		v1.PUT("/discovery/schedules/:id", middleware.RequireRole(middleware.RoleOperator), discHandler.UpdateSchedule)
+		v1.DELETE("/discovery/schedules/:id", middleware.RequireRole(middleware.RoleAdmin), discHandler.DeleteSchedule)
+		v1.POST("/discovery/schedules/:id/run", middleware.RequireRole(middleware.RoleOperator), discHandler.RunSchedule)
 
 		// ── Display Tokens ──
 		// Admin-only throughout: minting a credential that authenticates to

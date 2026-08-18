@@ -115,6 +115,46 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "Hosts", Value: fallback(listText(payload, "hosts"), "—")},
 		}
 
+	case events.TopicDiscoveryChanged:
+		changed := int(num(payload, "changed_count"))
+		gone := int(num(payload, "disappeared_count"))
+
+		// Composed from the parts that actually happened.
+		//
+		// A fixed sentence covering both would open "0 endpoints are serving a
+		// different certificate … so something is renewing certificates outside
+		// this system", which asserts a claim about zero things and then draws
+		// a conclusion from it. Reading one of those teaches people that this
+		// alert's words do not mean anything.
+		var titleParts, summaryParts []string
+		if changed > 0 {
+			titleParts = append(titleParts, fmt.Sprintf("%d certificate(s) changed", changed))
+			// Says who, not what: a certificate rotating on an endpoint nobody
+			// manages means somebody out there knows how to replace it, and
+			// that person is the point of the alert.
+			summaryParts = append(summaryParts, fmt.Sprintf(
+				"%d endpoint(s) are serving a different certificate than last time and CertPilot manages none of them, so something is renewing certificates outside this system.",
+				changed))
+		}
+		if gone > 0 {
+			titleParts = append(titleParts, fmt.Sprintf("%d endpoint(s) gone", gone))
+			summaryParts = append(summaryParts, fmt.Sprintf(
+				"%d endpoint(s) that used to answer no longer do — either they moved and the scan no longer covers them, or they are down.",
+				gone))
+		}
+		alert.Title = "Discovery: " + strings.Join(titleParts, ", ")
+		alert.Summary = strings.Join(summaryParts, " ")
+
+		alert.Fields = []Field{{Label: "Endpoints scanned", Value: countText(num(payload, "scanned_count"))}}
+		if changed > 0 {
+			alert.Fields = append(alert.Fields,
+				Field{Label: "Changed", Value: fallback(listText(payload, "changed_hosts"), "—")})
+		}
+		if gone > 0 {
+			alert.Fields = append(alert.Fields,
+				Field{Label: "No longer answering", Value: fallback(listText(payload, "disappeared_hosts"), "—")})
+		}
+
 	case events.TopicGatewayStatus:
 		name := str(payload, "name")
 		alert.Title = fmt.Sprintf("Gateway %s", fallback(str(payload, "status"), "status changed"))

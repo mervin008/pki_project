@@ -13,10 +13,15 @@
  * backend has ever returned — so every field rendered as an em dash and the
  * scan itself 400'd.
  */
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useApi } from '@/composables/useApi'
-import type { DiscoveryResult, DiscoveryScanResponse } from '@/lib/types'
-import { AlertTriangle, CheckCircle, Radar, Search } from 'lucide-vue-next'
+import type {
+  DiscoveryResult,
+  DiscoveryScanResponse,
+  DiscoverySchedule,
+  DiscoveryScheduleList,
+} from '@/lib/types'
+import { AlertTriangle, CalendarClock, CheckCircle, Radar, Search, Trash2 } from 'lucide-vue-next'
 
 const api = useApi()
 const targetInput = ref('')
@@ -162,6 +167,77 @@ function formatDate(d?: string) {
   if (!d) return '—'
   return new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
 }
+
+function formatWhen(d?: string | null) {
+  if (!d) return 'never'
+  return new Date(d).toLocaleString('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+// ── Schedules ─────────────────────────────────────────────
+//
+// Discovery run once is a snapshot. Run on a schedule it is monitoring, which
+// is the only version that catches an endpoint someone stood up last Tuesday.
+
+const schedules = ref<DiscoverySchedule[]>([])
+const scheduleError = ref('')
+const newSchedule = ref({ name: '', targets: '', interval_minutes: 1440 })
+const savingSchedule = ref(false)
+
+onMounted(loadSchedules)
+
+async function loadSchedules() {
+  try {
+    const res = await api.get<DiscoveryScheduleList>('/api/v1/discovery/schedules')
+    schedules.value = res.data
+  } catch (err: any) {
+    scheduleError.value = err.message || 'Could not load schedules'
+  }
+}
+
+async function createSchedule() {
+  savingSchedule.value = true
+  scheduleError.value = ''
+  try {
+    await api.post('/api/v1/discovery/schedules', {
+      name: newSchedule.value.name,
+      targets: newSchedule.value.targets.split(/[\s,]+/).filter(Boolean),
+      interval_minutes: Number(newSchedule.value.interval_minutes),
+    })
+    newSchedule.value = { name: '', targets: '', interval_minutes: 1440 }
+    await loadSchedules()
+  } catch (err: any) {
+    scheduleError.value = err.message || 'Could not save the schedule'
+  } finally {
+    savingSchedule.value = false
+  }
+}
+
+async function runSchedule(schedule: DiscoverySchedule) {
+  try {
+    const res = await api.post<DiscoveryScanResponse>(
+      `/api/v1/discovery/schedules/${schedule.id}/run`,
+    )
+    response.value = res
+    scanning.value = true
+    pollScan(res.scan.id)
+  } catch (err: any) {
+    scheduleError.value = err.message || 'Could not run the schedule'
+  }
+}
+
+async function deleteSchedule(schedule: DiscoverySchedule) {
+  try {
+    await api.delete(`/api/v1/discovery/schedules/${schedule.id}`)
+    await loadSchedules()
+  } catch (err: any) {
+    scheduleError.value = err.message || 'Could not delete the schedule'
+  }
+}
 </script>
 
 <template>
@@ -198,6 +274,84 @@ function formatDate(d?: string) {
             Scan {{ targets.length || '' }}
           </button>
         </form>
+      </div>
+    </div>
+
+    <!-- Schedules. A scan run once is a snapshot; this is the version that
+         catches an endpoint somebody stood up last Tuesday. -->
+    <div class="card bg-base-100 border border-base-300">
+      <div class="card-body p-5">
+        <h2 class="card-title text-sm font-bold mb-3">
+          <CalendarClock class="w-4 h-4 text-primary" /> Scheduled scans
+        </h2>
+
+        <div v-if="schedules.length" class="space-y-2 mb-4">
+          <div
+            v-for="schedule in schedules"
+            :key="schedule.id"
+            class="flex items-center justify-between gap-3 text-xs border border-base-200 rounded-lg p-3"
+          >
+            <div class="min-w-0">
+              <div class="flex items-center gap-2">
+                <span class="font-medium">{{ schedule.name }}</span>
+                <span v-if="!schedule.is_enabled" class="badge badge-ghost badge-xs">disabled</span>
+              </div>
+              <div class="font-mono text-base-content/60 truncate">
+                {{ schedule.targets.join(', ') }} · every
+                {{ schedule.interval_minutes }} min
+              </div>
+              <div class="text-base-content/60">
+                last run {{ formatWhen(schedule.last_run_at) }} · next
+                {{ formatWhen(schedule.next_run_at) }}
+              </div>
+              <!-- A schedule that fails every night and is never read is worse
+                   than none: it is the appearance of coverage. -->
+              <div v-if="schedule.last_error" class="text-error mt-1">
+                last run did not happen: {{ schedule.last_error }}
+              </div>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+              <button class="btn btn-xs btn-outline" @click="runSchedule(schedule)">Run now</button>
+              <button class="btn btn-xs btn-ghost text-error" @click="deleteSchedule(schedule)">
+                <Trash2 class="w-3 h-3" />
+              </button>
+            </div>
+          </div>
+        </div>
+        <p v-else class="text-xs text-base-content/60 mb-4">
+          Nothing is being scanned on a schedule, so anything that appears between manual scans
+          goes unnoticed.
+        </p>
+
+        <form @submit.prevent="createSchedule" class="flex items-end gap-3">
+          <div class="form-control w-40">
+            <label class="label"><span class="label-text text-xs">Name</span></label>
+            <input v-model="newSchedule.name" class="input input-bordered input-sm" required />
+          </div>
+          <div class="form-control flex-1">
+            <label class="label"><span class="label-text text-xs">Targets</span></label>
+            <input
+              v-model="newSchedule.targets"
+              class="input input-bordered input-sm"
+              placeholder="10.0.0.0/24"
+              required
+            />
+          </div>
+          <div class="form-control w-28">
+            <label class="label"><span class="label-text text-xs">Every (min)</span></label>
+            <input
+              v-model="newSchedule.interval_minutes"
+              type="number"
+              class="input input-bordered input-sm"
+            />
+          </div>
+          <button type="submit" class="btn btn-sm" :disabled="savingSchedule">Add</button>
+        </form>
+
+        <div v-if="scheduleError" role="alert" class="alert alert-error mt-3">
+          <AlertTriangle class="w-4 h-4" />
+          <span class="text-sm">{{ scheduleError }}</span>
+        </div>
       </div>
     </div>
 

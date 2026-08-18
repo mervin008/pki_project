@@ -228,8 +228,12 @@ export interface Finding {
 export interface DiscoveryScan {
   id: string
   scan_type: 'network' | 'ct_log' | 'cloud'
+  /** As typed. A CIDR stays a CIDR here; `target_count` says what it became. */
   targets: string[]
-  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED'
+  /** CANCELLED is distinct from FAILED: somebody stopped it on purpose. */
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
+  /** How many endpoints the run set out to reach, after expansion. */
+  target_count: number
   results_count: number
   /** The headline. The only count that implies work. */
   unmanaged_count: number
@@ -283,6 +287,39 @@ export interface DiscoveryResult {
   imported_certificate_id?: string | null
   scanned_at: string
   created_at: string
+}
+
+/**
+ * core/store/models.go — DiscoverySchedule.
+ *
+ * An interval, not a cron expression: a cron field is a small language whose
+ * mistakes are silent, and a schedule meant to run nightly that instead runs
+ * yearly looks identical on screen to one that works.
+ */
+export interface DiscoverySchedule {
+  id: string
+  name: string
+  /** As typed — "10.0.0.0/24", not the 254 addresses it becomes. */
+  targets: string[]
+  ports: number[]
+  interval_minutes: number
+  is_enabled: boolean
+  /** When a run last *started*. The next run is computed from this. */
+  last_run_at?: string | null
+  next_run_at?: string | null
+  last_scan_id?: string | null
+  /** Why the last run did not happen. A schedule failing nightly and never
+   *  read is worse than none: it is the appearance of coverage. */
+  last_error?: string
+  created_at: string
+  updated_at: string
+}
+
+/** GET /api/v1/discovery/schedules */
+export interface DiscoveryScheduleList {
+  data: DiscoverySchedule[]
+  total: number
+  min_interval_minutes: number
 }
 
 /** POST /api/v1/discovery/scan and GET /api/v1/discovery/scans/:id */
@@ -381,6 +418,9 @@ export type StreamTopic =
   | 'cert.renewal_failed'
   | 'cert.expiring'
   | 'gateway.status'
+  | 'discovery.unmanaged'
+  | 'discovery.changed'
+  | 'discovery.progress'
 
 /** One published change — core/events/broker.go `Event`. */
 export interface StreamEvent {

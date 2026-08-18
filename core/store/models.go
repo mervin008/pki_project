@@ -502,6 +502,54 @@ func (r *DiscoveryResult) WorstSeverity() string {
 	return worst
 }
 
+// DiscoverySchedule is a scan that runs by itself.
+//
+// Discovery run once is a snapshot; run repeatedly it is monitoring. The
+// finding it exists to produce is created continuously — by deployments nobody
+// mentioned and appliances nobody registered — so catching it means looking
+// again without anyone remembering to.
+type DiscoverySchedule struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Targets as typed, not expanded. A schedule is edited by the person who
+	// wrote it, and re-reading 254 addresses is not editing.
+	Targets []string `json:"targets"`
+	Ports   []int    `json:"ports"`
+	// IntervalMinutes is how often it runs. Not a cron expression: an interval
+	// is what a PKI team wants, and a cron field is a small language whose
+	// mistakes are silent — a schedule meant to run nightly that instead runs
+	// yearly looks identical on screen to one that works.
+	IntervalMinutes int  `json:"interval_minutes"`
+	IsEnabled       bool `json:"is_enabled"`
+	// LastRunAt is when a run last started, not finished. The next run is
+	// computed from it, so a long scan does not push its own schedule later
+	// every time it runs.
+	LastRunAt  *time.Time `json:"last_run_at,omitempty"`
+	NextRunAt  *time.Time `json:"next_run_at,omitempty"`
+	LastScanID *string    `json:"last_scan_id,omitempty"`
+	// LastError is why the last run did not happen. Kept on the schedule so a
+	// list can show which one has quietly stopped working: a schedule that
+	// fails every night and is never read is worse than no schedule, because it
+	// is the appearance of coverage.
+	LastError string    `json:"last_error,omitempty"`
+	CreatedBy *string   `json:"created_by,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Due reports whether the schedule should run now.
+func (s *DiscoverySchedule) Due(now time.Time) bool {
+	if s == nil || !s.IsEnabled {
+		return false
+	}
+	// A schedule that has never run is due immediately. Someone who has just
+	// created one wants to know it works, not to find out tomorrow.
+	if s.NextRunAt == nil {
+		return true
+	}
+	return !s.NextRunAt.After(now)
+}
+
 // DiscoveryResultFilter narrows a result list.
 type DiscoveryResultFilter struct {
 	// ScanID restricts to one run. Empty means across every scan, which is how
@@ -515,8 +563,17 @@ type DiscoveryResultFilter struct {
 	Host string
 	// UnimportedOnly hides results someone has already adopted into inventory.
 	UnimportedOnly bool
-	Limit          int
-	Offset         int
+	// LatestPerEndpoint keeps only the newest observation of each host and
+	// port.
+	//
+	// Without it, "everything we have found and not adopted" counts an endpoint
+	// once per scan that ever touched it — so a nightly schedule turns one
+	// unmanaged certificate into thirty findings, and the number stops meaning
+	// anything. A result is a record of a moment; the outstanding-work list is
+	// a question about now.
+	LatestPerEndpoint bool
+	Limit             int
+	Offset            int
 }
 
 // DashboardStats holds summary statistics for the overview dashboard.

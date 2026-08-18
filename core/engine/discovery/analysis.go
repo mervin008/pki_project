@@ -31,7 +31,74 @@ const (
 	FindingWeakCipher       = "weak_cipher"
 	FindingNoForwardSecrecy = "no_forward_secrecy"
 	FindingLongValidity     = "long_validity"
+
+	// Findings that only exist on a repeated scan. The value of the second run
+	// is not the list, it is the difference.
+	FindingCertificateChanged  = "certificate_changed"
+	FindingEndpointDisappeared = "endpoint_disappeared"
+	FindingEndpointAppeared    = "endpoint_appeared"
 )
+
+// reconcile compares an endpoint against what it was last seen serving.
+//
+// Returns the findings that describe the change, and whether the change is one
+// worth telling somebody about.
+//
+// The distinction that carries the weight: a certificate that changed on an
+// endpoint CertPilot manages is a renewal, and unremarkable. The same change on
+// an endpoint it does not manage means something out there renewed a
+// certificate without going through any of this — which is the shadow-PKI
+// signal the whole feature exists to surface, and it is invisible to a first
+// scan.
+func reconcile(result *store.DiscoveryResult, previous *store.DiscoveryResult) []store.Finding {
+	findings := []store.Finding{}
+	if previous == nil {
+		// Not a finding on its own. Every endpoint is new the first time, and
+		// an estate's first scan should not report itself as a hundred changes.
+		return findings
+	}
+
+	switch {
+	case previous.Reachable && !result.Reachable:
+		findings = append(findings, store.Finding{
+			Code:     FindingEndpointDisappeared,
+			Severity: events.SeverityWarning,
+			Detail: fmt.Sprintf("This endpoint was serving %q when it was last scanned on %s, and no longer answers. Either it moved and the scan no longer covers it, or it is down.",
+				fallbackName(previous), previous.ScannedAt.UTC().Format("2 January 2006")),
+		})
+
+	case !previous.Reachable && result.Reachable:
+		findings = append(findings, store.Finding{
+			Code:     FindingEndpointAppeared,
+			Severity: events.SeverityInfo,
+			Detail:   "This endpoint did not answer the last time it was scanned and does now.",
+		})
+
+	case result.Reachable && previous.FingerprintSHA256 != "" &&
+		previous.FingerprintSHA256 != result.FingerprintSHA256:
+		severity := events.SeverityInfo
+		detail := fmt.Sprintf("The certificate here changed since %s. CertPilot manages the new one, so this is a renewal it knows about.",
+			previous.ScannedAt.UTC().Format("2 January 2006"))
+		if result.ManagementState != store.DiscoveryManaged {
+			// The finding that only a repeated scan can produce.
+			severity = events.SeverityWarning
+			detail = fmt.Sprintf("The certificate here changed since %s and CertPilot manages neither the old one nor the new one. Something is renewing certificates on this endpoint outside this system, so somebody knows how to replace it — find out who.",
+				previous.ScannedAt.UTC().Format("2 January 2006"))
+		}
+		findings = append(findings, store.Finding{
+			Code: FindingCertificateChanged, Severity: severity, Detail: detail,
+		})
+	}
+
+	return findings
+}
+
+func fallbackName(result *store.DiscoveryResult) string {
+	if result.CommonName != "" {
+		return result.CommonName
+	}
+	return "a certificate"
+}
 
 const (
 	// expiringSoonDays is when a discovered certificate starts being a finding

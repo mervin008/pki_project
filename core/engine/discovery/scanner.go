@@ -385,6 +385,11 @@ func (s *Scanner) execute(ctx context.Context, scan *store.DiscoveryScan, target
 			"error", err)
 	}
 
+	// What these endpoints were last seen serving, in one call rather than one
+	// per endpoint. A repeated scan's value is the difference, and without this
+	// every run reports the estate as if it had never been looked at before.
+	baseline := s.loadBaseline(ctx, targets)
+
 	results := make([]*store.DiscoveryResult, len(targets))
 	completed := make(chan int, len(targets))
 	jobs := make(chan int)
@@ -409,7 +414,7 @@ func (s *Scanner) execute(ctx context.Context, scan *store.DiscoveryScan, target
 					completed <- -1
 					continue
 				}
-				results[i] = s.judge(ctx, probe, anchors)
+				results[i] = s.judge(ctx, probe, anchors, baseline)
 				completed <- i
 			}
 		}()
@@ -509,7 +514,7 @@ func (s *Scanner) execute(ctx context.Context, scan *store.DiscoveryScan, target
 	if err := s.store.UpdateDiscoveryScan(writeCtx, scan); err != nil {
 		slog.Warn("scan results stored but the scan record could not be updated", "scan_id", scan.ID, "error", err)
 	}
-	s.publishFinished(scan)
+	s.publishFinished(scan, stored)
 
 	return stored
 }
@@ -538,7 +543,7 @@ func (s *Scanner) publishProgress(scan *store.DiscoveryScan, total int) {
 	})
 }
 
-func (s *Scanner) publishFinished(scan *store.DiscoveryScan) {
+func (s *Scanner) publishFinished(scan *store.DiscoveryScan, results []*store.DiscoveryResult) {
 	if s.broker == nil {
 		return
 	}
@@ -550,56 +555,93 @@ func (s *Scanner) publishFinished(scan *store.DiscoveryScan) {
 			"scan_id":         scan.ID,
 			"status":          scan.Status,
 			"scanned_count":   scan.ResultsCount,
-			"target_count":    scan.ResultsCount,
+			"target_count":    scan.TargetCount,
 			"unmanaged_count": scan.UnmanagedCount,
 			"managed_count":   scan.ManagedCount,
 			"finished":        true,
 		},
 	})
 
-	// The finding, separate from the progress. Published by the scanner rather
-	// than the handler so a background run alerts on what it found without
-	// anyone still being on the request that started it.
-	if scan.UnmanagedCount == 0 {
+	// The findings, separate from the progress, and published by the scanner
+	// rather than by the handler — a background run has to alert on what it
+	// found long after the request that started it was answered.
+	if scan.UnmanagedCount > 0 {
+		s.broker.Publish(events.Event{
+			Topic:    events.TopicDiscoveryUnmanaged,
+			Severity: events.SeverityWarning,
+			EntityID: scan.ID,
+			Payload: map[string]any{
+				"scan_id":         scan.ID,
+				"unmanaged_count": scan.UnmanagedCount,
+				"scanned_count":   scan.ResultsCount,
+				"hosts":           hostsWithState(results, store.DiscoveryUnmanaged, 10),
+			},
+		})
+	}
+
+	// Changes are their own event, not a variation on "we found something".
+	//
+	// "There is an endpoint you do not manage" is a fact about an estate that
+	// may have been true for years. "The certificate on it changed last night"
+	// is a fact about somebody who is actively operating it, and it is only
+	// visible on a repeated scan — which is the entire argument for scheduling
+	// one.
+	changed := hostsWithFinding(results, FindingCertificateChanged, events.SeverityWarning, 10)
+	gone := hostsWithFinding(results, FindingEndpointDisappeared, events.SeverityWarning, 10)
+	if len(changed) == 0 && len(gone) == 0 {
 		return
 	}
 	s.broker.Publish(events.Event{
-		Topic:    events.TopicDiscoveryUnmanaged,
+		Topic:    events.TopicDiscoveryChanged,
 		Severity: events.SeverityWarning,
 		EntityID: scan.ID,
 		Payload: map[string]any{
-			"scan_id":         scan.ID,
-			"unmanaged_count": scan.UnmanagedCount,
-			"scanned_count":   scan.ResultsCount,
-			"hosts":           s.unmanagedHosts(scan.ID),
+			"scan_id":           scan.ID,
+			"changed_count":     len(changed),
+			"disappeared_count": len(gone),
+			"changed_hosts":     changed,
+			"disappeared_hosts": gone,
+			"scanned_count":     scan.ResultsCount,
 		},
 	})
 }
 
-// unmanagedHosts names what the run found, capped, so an alert is actionable
-// without carrying a thousand hostnames into Slack.
-func (s *Scanner) unmanagedHosts(scanID string) []string {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	results, _, err := s.store.ListDiscoveryResults(ctx, store.DiscoveryResultFilter{
-		ScanID:          scanID,
-		ManagementState: store.DiscoveryUnmanaged,
-		Limit:           10,
-	})
-	if err != nil {
-		return nil
-	}
-	hosts := make([]string, 0, len(results))
+// hostsWithState names endpoints in a given management state, capped so an
+// alert stays readable rather than carrying a thousand hostnames into Slack.
+func hostsWithState(results []*store.DiscoveryResult, state string, max int) []string {
+	hosts := make([]string, 0, max)
 	for _, r := range results {
+		if r.ManagementState != state {
+			continue
+		}
 		hosts = append(hosts, fmt.Sprintf("%s:%d", r.Host, r.Port))
+		if len(hosts) == max {
+			break
+		}
+	}
+	return hosts
+}
+
+// hostsWithFinding names endpoints carrying a finding at or above a severity.
+func hostsWithFinding(results []*store.DiscoveryResult, code, severity string, max int) []string {
+	hosts := make([]string, 0, max)
+	for _, r := range results {
+		for _, f := range r.Findings {
+			if f.Code == code && f.Severity == severity {
+				hosts = append(hosts, fmt.Sprintf("%s:%d", r.Host, r.Port))
+				break
+			}
+		}
+		if len(hosts) == max {
+			break
+		}
 	}
 	return hosts
 }
 
 // judge turns a probe into a result: the verdicts, the findings, and the
 // evidence for both.
-func (s *Scanner) judge(ctx context.Context, probe *Probe, anchors *TrustAnchors) *store.DiscoveryResult {
+func (s *Scanner) judge(ctx context.Context, probe *Probe, anchors *TrustAnchors, baseline map[string]*store.DiscoveryResult) *store.DiscoveryResult {
 	result := &store.DiscoveryResult{
 		Host:      probe.Target.Host,
 		Port:      probe.Target.Port,
@@ -613,6 +655,9 @@ func (s *Scanner) judge(ctx context.Context, probe *Probe, anchors *TrustAnchors
 		result.Error = probe.Err.Error()
 		result.ManagementState = store.DiscoveryUnreachable
 		result.TrustState = store.TrustUnknown
+		// An endpoint that used to answer and now does not is the one thing
+		// worth saying about a failed probe, so reconciliation runs even here.
+		result.Findings = append(result.Findings, reconcile(result, baseline[probe.Target.String()])...)
 		return result
 	}
 
@@ -666,8 +711,28 @@ func (s *Scanner) judge(ctx context.Context, probe *Probe, anchors *TrustAnchors
 	trust, findings := analyse(probe, anchors, s.now())
 	result.TrustState = trust
 	result.Findings = append(result.Findings, findings...)
+	result.Findings = append(result.Findings, reconcile(result, baseline[probe.Target.String()])...)
 
 	return result
+}
+
+// loadBaseline reads what each target was last seen serving.
+//
+// A failure is not fatal: without a baseline the run reports no changes, which
+// understates rather than invents. Reporting a change that did not happen would
+// send somebody hunting for a rotation nobody performed.
+func (s *Scanner) loadBaseline(ctx context.Context, targets []Target) map[string]*store.DiscoveryResult {
+	endpoints := make([]string, 0, len(targets))
+	for _, t := range targets {
+		endpoints = append(endpoints, t.String())
+	}
+
+	baseline, err := s.store.GetLatestDiscoveryResults(ctx, endpoints)
+	if err != nil {
+		slog.Warn("could not load previous scan results; this run will not report what changed", "error", err)
+		return map[string]*store.DiscoveryResult{}
+	}
+	return baseline
 }
 
 // TrustAnchors is the set of CAs CertPilot manages, in the form x509

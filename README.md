@@ -103,7 +103,7 @@ explicitly.
 | Kiosk display tokens | ✅ | Read-only, viewer-scoped, expiring, revocable credentials for a wall display |
 | CA hierarchy tree | ⚠️ | Position and lineage are shown per CA and a malformed hierarchy is flagged; the tree is not drawn as a tree |
 | Policy engine | ⚠️ | `key_size`, `max_lifetime`, `ca_restriction`; other rule types are not implemented |
-| Discovery | ⚠️ | Scans hosts, CIDR networks, and address ranges; records the full handshake and says which certificates nobody manages. Wide scans run in the background and can be stopped. No scheduled scans, CT logs, or cloud inventory yet |
+| Discovery | ⚠️ | Scans hosts, CIDR networks, and address ranges on a schedule; records the full handshake, says which certificates nobody manages, and reports what changed since last time. No CT logs or cloud inventory yet |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ❌ | Not started |
 | Host agent | ❌ | Not started |
@@ -325,6 +325,30 @@ history has to have been collected before it is asked.
 Importing a finding watches it for expiry. It does **not** make it renewable:
 CertPilot holds no private key for something it merely observed, so `auto_renew`
 stays false whatever you ask for, and the response says why.
+
+### Looking again
+
+A scan run once is a snapshot, and the endpoint somebody stood up last Tuesday
+is not in it. Schedules fix that:
+
+```bash
+curl -X POST localhost:8080/api/v1/discovery/schedules -H 'Content-Type: application/json' \
+  -d '{"name": "nightly perimeter", "targets": ["10.0.0.0/24"], "interval_minutes": 1440}'
+```
+
+The second run is where the value is. It reports what **changed**:
+
+```
+127.0.0.1:8443   UNMANAGED  SELF_SIGNED
+  [WARNING] certificate_changed: The certificate here changed since 17 August 2026
+  and CertPilot manages neither the old one nor the new one. Something is renewing
+  certificates on this endpoint outside this system, so somebody knows how to
+  replace it — find out who.
+```
+
+The same rotation on a managed endpoint is a renewal CertPilot performed, and is
+reported at INFO. Alerting on its own renewals is how a system teaches people to
+ignore the alert that matters.
 
 ## Security model
 

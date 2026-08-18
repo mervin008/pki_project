@@ -119,6 +119,29 @@ type Store interface {
 	// adopted it into, so the same endpoint stops being reported as an
 	// unmanaged finding on the next scan.
 	MarkDiscoveryResultImported(ctx context.Context, id, certificateID string) error
+	// GetLatestDiscoveryResults returns what each of these endpoints was last
+	// seen serving, keyed by "host:port".
+	//
+	// This is what makes a repeated scan worth more than the first one: the
+	// value of the second run is not the list, it is the difference. Loaded in
+	// one call before the run, not per endpoint during it.
+	GetLatestDiscoveryResults(ctx context.Context, endpoints []string) (map[string]*DiscoveryResult, error)
+
+	// ── Discovery schedules ─────────────────────────────────
+
+	ListDiscoverySchedules(ctx context.Context) ([]*DiscoverySchedule, error)
+	GetDiscoverySchedule(ctx context.Context, id string) (*DiscoverySchedule, error)
+	CreateDiscoverySchedule(ctx context.Context, s *DiscoverySchedule) error
+	UpdateDiscoverySchedule(ctx context.Context, s *DiscoverySchedule) error
+	DeleteDiscoverySchedule(ctx context.Context, id string) error
+	// GetDueDiscoverySchedules returns the schedules that should run now.
+	GetDueDiscoverySchedules(ctx context.Context, now time.Time) ([]*DiscoverySchedule, error)
+	// MarkDiscoveryScheduleRun records an attempt and moves the schedule on.
+	//
+	// Separate from UpdateDiscoverySchedule so the scheduler, which runs
+	// concurrently with whoever is editing the schedule, cannot write back a
+	// stale definition as a side effect of recording that it ran.
+	MarkDiscoveryScheduleRun(ctx context.Context, id string, ranAt, nextRunAt time.Time, scanID *string, runErr string) error
 
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error

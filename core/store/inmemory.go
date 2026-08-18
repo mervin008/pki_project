@@ -36,8 +36,9 @@ type MemoryStore struct {
 	acks      []*AlertAcknowledgement
 	auditLogs []*AuditLog
 	// Discovery runs and their results, both append-only and newest last.
-	discoveryScans   []*DiscoveryScan
-	discoveryResults []*DiscoveryResult
+	discoveryScans     []*DiscoveryScan
+	discoveryResults   []*DiscoveryResult
+	discoverySchedules map[string]*DiscoverySchedule
 }
 
 // clone returns a shallow copy of a stored record.
@@ -226,6 +227,9 @@ func NewMemoryStore() *MemoryStore {
 		// webhook URL or an SMTP password.
 		notifChannels: make(map[string]*NotificationChannel),
 		auditLogs:     []*AuditLog{log1},
+		// Empty: a schedule is an outbound action on a timer, and seeding one
+		// would have a fresh install scanning something nobody asked it to.
+		discoverySchedules: make(map[string]*DiscoverySchedule),
 	}
 }
 
@@ -1114,8 +1118,18 @@ func (m *MemoryStore) ListDiscoveryResults(ctx context.Context, filter Discovery
 	defer m.mu.RUnlock()
 
 	matched := make([]*DiscoveryResult, 0)
+	// Walked newest first, so the first result seen for an endpoint is its
+	// latest observation.
+	seenEndpoint := map[string]bool{}
 	for i := len(m.discoveryResults) - 1; i >= 0; i-- {
 		r := m.discoveryResults[i]
+		if filter.LatestPerEndpoint {
+			key := endpointKey(r.Host, r.Port)
+			if seenEndpoint[key] {
+				continue
+			}
+			seenEndpoint[key] = true
+		}
 		if filter.ScanID != "" && r.ScanID != filter.ScanID {
 			continue
 		}
@@ -1180,4 +1194,139 @@ func (m *MemoryStore) MarkDiscoveryResultImported(ctx context.Context, id, certi
 		return nil
 	}
 	return fmt.Errorf("discovery result %s not found", id)
+}
+
+// GetLatestDiscoveryResults returns what each endpoint was last seen serving.
+func (m *MemoryStore) GetLatestDiscoveryResults(ctx context.Context, endpoints []string) (map[string]*DiscoveryResult, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	wanted := make(map[string]bool, len(endpoints))
+	for _, e := range endpoints {
+		wanted[e] = true
+	}
+	// Empty means every endpoint, which is how the whole estate's current state
+	// is asked for.
+	all := len(endpoints) == 0
+
+	out := make(map[string]*DiscoveryResult, len(endpoints))
+	for i := len(m.discoveryResults) - 1; i >= 0; i-- {
+		r := m.discoveryResults[i]
+		key := endpointKey(r.Host, r.Port)
+		if !all && !wanted[key] {
+			continue
+		}
+		if _, seen := out[key]; !seen {
+			out[key] = clone(r)
+		}
+	}
+	return out, nil
+}
+
+func endpointKey(host string, port int) string {
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// ── Discovery schedules ─────────────────────────────────
+
+func (m *MemoryStore) ListDiscoverySchedules(ctx context.Context) ([]*DiscoverySchedule, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*DiscoverySchedule, 0, len(m.discoverySchedules))
+	for _, s := range m.discoverySchedules {
+		out = append(out, clone(s))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *MemoryStore) GetDiscoverySchedule(ctx context.Context, id string) (*DiscoverySchedule, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if s, ok := m.discoverySchedules[id]; ok {
+		return clone(s), nil
+	}
+	return nil, fmt.Errorf("discovery schedule %s not found", id)
+}
+
+func (m *MemoryStore) CreateDiscoverySchedule(ctx context.Context, s *DiscoverySchedule) error {
+	if len(s.Targets) == 0 {
+		return fmt.Errorf("a discovery schedule needs at least one target")
+	}
+	if s.IntervalMinutes <= 0 {
+		return fmt.Errorf("a discovery schedule needs a positive interval")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if s.ID == "" {
+		s.ID = uuid.New().String()
+	}
+	now := time.Now()
+	s.CreatedAt, s.UpdatedAt = now, now
+	m.discoverySchedules[s.ID] = clone(s)
+	return nil
+}
+
+func (m *MemoryStore) UpdateDiscoverySchedule(ctx context.Context, s *DiscoverySchedule) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	existing, ok := m.discoverySchedules[s.ID]
+	if !ok {
+		return fmt.Errorf("discovery schedule %s not found", s.ID)
+	}
+	updated := clone(s)
+	updated.CreatedAt = existing.CreatedAt
+	updated.UpdatedAt = time.Now()
+	m.discoverySchedules[s.ID] = updated
+	return nil
+}
+
+func (m *MemoryStore) DeleteDiscoverySchedule(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.discoverySchedules[id]; !ok {
+		return fmt.Errorf("discovery schedule %s not found", id)
+	}
+	delete(m.discoverySchedules, id)
+	return nil
+}
+
+func (m *MemoryStore) GetDueDiscoverySchedules(ctx context.Context, now time.Time) ([]*DiscoverySchedule, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*DiscoverySchedule, 0)
+	for _, s := range m.discoverySchedules {
+		if s.Due(now) {
+			out = append(out, clone(s))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *MemoryStore) MarkDiscoveryScheduleRun(ctx context.Context, id string, ranAt, nextRunAt time.Time, scanID *string, runErr string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.discoverySchedules[id]
+	if !ok {
+		return fmt.Errorf("discovery schedule %s not found", id)
+	}
+	s.LastRunAt = &ranAt
+	s.NextRunAt = &nextRunAt
+	s.LastError = runErr
+	// A failed run keeps the previous scan id rather than clearing it: "the
+	// last time this worked" is the more useful fact of the two.
+	if scanID != nil {
+		s.LastScanID = scanID
+	}
+	s.UpdatedAt = time.Now()
+	return nil
 }

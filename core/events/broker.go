@@ -35,6 +35,15 @@ const (
 	// Published so it reaches the channels a team already configured, rather
 	// than waiting to be noticed on a results page nobody has open.
 	TopicDiscoveryUnmanaged = "discovery.unmanaged"
+	// TopicDiscoveryChanged carries what a repeated scan found different: a
+	// certificate rotated on an endpoint nobody manages, or an endpoint that
+	// used to answer and no longer does.
+	//
+	// Distinct from TopicDiscoveryUnmanaged because the two mean different
+	// things. "There is an endpoint you do not manage" may have been true for
+	// years; "the certificate on it changed last night" is a fact about
+	// somebody actively operating it, and it is only visible on a second scan.
+	TopicDiscoveryChanged = "discovery.changed"
 	// TopicDiscoveryProgress reports how far a running scan has got. Stream
 	// only — see IsNotifiable.
 	TopicDiscoveryProgress = "discovery.progress"
@@ -83,6 +92,7 @@ func AllTopics() []string {
 		TopicCertExpiring,
 		TopicGatewayStatus,
 		TopicDiscoveryUnmanaged,
+		TopicDiscoveryChanged,
 	}
 }
 

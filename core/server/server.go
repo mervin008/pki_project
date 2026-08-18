@@ -34,6 +34,7 @@ type Server struct {
 	broker       *events.Broker
 	renewalSched *renewal.Scheduler
 	scanner      *discovery.Scanner
+	discoverySch *discovery.Scheduler
 	cfg          *config.CoreConfig
 }
 
@@ -113,6 +114,8 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	// The scanner publishes progress so a range scan is visible while it runs,
 	// not only once it is over.
 	scanner := discovery.NewScanner(st, discovery.WithBroker(broker))
+	// Discovery run once is a snapshot; run on a schedule it is monitoring.
+	discoverySch := discovery.NewScheduler(st, scanner)
 
 	// The dispatcher is an ordinary broker subscriber. That is the point: it
 	// makes outbound HTTP and SMTP calls, and a wedged destination can only cost
@@ -166,6 +169,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		broker:       broker,
 		renewalSched: renewalSched,
 		scanner:      scanner,
+		discoverySch: discoverySch,
 		cfg:          cfg,
 	}, nil
 }
@@ -217,6 +221,11 @@ func (s *Server) Start() error {
 	}
 	s.caMonitor.Start(caInterval)
 
+	// Its own interval comes from each schedule, so this only needs to wake
+	// often enough to notice one is due. A fresh install has no schedules and
+	// this loop does nothing but one indexed query a minute.
+	s.discoverySch.Start()
+
 	// After the producers, so nothing is published before there is anything
 	// subscribed to deliver it.
 	s.dispatcher.Start()
@@ -230,6 +239,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	slog.Info("shutting down CertPilot Core")
 	s.renewalSched.Stop()
 	s.caMonitor.Stop()
+	s.discoverySch.Stop()
 	// A range scan can run for minutes. Left alone it would hold the grace
 	// period open and then be killed mid-write anyway; cancelled, it records
 	// what it found and stops.
