@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -2223,4 +2225,74 @@ func (m *MemoryStore) UpdateCertificateRenewalInfo(ctx context.Context, id strin
 	cert.ARISupported = info.Supported
 	cert.UpdatedAt = time.Now()
 	return nil
+}
+
+func (m *MemoryStore) GetCertificatesDueForVerification(ctx context.Context, now time.Time, limit int) ([]*Certificate, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 50
+	}
+	out := make([]*Certificate, 0)
+	for _, c := range m.certificates {
+		if c.VerifyAfter == nil || c.VerifyAfter.After(now) {
+			continue
+		}
+		out = append(out, clone(c))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].VerifyAfter.Before(*out[j].VerifyAfter) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *MemoryStore) UpdateCertificateVerification(ctx context.Context, id string, update VerificationUpdate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cert, ok := m.certificates[id]
+	if !ok {
+		return fmt.Errorf("certificate %s not found", id)
+	}
+	cert.VerificationState = update.State
+	cert.VerificationDetail = update.Detail
+	checked := update.CheckedAt
+	cert.LastVerifiedAt = &checked
+	cert.VerifyAfter = update.VerifyAfter
+	cert.VerificationAttempts = update.Attempts
+	if update.PreviousFingerprint != "" {
+		cert.PreviousFingerprint = update.PreviousFingerprint
+	}
+	cert.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryStore) GetEndpointsServingCertificate(ctx context.Context, certificateID, fingerprint string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Newest observation per endpoint only. An endpoint scanned nightly for a
+	// month would otherwise be probed thirty times to answer one question.
+	latest := map[string]*DiscoveryResult{}
+	for _, r := range m.discoveryResults {
+		if !r.Reachable {
+			continue
+		}
+		key := net.JoinHostPort(r.Host, strconv.Itoa(r.Port))
+		if prev, ok := latest[key]; !ok || r.ScannedAt.After(prev.ScannedAt) {
+			latest[key] = r
+		}
+	}
+
+	endpoints := make([]string, 0)
+	for key, r := range latest {
+		matched := r.MatchedCertificateID != nil && *r.MatchedCertificateID == certificateID
+		if matched || (fingerprint != "" && r.FingerprintSHA256 == fingerprint) {
+			endpoints = append(endpoints, key)
+		}
+	}
+	sort.Strings(endpoints)
+	return endpoints, nil
 }

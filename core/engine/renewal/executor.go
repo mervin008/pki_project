@@ -78,6 +78,9 @@ func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.
 
 	now := time.Now()
 	cert.LastRenewalAttempt = &now
+	// Captured before anything overwrites it: this is what the endpoints are
+	// expected to stop serving.
+	previousFingerprint := cert.FingerprintSHA256
 
 	renewReq := &providerv1.RenewCertificateRequest{
 		ProviderCertificateId: cert.SerialNumber,
@@ -142,6 +145,30 @@ func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.
 
 	if err := e.store.UpdateCertificate(ctx, cert); err != nil {
 		return nil, fmt.Errorf("failed to save renewed certificate: %w", err)
+	}
+
+	// A renewal is not done when the certificate is stored. It is done when the
+	// thing serving it is serving it — and CertPilot deploys nothing yet, so
+	// that gap is the normal state rather than an edge case.
+	//
+	// Written through the narrow verification writer rather than as fields on
+	// the row above. UpdateCertificate has an explicit column list, and adding
+	// to the model without adding to that list drops the value in silence —
+	// which is exactly what happened the first time this was written, and the
+	// in-memory store could not show it because it stores whole structs.
+	verifyAt := time.Now().Add(VerifyGrace)
+	if err := e.store.UpdateCertificateVerification(ctx, cert.ID, store.VerificationUpdate{
+		State:               store.VerificationPending,
+		CheckedAt:           time.Now(),
+		VerifyAfter:         &verifyAt,
+		Attempts:            0,
+		PreviousFingerprint: previousFingerprint,
+	}); err != nil {
+		// Not fatal to the renewal, which has already happened and been stored.
+		// But it does mean nothing will check that this reached the server, so
+		// it is said loudly rather than logged at debug.
+		slog.Error("a certificate was renewed but its deployment check could not be scheduled",
+			"cert_id", cert.ID, "error", err)
 	}
 
 	_ = e.store.CreateAuditLog(ctx, &store.AuditLog{

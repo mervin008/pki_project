@@ -36,8 +36,16 @@ const (
 	// revocation moves the affected windows into the past, and this is the only
 	// automated warning anybody gets.
 	TopicCertRenewalWindowMoved = "cert.renewal_window_moved"
-	TopicCertExpiring           = "cert.expiring"
-	TopicGatewayStatus          = "gateway.status"
+	// TopicCertNotDeployed carries a renewal that succeeded and never reached
+	// the server.
+	//
+	// Named as the consequence rather than as a failed check, because it is the
+	// exact outage a renewal engine is supposed to prevent, arriving through
+	// one: the inventory says ninety days remaining, the endpoint says twenty,
+	// and the dashboard is green.
+	TopicCertNotDeployed = "cert.not_deployed"
+	TopicCertExpiring    = "cert.expiring"
+	TopicGatewayStatus   = "gateway.status"
 	// TopicDiscoveryUnmanaged carries the one finding a discovery scan exists
 	// to produce: an endpoint serving a certificate this system has never seen.
 	// Published so it reaches the channels a team already configured, rather
@@ -118,6 +126,7 @@ func AllTopics() []string {
 		TopicCertRenewed,
 		TopicCertRenewFail,
 		TopicCertRenewalWindowMoved,
+		TopicCertNotDeployed,
 		TopicCertExpiring,
 		TopicGatewayStatus,
 		TopicDiscoveryUnmanaged,

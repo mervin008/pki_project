@@ -414,7 +414,7 @@ phase widened what it has to renew.
 | 1 | Renewal as a durable job, not a function call | ✅ |
 | 2 | Backoff that tightens towards the deadline, and per-CA rate limiting | ✅ |
 | 3 | ARI: let the CA say when, and when it changes its mind | ✅ |
-| 4 | Post-renewal verification — confirm the new certificate is actually served | |
+| 4 | Post-renewal verification — confirm the new certificate is actually served | ✅ |
 
 One sentence governs the phase:
 
@@ -611,6 +611,60 @@ as a date, so something happening in fifty-five minutes read as "18 August
 2026". During a revocation that is the difference between acting now and acting
 tomorrow.
 
+**Step 4** closed the phase with the question everything before it had assumed
+the answer to: **is the thing in front of the users actually serving the new
+certificate?**
+
+Until now a successful renewal wrote a new certificate, incremented the count,
+set the status to ISSUED, and published "certificate renewed". Every one of
+those can be true while the server is still presenting the certificate it
+replaced — and still expiring on that certificate's schedule. It is the sharpest
+possible version of the failure this product exists to prevent, produced by this
+product: a green dashboard over an expiring estate, where the inventory says
+ninety days and the endpoint says twenty.
+
+CertPilot deploys nothing yet, so "renewed but not deployed" is not an edge case
+here. It is the normal state, and reporting it is the difference between a
+renewal engine and a renewal engine somebody can trust.
+
+The endpoints checked are the ones **discovery has actually observed serving
+this certificate** — the two halves of the product finally holding each other
+up. Not the SANs: probing hostnames read out of certificate data would have
+CertPilot opening connections nobody asked for, to names that may not resolve to
+anything it should be touching. A certificate discovery has never seen is
+reported as `NO_ENDPOINTS`, with the sentence that makes it actionable — *"run a
+discovery scan that covers wherever it is deployed and this will start being
+verified"* — rather than guessed at. "We cannot verify this" is useful; a
+fabricated verification is not.
+
+Silence is never success. An endpoint that does not answer is `UNREACHABLE`, and
+a certificate where some endpoints serve the new one and others do not answer is
+*not* verified — the ones that did not answer are exactly the ones that might
+still be on the old certificate.
+
+Two defects, both from running it rather than testing it.
+
+The renewal set the verification fields on the certificate and saved it with
+`UpdateCertificate`, whose explicit column list did not include them, so they
+were **dropped in silence** against PostgreSQL. Every test passed: the in-memory
+store keeps whole structs and cannot express a dropped column. Found by renewing
+a real certificate and watching `previous_fingerprint` come back empty. It is
+now written through the narrow verification writer, which is where it belonged
+anyway.
+
+And after renewing twice without deploying, the endpoint — still on the
+original certificate, two renewals back — was reported as *"something else is
+terminating TLS there"*. Technically true and badly wrong: it sends somebody
+hunting a rogue service when the answer is that renewals have been landing
+nowhere. An older certificate for the same name now has its own words.
+
+Verified live end to end: issue, deploy, scan so discovery links the endpoint,
+renew, and the check answered **409 STALE** naming the endpoint; deploy the
+renewed certificate and it answered **200 VERIFIED** and stopped asking; renew
+once more and one CRITICAL arrived — *"Renewed, but not deployed:
+verify-lab.local … CertPilot's record looks healthy; what users get expires on
+the old schedule."*
+
 The 47-day horizon is what forces the rest. When the CA/Browser Forum's maximum
 lifetime lands, a certificate is renewed roughly every fortnight rather than
 twice a year — renewal stops being an event and becomes a heartbeat, failures
@@ -669,8 +723,9 @@ Tracked honestly rather than quietly:
 
 - Audit log is an ordinary table — not hash-chained, so a database writer can
   rewrite history
-- Renewal has no retry, backoff, or distributed lock; two replicas will renew
-  the same certificate concurrently
+- Post-renewal verification only covers endpoints discovery has already
+  observed. A certificate deployed somewhere nothing has scanned is reported as
+  unverifiable rather than checked
 - The OCSP responder check is an HTTP GET, not an RFC 6960 request, and reports
   responders as healthy that are not
 - `migrations/001_initial_schema.sql` references `auth.users` and `auth.jwt()`

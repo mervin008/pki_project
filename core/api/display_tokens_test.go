@@ -75,6 +75,7 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 		RenewalSched:  renewal.NewScheduler(st, 30),
 		RenewalQueue:  renewal.NewQueue(st, renewal.NewExecutor(st, pm, keyring, broker), broker),
 		ARIPoller:     renewal.NewARIPoller(st, pm, keyring, broker),
+		Verifier:      renewal.NewVerifier(st, discovery.NewScanner(st), broker),
 		PolicyEngine:  policy.NewEngine(st),
 		// A real broker on the scanner: background scans publish their findings
 		// themselves, so a scanner without one would silently drop them.

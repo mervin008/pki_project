@@ -32,6 +32,7 @@ type RouterDeps struct {
 	RenewalSched  *renewal.Scheduler
 	RenewalQueue  *renewal.Queue
 	ARIPoller     *renewal.ARIPoller
+	Verifier      *renewal.Verifier
 	PolicyEngine  *policy.Engine
 	Scanner       *discovery.Scanner
 	CTMonitor     *ctlog.Monitor
@@ -55,7 +56,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	})
 
 	certHandler := NewCertificateHandler(deps.Store, deps.PluginMgr, deps.RenewalExec, deps.RenewalSched, deps.PolicyEngine, deps.Keyring, deps.Broker)
-	renewalHandler := NewRenewalHandler(deps.Store, deps.RenewalSched, deps.ARIPoller)
+	renewalHandler := NewRenewalHandler(deps.Store, deps.RenewalSched, deps.ARIPoller, deps.Verifier)
 	caHandler := NewCAHandler(deps.Store, deps.CAMonitor, deps.ChainResolver)
 	caAccHandler := NewCAAccountHandler(deps.Store, deps.PluginMgr, deps.Keyring)
 	dashHandler := NewDashboardHandler(deps.Store)
@@ -181,6 +182,8 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// Ask the CA now what it thinks about one certificate. Reaching out to
 		// somebody else's CA is an action, not a read.
 		v1.POST("/certificates/:id/renewal-info", middleware.RequireRole(middleware.RoleOperator), renewalHandler.RefreshRenewalInfo)
+		// Check now whether a renewal actually reached the servers it was for.
+		v1.POST("/certificates/:id/verify", middleware.RequireRole(middleware.RoleOperator), renewalHandler.Verify)
 
 		// ── Display Tokens ──
 		// Admin-only throughout: minting a credential that authenticates to

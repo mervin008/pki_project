@@ -83,8 +83,9 @@ make migrate
   applied  013_renewal_jobs.sql
   applied  014_renewal_pacing.sql
   applied  015_renewal_information.sql
+  applied  016_renewal_verification.sql
 
-Applied 15 migration(s).
+Applied 16 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so
@@ -297,3 +298,22 @@ the second takes the next row rather than blocking or duplicating. The second
 A leader would have given one replica all the work and a failover window during
 which no certificate renews at all. These two lines give N equal workers and no
 window.
+
+### Migration 016 and a column list that quietly dropped writes
+
+`UpdateCertificate` writes an explicit column list. Adding `previous_fingerprint`
+and the verification columns to the Go model without adding them to that list
+meant the renewal set them, the update ran, and the values never reached the
+database — no error, no warning.
+
+Every test passed. The in-memory store keeps whole structs, so it cannot express
+a dropped column at all; this is the same lesson as migration 012's check
+constraint, arriving from the other direction. Found by renewing a real
+certificate and watching `previous_fingerprint` come back empty.
+
+The fix was not to widen `UpdateCertificate`. Verification state is written
+through its own narrow writer, because the verifier runs concurrently with
+everything else and a whole-row write from a stale copy would undo a renewal
+that completed while it was probing. `previous_fingerprint` is coalesced there
+rather than overwritten: it is set once by the renewal that scheduled the check
+and every later pass has to keep it.

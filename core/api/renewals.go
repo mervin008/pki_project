@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -15,14 +16,56 @@ import (
 
 // RenewalHandler exposes the renewal queue.
 type RenewalHandler struct {
-	store store.Store
-	sched *renewal.Scheduler
-	ari   *renewal.ARIPoller
+	store    store.Store
+	sched    *renewal.Scheduler
+	ari      *renewal.ARIPoller
+	verifier *renewal.Verifier
 }
 
 // NewRenewalHandler creates the handler.
-func NewRenewalHandler(s store.Store, sched *renewal.Scheduler, ari *renewal.ARIPoller) *RenewalHandler {
-	return &RenewalHandler{store: s, sched: sched, ari: ari}
+func NewRenewalHandler(s store.Store, sched *renewal.Scheduler, ari *renewal.ARIPoller, v *renewal.Verifier) *RenewalHandler {
+	return &RenewalHandler{store: s, sched: sched, ari: ari, verifier: v}
+}
+
+// Verify handles POST /api/v1/certificates/:id/verify.
+//
+// Checks now whether the servers this certificate is deployed to are actually
+// presenting it. Synchronous, because the answer is the point and it takes a
+// handful of TLS handshakes.
+func (h *RenewalHandler) Verify(c *gin.Context) {
+	cert, err := h.store.GetCertificate(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Bounded under the server's write timeout, as everywhere else that reaches
+	// out during a request: a truncated response reads as "nothing happened",
+	// which here would read as "nothing is wrong".
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 25*time.Second)
+	defer cancel()
+	h.verifier.Verify(ctx, cert)
+
+	updated, err := h.store.GetCertificate(c.Request.Context(), cert.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	body := gin.H{
+		"data":    updated,
+		"state":   updated.VerificationState,
+		"summary": updated.VerificationDetail,
+	}
+	// A certificate the servers never picked up is not a 200-and-carry-on. The
+	// status code has to carry the same news the body does, because a script
+	// that only checks the code is the one most likely to be running this in a
+	// pipeline.
+	if updated.VerificationState == store.VerificationStale {
+		c.JSON(http.StatusConflict, body)
+		return
+	}
+	c.JSON(http.StatusOK, body)
 }
 
 // RefreshRenewalInfo handles POST /api/v1/certificates/:id/renewal-info.

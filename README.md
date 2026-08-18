@@ -107,6 +107,7 @@ explicitly.
 | Certificate Transparency | ✅ | Watches CT for certificates issued in your name — including ones never deployed anywhere you could scan. A check that could not run is never reported as a check that found nothing |
 | Cloud inventory | ✅ | Reads ACM, Azure Key Vault, Google Cloud, and Kubernetes TLS secrets. Reports which certificates the provider itself will not renew — the ones everybody assumes are automatic |
 | Renewal queue | ✅ | Durable jobs with leases, an attempt log, and backoff that tightens as expiry approaches. Safe on N replicas with no leader. Per-CA rate limits defer rather than fail |
+| Post-renewal verification | ✅ | Re-probes the endpoints discovery has seen serving a certificate and reports when a renewal never reached them — the green-dashboard-over-an-expiring-estate failure, caught |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ❌ | Not started |
 | Host agent | ❌ | Not started |
@@ -571,6 +572,44 @@ renewal rate limit is full until 29 November 2028, and it expires on
 18 August 2027. Retrying will not fix this: the limit has to be raised, or
 this certificate moved to another CA account.
 ```
+
+### A renewal is not done when the certificate is stored
+
+It is done when the thing serving it is serving it.
+
+CertPilot deploys nothing yet, so a successful renewal routinely leaves a new
+certificate in the database and the old one in front of the users — expiring on
+the old schedule, under a green dashboard. That is the failure this whole
+product exists to prevent, arriving through its own renewal engine.
+
+So every renewal schedules a check, and the check re-probes **the endpoints
+discovery has actually observed serving that certificate**:
+
+```bash
+curl -X POST localhost:8080/api/v1/certificates/$ID/verify
+```
+```json
+409 Conflict
+{ "state": "STALE",
+  "summary": "127.0.0.1:9500 is still serving the certificate this renewal replaced. The new certificate exists in CertPilot and has not reached the server, so what users get expires on the old schedule." }
+```
+
+```
+CRITICAL — Renewed, but not deployed: verify-lab.local
+
+verify-lab.local was renewed successfully, and the server is still presenting
+the certificate it replaced. CertPilot's record looks healthy; what users get
+expires on the old schedule. The new certificate has to be installed.
+```
+
+Install it and the same call answers `200 VERIFIED`, and stops asking.
+
+Not the SANs — probing hostnames read out of certificate data would open
+connections nobody asked for. A certificate discovery has never seen is reported
+as `NO_ENDPOINTS` with the sentence that fixes it, because *"we cannot verify
+this"* is useful and a fabricated verification is not. An endpoint that does not
+answer is `UNREACHABLE`, never verified: silence is the one answer that must
+never be read as success.
 
 ## Security model
 

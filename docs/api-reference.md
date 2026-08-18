@@ -998,6 +998,65 @@ renewal moment with a **time** on it rather than only a date — during a
 revocation, "in 55 minutes" and "sometime on 18 August" are different
 instructions.
 
+### Post-renewal verification
+
+```
+POST /api/v1/certificates/{id}/verify        Check the servers now     (operator)
+```
+
+A renewal is not done when the certificate is stored. It is done when the thing
+serving it is serving it — and CertPilot deploys nothing yet, so a successful
+renewal routinely leaves a new certificate in the database and the old one in
+front of the users, expiring on the old schedule under a green dashboard.
+
+Every successful renewal schedules a check 30 minutes later (a deployment done
+by hand does not happen in the same second as the issuance) and re-probes **the
+endpoints discovery has actually observed serving that certificate**.
+
+```json
+409 Conflict
+{ "state": "STALE",
+  "summary": "127.0.0.1:9500 is still serving the certificate this renewal replaced. The new certificate exists in CertPilot and has not reached the server, so what users get expires on the old schedule." }
+```
+
+**409, not 200.** The status code carries the same news the body does, because a
+script that only checks the code is the one most likely to be running this in a
+pipeline.
+
+| `verification_state` | Meaning |
+|:---|:---|
+| `PENDING` | renewed, inside the grace period |
+| `VERIFIED` | every known endpoint serves the renewed certificate |
+| `STALE` | an endpoint is serving something else — see below |
+| `UNREACHABLE` | endpoints are known and did not answer |
+| `NO_ENDPOINTS` | discovery has never observed this certificate anywhere |
+
+`STALE` distinguishes three cases, because they need different actions:
+
+- **still on the certificate this renewal replaced** — install the new one
+- **an older certificate for this name** — renewals have been landing nowhere
+  for more than one cycle
+- **a certificate for a different name entirely** — something other than this
+  certificate is terminating TLS there
+
+Endpoints come from discovery, never from the certificate's SANs. Probing
+hostnames read out of certificate data would have CertPilot opening connections
+nobody asked for, to names that may not resolve to anything it should be
+touching. A certificate discovery has never seen is `NO_ENDPOINTS` with the
+sentence that fixes it — *"run a discovery scan that covers wherever it is
+deployed"* — rather than a guess. **"We cannot verify this" is useful; a
+fabricated verification is not.**
+
+Silence is never success. An endpoint that does not answer is `UNREACHABLE`, and
+a certificate where some endpoints serve the new one while others stay quiet is
+*not* verified — the quiet ones are exactly the ones that might still be on the
+old certificate.
+
+The `cert.not_deployed` alert fires **once**, on the first check that finds it
+stale. An unresolved certificate is rechecked on a widening schedule (30m, 1h,
+4h, 12h, 24h) and then the verifier stops asking — but not reporting: the state
+stays on the record.
+
 ### Rate limits: deferred is not failed
 
 ```

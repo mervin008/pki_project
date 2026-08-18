@@ -121,6 +121,22 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "Explanation", Value: fallback(str(payload, "explanation_url"), "the CA gave none")},
 		}
 
+	case events.TopicCertNotDeployed:
+		cn := str(payload, "common_name")
+		alert.Title = fmt.Sprintf("Renewed, but not deployed: %s", fallback(cn, "a certificate"))
+		// Named as the consequence, not as a failed check. "Verification
+		// failed" is a fact about a checker; this is the outage a renewal
+		// engine exists to prevent, arriving through one — the inventory says
+		// the certificate is fine and the server is still on the old one.
+		alert.Summary = fmt.Sprintf(
+			"%s was renewed successfully, and the server is still presenting the certificate it replaced. CertPilot's record looks healthy; what users get expires on the old schedule. The new certificate has to be installed.",
+			fallback(cn, "A certificate"))
+		alert.Fields = []Field{
+			{Label: "Common name", Value: fallback(cn, "—")},
+			{Label: "Still on the old certificate", Value: fallback(listText(payload, "endpoints"), "—")},
+			{Label: "New certificate expires", Value: dateText(str(payload, "not_after"))},
+		}
+
 	case events.TopicCertExpiring:
 		cn := str(payload, "common_name")
 		alert.Title = fmt.Sprintf("Certificate expiring: %s", fallback(cn, "unnamed"))

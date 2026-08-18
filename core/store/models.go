@@ -209,6 +209,30 @@ type Certificate struct {
 	// Collapsing those would make a CA that has never been checked look
 	// identical to one that has nothing to say.
 	ARISupported *bool `json:"ari_supported,omitempty"`
+
+	// VerificationState answers the only question that matters after a
+	// renewal: is the thing in front of the users actually serving the new
+	// certificate?
+	//
+	// PENDING, VERIFIED, STALE, UNREACHABLE, NO_ENDPOINTS. A renewal that
+	// stored a certificate the server never picked up is the failure this
+	// product exists to prevent, produced by this product — the inventory says
+	// ninety days remaining and the endpoint says twenty.
+	VerificationState string `json:"verification_state,omitempty"`
+	// VerifyAfter is when the next check may run, set on a successful renewal
+	// to now plus a grace period: a deployment done by hand does not happen in
+	// the same second as the issuance.
+	VerifyAfter          *time.Time `json:"verify_after,omitempty"`
+	LastVerifiedAt       *time.Time `json:"last_verified_at,omitempty"`
+	VerificationAttempts int        `json:"verification_attempts"`
+	// VerificationDetail names the endpoints and what they were serving, so the
+	// state does not have to be interpreted from a code.
+	VerificationDetail string `json:"verification_detail,omitempty"`
+	// PreviousFingerprint is what this certificate replaced, captured at
+	// renewal. It is what makes "still serving the old one" distinguishable
+	// from "something else entirely is here" — and the second is a different
+	// problem deserving different words.
+	PreviousFingerprint string `json:"previous_fingerprint,omitempty"`
 }
 
 // DeploymentTarget represents where certs are installed.
@@ -1038,4 +1062,27 @@ type RenewalJobFilter struct {
 	EscalatedOnly bool
 	Limit         int
 	Offset        int
+}
+
+// Verification states for a renewed certificate.
+const (
+	VerificationPending     = "PENDING"
+	VerificationVerified    = "VERIFIED"
+	VerificationStale       = "STALE"
+	VerificationUnreachable = "UNREACHABLE"
+	VerificationNoEndpoints = "NO_ENDPOINTS"
+)
+
+// VerificationUpdate is what one verification pass learned — or, when a renewal
+// schedules the first one, what it should look for.
+type VerificationUpdate struct {
+	State       string
+	Detail      string
+	CheckedAt   time.Time
+	VerifyAfter *time.Time
+	Attempts    int
+	// PreviousFingerprint is written only when non-empty, because it is set
+	// once by the renewal that scheduled the check and must survive every pass
+	// that follows.
+	PreviousFingerprint string
 }

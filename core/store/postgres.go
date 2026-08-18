@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,7 +88,10 @@ const certificateColumns = `id, fingerprint_sha256, common_name,
 		coalesce(discovered_via, 'MANUAL'), coalesce(environment, ''), coalesce(team, ''),
 		coalesce(tags, '[]'::jsonb), created_by, created_at, updated_at,
 		renewal_scheduled_at, ari_window_start, ari_window_end,
-		coalesce(ari_explanation_url, ''), ari_checked_at, ari_next_check_at, ari_supported`
+		coalesce(ari_explanation_url, ''), ari_checked_at, ari_next_check_at, ari_supported,
+		coalesce(verification_state, ''), verify_after, last_verified_at,
+		coalesce(verification_attempts, 0), coalesce(verification_detail, ''),
+		coalesce(previous_fingerprint, '')`
 
 // scanCertificate reads one row of certificateColumns.
 func scanCertificate(row pgx.Row) (*Certificate, error) {
@@ -101,6 +105,8 @@ func scanCertificate(row pgx.Row) (*Certificate, error) {
 		&cert.DiscoveredVia, &cert.Environment, &cert.Team, &tagsJSON, &cert.CreatedBy, &cert.CreatedAt, &cert.UpdatedAt,
 		&cert.RenewalScheduledAt, &cert.ARIWindowStart, &cert.ARIWindowEnd,
 		&cert.ARIExplanationURL, &cert.ARICheckedAt, &cert.ARINextCheckAt, &cert.ARISupported,
+		&cert.VerificationState, &cert.VerifyAfter, &cert.LastVerifiedAt,
+		&cert.VerificationAttempts, &cert.VerificationDetail, &cert.PreviousFingerprint,
 	)
 	if err != nil {
 		return nil, err
@@ -2820,4 +2826,100 @@ func (s *PostgresStore) GetCertificatesDueForARICheck(ctx context.Context, now t
 		certs = append(certs, cert)
 	}
 	return certs, rows.Err()
+}
+
+func (s *PostgresStore) GetCertificatesDueForVerification(ctx context.Context, now time.Time, limit int) ([]*Certificate, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+certificateColumns+`
+		FROM public.certificates
+		WHERE verify_after IS NOT NULL AND verify_after <= $1
+		ORDER BY verify_after ASC
+		LIMIT $2`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	certs := []*Certificate{}
+	for rows.Next() {
+		cert, err := scanCertificate(rows)
+		if err != nil {
+			return nil, err
+		}
+		certs = append(certs, cert)
+	}
+	return certs, rows.Err()
+}
+
+// UpdateCertificateVerification records the outcome of one verification pass.
+//
+// Narrow rather than a full UpdateCertificate for the same reason the renewal
+// information writer is: the verifier runs concurrently with everything else,
+// and a whole-row write from a stale copy would undo a renewal that completed
+// while it was probing.
+func (s *PostgresStore) UpdateCertificateVerification(ctx context.Context, id string, update VerificationUpdate) error {
+	// previous_fingerprint is coalesced rather than overwritten: it is set once
+	// by the renewal that scheduled the check, and every pass afterwards has to
+	// keep it in order to tell "still on the old certificate" from "something
+	// else is here".
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.certificates
+		SET verification_state = $2,
+		    verification_detail = $3,
+		    last_verified_at = $4,
+		    verify_after = $5,
+		    verification_attempts = $6,
+		    previous_fingerprint = coalesce($7, previous_fingerprint),
+		    updated_at = now()
+		WHERE id = $1`,
+		id, nullIfEmpty(update.State), nullIfEmpty(update.Detail),
+		update.CheckedAt, update.VerifyAfter, update.Attempts,
+		nullIfEmpty(update.PreviousFingerprint))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("certificate %s not found", id)
+	}
+	return nil
+}
+
+// GetEndpointsServingCertificate returns the endpoints discovery last observed
+// serving one certificate.
+//
+// DISTINCT ON keeps only the newest observation of each host and port: an
+// endpoint scanned nightly for a month would otherwise appear thirty times and
+// be probed thirty times to answer one question.
+//
+// Matched on either the link discovery drew to inventory or the raw
+// fingerprint, because a certificate found before it was adopted has the second
+// and not the first.
+func (s *PostgresStore) GetEndpointsServingCertificate(ctx context.Context, certificateID, fingerprint string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT host, port FROM (
+			SELECT DISTINCT ON (host, port) host, port, matched_certificate_id, fingerprint_sha256
+			FROM public.discovery_results
+			WHERE reachable
+			ORDER BY host, port, scanned_at DESC
+		) latest
+		WHERE matched_certificate_id = $1
+		   OR ($2 <> '' AND fingerprint_sha256 = $2)`, certificateID, fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	endpoints := []string{}
+	for rows.Next() {
+		var host string
+		var port int
+		if err := rows.Scan(&host, &port); err != nil {
+			return nil, err
+		}
+		endpoints = append(endpoints, net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+	return endpoints, rows.Err()
 }

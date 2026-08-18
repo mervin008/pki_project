@@ -12,6 +12,7 @@ import (
 
 	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/store"
+	"github.com/certpilot/certpilot/pkg/x509util"
 )
 
 // Finding codes. Stable identifiers: a dashboard filter, an alert rule, and a
@@ -544,4 +545,19 @@ func humanDuration(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%d hours", int(d.Hours()))
 	}
+}
+
+// FingerprintSHA256 renders a certificate's SHA-256 fingerprint in the form
+// CertPilot stores and compares on.
+//
+// Exported because it is the identity the whole system agrees on: discovery
+// decides managed-or-not with it, cloud inventory matches on it, and
+// post-renewal verification asks with it whether the certificate a server is
+// presenting is the one that was just issued. Two spellings of that would be
+// two answers to the same question.
+func FingerprintSHA256(cert *x509.Certificate) string {
+	if cert == nil {
+		return ""
+	}
+	return x509util.CertInfoFromX509(cert).FingerprintSHA256
 }

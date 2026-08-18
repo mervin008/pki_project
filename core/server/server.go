@@ -37,6 +37,7 @@ type Server struct {
 	renewalSched *renewal.Scheduler
 	renewalQueue *renewal.Queue
 	ariPoller    *renewal.ARIPoller
+	verifier     *renewal.Verifier
 	scanner      *discovery.Scanner
 	discoverySch *discovery.Scheduler
 	ctMonitor    *ctlog.Monitor
@@ -130,6 +131,11 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	// The scanner publishes progress so a range scan is visible while it runs,
 	// not only once it is over.
 	scanner := discovery.NewScanner(st, discovery.WithBroker(broker))
+	// And the part that closes the loop: a renewal is not done when the
+	// certificate is stored, it is done when the thing serving it is serving
+	// it. Uses the discovery scanner, because "what is this endpoint actually
+	// presenting" is a question already answered well.
+	verifier := renewal.NewVerifier(st, scanner, broker)
 	// Discovery run once is a snapshot; run on a schedule it is monitoring.
 	discoverySch := discovery.NewScheduler(st, scanner)
 	// Certificate Transparency reaches what a scan cannot: certificates issued
@@ -168,6 +174,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		RenewalSched:  renewalSched,
 		RenewalQueue:  renewalQueue,
 		ARIPoller:     ariPoller,
+		Verifier:      verifier,
 		PolicyEngine:  policyEng,
 		Scanner:       scanner,
 		CTMonitor:     ctMonitor,
@@ -199,6 +206,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		renewalSched: renewalSched,
 		renewalQueue: renewalQueue,
 		ariPoller:    ariPoller,
+		verifier:     verifier,
 		scanner:      scanner,
 		discoverySch: discoverySch,
 		ctMonitor:    ctMonitor,
@@ -247,6 +255,7 @@ func (s *Server) Start() error {
 	s.renewalSched.Start(scanInterval)
 	s.renewalQueue.Start()
 	s.ariPoller.Start()
+	s.verifier.Start()
 
 	// An expiring CA takes down everything it signs, so this sweep has to run
 	// on a timer rather than waiting for someone to open the dashboard.
@@ -281,6 +290,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.renewalSched.Stop()
 	s.renewalQueue.Stop()
 	s.ariPoller.Stop()
+	s.verifier.Stop()
 	s.caMonitor.Stop()
 	s.discoverySch.Stop()
 	s.ctMonitor.Stop()

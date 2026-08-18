@@ -271,6 +271,18 @@ type Store interface {
 	// asking.
 	UpdateCertificateRenewalInfo(ctx context.Context, id string, info RenewalInfoUpdate) error
 
+	// ── Post-renewal verification ───────────────────────────
+
+	// GetCertificatesDueForVerification returns certificates whose deployment
+	// should be checked.
+	GetCertificatesDueForVerification(ctx context.Context, now time.Time, limit int) ([]*Certificate, error)
+	// UpdateCertificateVerification records the outcome of one pass.
+	UpdateCertificateVerification(ctx context.Context, id string, update VerificationUpdate) error
+	// GetEndpointsServingCertificate returns the endpoints discovery last
+	// observed serving one certificate — the only endpoints CertPilot has any
+	// business connecting to in order to check a renewal reached them.
+	GetEndpointsServingCertificate(ctx context.Context, certificateID, fingerprint string) ([]string, error)
+
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)
