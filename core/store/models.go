@@ -235,17 +235,40 @@ type Certificate struct {
 	PreviousFingerprint string `json:"previous_fingerprint,omitempty"`
 }
 
-// DeploymentTarget represents where certs are installed.
+// DeploymentTarget is one place certificates are installed.
+//
+// Deployment is where CertPilot stops observing and starts changing something
+// that is currently carrying traffic, so a target carries more than an address:
+// whether it is switched on, what went wrong last time, and whether private key
+// material passes through it.
 type DeploymentTarget struct {
-	ID                   string     `json:"id"`
-	Name                 string     `json:"name"`
-	TargetType           string     `json:"target_type"` // filesystem, aws_acm, kubernetes, etc.
-	ConfigEncrypted      string     `json:"-"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	TargetType  string `json:"target_type"` // webhook, kubernetes, aws_acm, azure_kv, gcp_lb, filesystem
+	// ConfigEncrypted is sealed with the keyring under
+	// secrets.ContextDeploymentConfig. Read access to this row is not access to
+	// whatever the target authenticates against.
+	ConfigEncrypted string `json:"-"`
+	IsEnabled       bool   `json:"is_enabled"`
+
+	// DeploysPrivateKey records whether this target receives key material.
+	//
+	// Stored rather than derived from the sealed config, so "where does this
+	// organisation ship private keys" is answerable by reading the target list
+	// — without the KEK, and without decrypting anything.
+	DeploysPrivateKey bool `json:"deploys_private_key"`
+
+	// Attempted versus succeeded. A target that has been failing all week must
+	// not read as one that simply has had nothing to do.
 	LastDeploymentAt     *time.Time `json:"last_deployment_at,omitempty"`
 	LastDeploymentStatus *string    `json:"last_deployment_status,omitempty"`
-	CreatedBy            *string    `json:"created_by,omitempty"`
-	CreatedAt            time.Time  `json:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at"`
+	LastDeploymentError  string     `json:"last_deployment_error,omitempty"`
+	LastSuccessAt        *time.Time `json:"last_success_at,omitempty"`
+
+	CreatedBy *string   `json:"created_by,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Policy represents a security/compliance policy rule.
@@ -1085,4 +1108,157 @@ type VerificationUpdate struct {
 	// once by the renewal that scheduled the check and must survive every pass
 	// that follows.
 	PreviousFingerprint string
+}
+
+// ── Deployment ──────────────────────────────────────────────
+
+// Binding states: what one place was last known to be holding.
+const (
+	DeploymentPending  = "PENDING"
+	DeploymentDeployed = "DEPLOYED"
+	DeploymentFailed   = "FAILED"
+)
+
+// Deployment job states.
+const (
+	DeployPending   = "PENDING"
+	DeployRunning   = "RUNNING"
+	DeploySucceeded = "SUCCEEDED"
+	DeployFailed    = "FAILED"
+	DeployCancelled = "CANCELLED"
+)
+
+// Why a deployment job exists.
+const (
+	DeployReasonRenewal = "RENEWAL"
+	DeployReasonManual  = "MANUAL"
+	DeployReasonRetry   = "RETRY"
+	DeployReasonDrift   = "DRIFT"
+)
+
+// CertificateDeployment binds one certificate to one target.
+//
+// The binding, rather than a column on the certificate, because one wildcard on
+// six load balancers is six deployments with six outcomes. A single deployed_at
+// on the certificate would average them into a number that is true of nowhere.
+type CertificateDeployment struct {
+	ID            string `json:"id"`
+	CertificateID string `json:"certificate_id"`
+	TargetID      string `json:"target_id"`
+	IsEnabled     bool   `json:"is_enabled"`
+
+	// Options is per-binding placement — which secret in which namespace, which
+	// path. Deliberately not a place for credentials: those belong to the
+	// target, which is the thing that holds a connection.
+	Options map[string]any `json:"options,omitempty"`
+
+	// DeployedFingerprint is what this place was last confirmed to hold.
+	//
+	// Confirmed by a deploy that returned success, which is a claim about what
+	// was sent — not evidence about what is being served. The evidence comes
+	// from the verifier, which opens a connection and looks.
+	DeployedFingerprint string     `json:"deployed_fingerprint,omitempty"`
+	DeployedAt          *time.Time `json:"deployed_at,omitempty"`
+
+	LastStatus string `json:"last_status,omitempty"`
+	LastError  string `json:"last_error,omitempty"`
+
+	// TargetName and TargetType are joined in for listings, so a page showing
+	// where a certificate goes does not have to issue one lookup per row.
+	TargetName string `json:"target_name,omitempty"`
+	TargetType string `json:"target_type,omitempty"`
+
+	CreatedBy *string   `json:"created_by,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// DeploymentOutcome is what one deploy attempt did to a binding.
+//
+// Narrow rather than a full row write: the queue runs concurrently with
+// whoever is editing the binding, and a full-row update would let a stale copy
+// in a worker's hand overwrite an options change made while it was deploying.
+type DeploymentOutcome struct {
+	Status string
+	// Fingerprint is written only on success, and is what the target now holds.
+	Fingerprint string
+	Error       string
+	At          time.Time
+}
+
+// DeploymentAttempt is one try at installing a certificate somewhere.
+type DeploymentAttempt struct {
+	Number     int       `json:"number"`
+	StartedAt  time.Time `json:"started_at"`
+	DurationMS int64     `json:"duration_ms"`
+	// Worker names the process that made the attempt, so a failure isolated to
+	// one replica is visible as one.
+	Worker string `json:"worker,omitempty"`
+	// Detail is what the target said on success — the secret that was written,
+	// the status the receiver returned. Kept because "it worked" without a
+	// subject is not something anybody can check.
+	Detail string `json:"detail,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// DeploymentJob is one installation that has been asked for and not finished.
+//
+// Durable for the same reason a renewal is: a process that dies mid-deploy must
+// leave behind something another process can pick up. Held per binding rather
+// than per certificate — one certificate going to six targets is six jobs, all
+// outstanding at once.
+type DeploymentJob struct {
+	ID            string `json:"id"`
+	DeploymentID  string `json:"deployment_id"`
+	CertificateID string `json:"certificate_id"`
+	TargetID      string `json:"target_id"`
+	Reason        string `json:"reason"`
+	Status        string `json:"status"`
+
+	RunAfter time.Time `json:"run_after"`
+	Attempts int       `json:"attempts"`
+
+	LockedBy    *string    `json:"locked_by,omitempty"`
+	LockedUntil *time.Time `json:"locked_until,omitempty"`
+
+	LastError  string              `json:"last_error,omitempty"`
+	AttemptLog []DeploymentAttempt `json:"attempt_log"`
+
+	// Fingerprint is what this job is trying to install, captured at enqueue.
+	// Not read off the certificate at run time: a job enqueued by a renewal is
+	// for that renewal's certificate, and if a newer one exists there is a
+	// newer job behind this one.
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// NotAfter is the expiry being raced, so the queue orders by urgency
+	// without a join.
+	NotAfter *time.Time `json:"not_after,omitempty"`
+
+	EscalatedAt *time.Time `json:"escalated_at,omitempty"`
+
+	TriggeredBy *string `json:"triggered_by,omitempty"`
+	ActorEmail  *string `json:"actor_email,omitempty"`
+
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+// Outstanding reports whether this job still has work left in it.
+func (j *DeploymentJob) Outstanding() bool {
+	return j != nil && (j.Status == DeployPending || j.Status == DeployRunning)
+}
+
+// DeploymentJobFilter narrows a listing.
+type DeploymentJobFilter struct {
+	CertificateID string
+	TargetID      string
+	DeploymentID  string
+	Status        string
+	// OutstandingOnly returns the queue rather than its history.
+	OutstandingOnly bool
+	// EscalatedOnly returns the jobs somebody needs to look at.
+	EscalatedOnly bool
+	Limit         int
+	Offset        int
 }

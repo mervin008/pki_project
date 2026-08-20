@@ -44,8 +44,24 @@ const (
 	// one: the inventory says ninety days remaining, the endpoint says twenty,
 	// and the dashboard is green.
 	TopicCertNotDeployed = "cert.not_deployed"
-	TopicCertExpiring    = "cert.expiring"
-	TopicGatewayStatus   = "gateway.status"
+	// TopicCertDeployed carries a certificate that reached a target and was
+	// accepted by it.
+	//
+	// Deliberately INFO, and deliberately not the same news as
+	// TopicCertNotDeployed being absent. This says bytes were accepted by the
+	// thing CertPilot talked to; whether the process in front of the users has
+	// picked them up is a question only the verifier can answer, by opening a
+	// connection and looking.
+	TopicCertDeployed = "cert.deployed"
+	// TopicCertDeployFailed carries a deployment that has stopped being a blip.
+	//
+	// Distinct from a renewal failure, because the fix is somewhere else and
+	// usually belongs to somebody else: a renewal failure is between CertPilot
+	// and a CA, a deployment failure is between CertPilot and a machine
+	// somebody in the organisation operates.
+	TopicCertDeployFailed = "cert.deploy_failed"
+	TopicCertExpiring     = "cert.expiring"
+	TopicGatewayStatus    = "gateway.status"
 	// TopicDiscoveryUnmanaged carries the one finding a discovery scan exists
 	// to produce: an endpoint serving a certificate this system has never seen.
 	// Published so it reaches the channels a team already configured, rather
@@ -127,6 +143,8 @@ func AllTopics() []string {
 		TopicCertRenewFail,
 		TopicCertRenewalWindowMoved,
 		TopicCertNotDeployed,
+		TopicCertDeployed,
+		TopicCertDeployFailed,
 		TopicCertExpiring,
 		TopicGatewayStatus,
 		TopicDiscoveryUnmanaged,

@@ -84,8 +84,9 @@ make migrate
   applied  014_renewal_pacing.sql
   applied  015_renewal_information.sql
   applied  016_renewal_verification.sql
+  applied  017_deployment.sql
 
-Applied 16 migration(s).
+Applied 17 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so
@@ -298,6 +299,27 @@ the second takes the next row rather than blocking or duplicating. The second
 A leader would have given one replica all the work and a failover window during
 which no certificate renews at all. These two lines give N equal workers and no
 window.
+
+### Migration 017 and an index that had to differ from the one above it
+
+`deployment_jobs` is `renewal_jobs` with one line changed, and that line is the
+whole design.
+
+Renewal's partial unique index is on `certificate_id`: at most one outstanding
+renewal per certificate, because a second one issues a second certificate
+against a weekly quota. Deployment is the opposite case. A wildcard bound to six
+load balancers needs six jobs outstanding at once, so the index is on
+`deployment_id` — the *binding*, the place — and copying the renewal queue
+verbatim would have produced a system that deployed to whichever target got
+there first and discarded the other five without an error, a log line, or a row.
+
+The same reasoning is why `certificate_deployments` exists at all rather than
+three more columns on `certificates`. Migration 001 modelled deployment as
+`certificates.deployment_target_id`: one certificate, one place. Six places have
+six outcomes and six fingerprints, and a single `deployed_at` averages them into
+a value that is true of nowhere. That column survives — nothing in the
+deployment path reads it — and is listed in the roadmap's known gaps for
+removal.
 
 ### Migration 016 and a column list that quietly dropped writes
 

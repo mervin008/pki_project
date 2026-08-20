@@ -3,9 +3,6 @@ package notifications
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,16 +11,22 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/certpilot/certpilot/pkg/webhooksig"
 )
 
 // Headers on a signed webhook delivery.
+//
+// Aliases of the shared definitions: alerts and deployments sign identically,
+// and an integrator who writes one verifier should not discover that the other
+// feature spells the header differently.
 const (
 	// WebhookSignatureHeader carries the hex HMAC-SHA256.
-	WebhookSignatureHeader = "X-CertPilot-Signature"
+	WebhookSignatureHeader = webhooksig.SignatureHeader
 	// WebhookTimestampHeader carries the Unix seconds the signature covers.
-	WebhookTimestampHeader = "X-CertPilot-Timestamp"
+	WebhookTimestampHeader = webhooksig.TimestampHeader
 	// WebhookEventHeader lets a receiver route without parsing the body.
-	WebhookEventHeader = "X-CertPilot-Event"
+	WebhookEventHeader = webhooksig.EventHeader
 )
 
 // reservedWebhookHeaders are set by CertPilot and may not come from config.
@@ -175,45 +178,19 @@ func (w *webhookNotifier) Send(ctx context.Context, alert Alert) error {
 
 // SignWebhook returns the hex HMAC-SHA256 a receiver should reproduce.
 //
-// The timestamp is inside the signed string, not merely alongside it. Signing
-// the body alone yields a signature that stays valid forever, so anyone who
-// captures one delivery can replay it indefinitely and the receiver cannot tell.
-// With the timestamp covered, a receiver rejects anything older than its own
-// tolerance and replay becomes bounded.
-//
-// The signed string is exactly:
-//
-//	<unix-seconds> "." <raw request body>
-//
-// Exported so a receiver written in Go can call it, and so the test suite
-// verifies the same function an integrator would.
+// The signed string is `<unix-seconds> "." <raw request body>`: the timestamp
+// is inside it, not merely alongside, so a captured delivery cannot be replayed
+// indefinitely. See package webhooksig for the full reasoning — the scheme
+// lives there because deployments sign the same way, and two copies of a
+// signature format is how an integrator ends up with a verifier that works for
+// one feature and not for the other.
 func SignWebhook(secret, timestamp string, body []byte) string {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(timestamp))
-	mac.Write([]byte("."))
-	mac.Write(body)
-	return hex.EncodeToString(mac.Sum(nil))
+	return webhooksig.Sign(secret, timestamp, body)
 }
 
 // VerifyWebhook checks a signature in constant time and enforces a freshness
 // window. Provided so the property the sender promises is testable, and so a Go
 // receiver has no reason to hand-roll the comparison with ==.
 func VerifyWebhook(secret, timestamp, signature string, body []byte, tolerance time.Duration) error {
-	seconds, err := strconv.ParseInt(timestamp, 10, 64)
-	if err != nil {
-		return fmt.Errorf("timestamp is not valid: %w", err)
-	}
-	age := time.Since(time.Unix(seconds, 0))
-	if age < 0 {
-		age = -age
-	}
-	if tolerance > 0 && age > tolerance {
-		return fmt.Errorf("timestamp is %s outside the tolerance of %s", age.Round(time.Second), tolerance)
-	}
-
-	want := SignWebhook(secret, timestamp, body)
-	if !hmac.Equal([]byte(want), []byte(signature)) {
-		return fmt.Errorf("signature does not match")
-	}
-	return nil
+	return webhooksig.Verify(secret, timestamp, signature, body, tolerance)
 }

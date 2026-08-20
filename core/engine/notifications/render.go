@@ -137,6 +137,41 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "New certificate expires", Value: dateText(str(payload, "not_after"))},
 		}
 
+	case events.TopicCertDeployed:
+		cn := str(payload, "common_name")
+		target := fallback(str(payload, "target"), "a target")
+		alert.Title = fmt.Sprintf("Certificate deployed: %s", fallback(cn, "unnamed"))
+		// Says what happened and not one word more. The target accepted the
+		// certificate; whether the process in front of the users has picked it
+		// up is a different question, and a message that blurred the two would
+		// be this product telling the reassuring half of the story.
+		alert.Summary = fmt.Sprintf("%s was installed at %s and accepted.",
+			fallback(cn, "A certificate"), target)
+		alert.Fields = []Field{
+			{Label: "Common name", Value: fallback(cn, "—")},
+			{Label: "Target", Value: target},
+			{Label: "Where", Value: fallback(str(payload, "where"), "—")},
+		}
+
+	case events.TopicCertDeployFailed:
+		cn := str(payload, "common_name")
+		target := fallback(str(payload, "target"), "a target")
+		alert.Title = fmt.Sprintf("Cannot install %s at %s", fallback(cn, "a certificate"), target)
+		// Phrased around the certificate's clock, because that is what makes
+		// this urgent. A deployment that keeps failing is not an integration
+		// annoyance; it is a certificate that exists, is valid, and is not
+		// where it needs to be, running down the same schedule as one that was
+		// never renewed at all.
+		alert.Summary = fmt.Sprintf(
+			"%s has failed to install at %s %s. The certificate is fine; what is serving it is not being updated, so it expires on the schedule of whatever is there now.",
+			fallback(cn, "A certificate"), target, attemptsText(num(payload, "attempts")))
+		alert.Fields = []Field{
+			{Label: "Common name", Value: fallback(cn, "—")},
+			{Label: "Target", Value: target},
+			{Label: "Certificate expires", Value: dateText(str(payload, "not_after"))},
+			{Label: "Last error", Value: fallback(str(payload, "error"), "—")},
+		}
+
 	case events.TopicCertExpiring:
 		cn := str(payload, "common_name")
 		alert.Title = fmt.Sprintf("Certificate expiring: %s", fallback(cn, "unnamed"))
@@ -536,4 +571,20 @@ func momentText(value string) string {
 		return value
 	}
 	return ts.Local().Format("2 January 2006, 15:04 MST")
+}
+
+// attemptsText phrases a repeat count the way somebody would say it.
+//
+// "failed 1 times" is the kind of sentence that makes a reader stop trusting
+// everything else in the message.
+func attemptsText(attempts float64) string {
+	n := int(attempts)
+	switch {
+	case n <= 1:
+		return "once"
+	case n == 2:
+		return "twice"
+	default:
+		return fmt.Sprintf("%d times", n)
+	}
 }

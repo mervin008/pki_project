@@ -94,7 +94,7 @@ explicitly.
 | RBAC | ✅ | admin / operator / auditor / viewer, enforced per route |
 | Audit log | ⚠️ | Recorded, but the table is not yet tamper-evident |
 | Ownership and acknowledgement | ✅ | Who owns a CA, who acknowledged an alert and why. Silencing suppresses delivery only — an acknowledged CA never leaves the dashboard |
-| Automated renewal | ⚠️ | Works; no retry, backoff, or distributed locking yet |
+| Automated renewal | ✅ | Durable queue, leases, deadline-aware backoff, ARI, and post-renewal verification. Safe on N replicas with no leader |
 | CA health monitoring | ⚠️ | Scheduled sweep, expiry thresholds, and CRL freshness are real; the OCSP check is not a real OCSP request |
 | CA expiry alerting | ✅ | Threshold crossings are delivered to Slack, a signed webhook, or email over SMTP, with per-channel severity and topic filters |
 | Live dashboard updates | ✅ | Server-Sent Events end to end. The client tracks data age independently, so a dead feed degrades the surface instead of freezing it on green |
@@ -109,7 +109,7 @@ explicitly.
 | Renewal queue | ✅ | Durable jobs with leases, an attempt log, and backoff that tightens as expiry approaches. Safe on N replicas with no leader. Per-CA rate limits defer rather than fail |
 | Post-renewal verification | ✅ | Re-probes the endpoints discovery has seen serving a certificate and reports when a renewal never reached them — the green-dashboard-over-an-expiring-estate failure, caught |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
-| Deployment to servers | ❌ | Not started |
+| Deployment to servers | ⚠️ | Durable, retried, audited deployment to a generic signed webhook — enough for anything you can put an HTTP receiver in front of. Kubernetes, ACM, Key Vault and F5 are next; deployment is triggered by hand, not yet by renewal |
 | Host agent | ❌ | Not started |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
 | Vault, GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
@@ -577,10 +577,10 @@ this certificate moved to another CA account.
 
 It is done when the thing serving it is serving it.
 
-CertPilot deploys nothing yet, so a successful renewal routinely leaves a new
-certificate in the database and the old one in front of the users — expiring on
-the old schedule, under a green dashboard. That is the failure this whole
-product exists to prevent, arriving through its own renewal engine.
+A successful renewal can quite happily leave a new certificate in the database
+and the old one in front of the users — expiring on the old schedule, under a
+green dashboard. That is the failure this whole product exists to prevent,
+arriving through its own renewal engine.
 
 So every renewal schedules a check, and the check re-probes **the endpoints
 discovery has actually observed serving that certificate**:
@@ -610,6 +610,77 @@ as `NO_ENDPOINTS` with the sentence that fixes it, because *"we cannot verify
 this"* is useful and a fabricated verification is not. An endpoint that does not
 answer is `UNREACHABLE`, never verified: silence is the one answer that must
 never be read as success.
+
+### Putting the certificate where it is served
+
+Renewal creates new material. **Deployment replaces material that is currently
+carrying traffic** — which is a different risk, and the reason nothing here is
+shared with the renewal path by accident.
+
+A deployment target is a place. A certificate is *bound* to targets, one row per
+place, because a wildcard on six load balancers is six outcomes and six
+fingerprints, and a single "deployed" flag on the certificate would average them
+into a number that is true of nowhere.
+
+```bash
+# Anything you can put an HTTP receiver in front of is a deployment target.
+curl -X POST localhost:8080/api/v1/deployment-targets -d '{
+  "name": "lab nginx",
+  "target_type": "webhook",
+  "config": {
+    "url": "https://deploy.internal/install",
+    "signing_secret": "…",
+    "include_private_key": true
+  }}'
+
+curl -X POST localhost:8080/api/v1/certificates/$ID/targets \
+  -d '{"target_id":"…","options":{"path":"/etc/nginx/certs/app"}}'
+
+curl -X POST localhost:8080/api/v1/certificates/$ID/deploy
+```
+```json
+202 Accepted
+{ "queued": 1, "message": "app.example.com: queued for 1 target." }
+```
+
+Queued, not done: eight targets is eight machines that may each need a reload,
+and a synchronous handler cut off partway leaves half an estate updated with no
+way to say which half. Deployments are durable rows with leases, an attempt log,
+and the same deadline-aware backoff renewal uses — a certificate that has been
+renewed and not installed runs down exactly the clock of one that was never
+renewed at all.
+
+Ask a certificate where it stands and the answer is about places:
+
+```
+GET /api/v1/certificates/$ID/targets
+"1 target: 1 holding an older certificate."
+```
+
+That sentence costs no network at all — it compares recorded fingerprints. The
+verifier above reaches the same conclusion by opening a connection. **Two
+independent kinds of evidence, and they should agree**; when they do not, that
+itself is worth knowing.
+
+Two rules on the webhook deployer are stricter than on the notification webhook,
+and both follow from what the endpoint can *do*:
+
+- **Signing is mandatory.** An unsigned alert webhook lets a receiver act on a
+  fabricated alert. An unsigned deployment webhook lets anyone who can reach the
+  receiver install *their* certificate and *their* key under *your* hostname.
+- **Private keys do not cross plaintext HTTP off the machine.** The exception is
+  a loopback address, where there is no wire. A name that merely resolves to
+  loopback today does not count.
+
+And `deploys_private_key` is a plain column on the target, not something derived
+from the sealed config, so **"where does this organisation send private keys"**
+can be answered by reading a list — without holding the KEK, and without
+decrypting a single credential.
+
+```
+GET /api/v1/deployment-targets
+{ "count": 6, "carrying_private_key": 1 }
+```
 
 ## Security model
 
@@ -787,11 +858,13 @@ frame parsing, CA chain resolution, and the display-token client.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). The monitoring milestone is complete: a streaming
-dashboard, a CA health view, a wall display, alert delivery to Slack / SMTP /
-signed webhooks, and ownership with acknowledgement. Next is a renewal engine
-that survives 47-day certificates — durable job queue, leader election, backoff,
-and post-renewal verification.
+See [ROADMAP.md](ROADMAP.md). Monitoring, discovery, and the renewal engine are
+complete: a streaming dashboard and wall display, network / CT / cloud
+discovery, and renewal as a durable queue with ARI and post-renewal
+verification. Deployment has begun — a certificate can now be installed
+somewhere, durably and with an attempt log — and the rest of that phase is the
+deployers that reach real infrastructure, then the agent that generates keys
+locally so private keys never traverse the network.
 
 ## License
 

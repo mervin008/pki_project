@@ -674,16 +674,108 @@ has weeks rather than months before it is noticed.
 ### Phase 6 — Deployment, then the agent
 
 Renewal that does not reach the server is only half the job, and this is where
-the commercial tools earn their price.
+the commercial tools earn their price. Phase 4 ended by being able to say,
+honestly, that a renewal had not reached the server. This is the phase that can
+do something about it.
 
-- Agentless deployers first: Kubernetes, ACM, Azure Key Vault, F5, generic webhook
-- Then the agent: one binary that enrols over mTLS, inventories certificate
-  stores (filesystem, Java keystore, Windows store, nginx/Apache/HAProxy, IIS),
-  **generates keys locally so private keys never traverse the network**,
-  submits CSRs, installs renewals, and runs a reload hook
+| Step | | |
+|:---|:---|:---|
+| 1 | Deployment as a durable job, and the first target | ✅ |
+| 2 | The deployers that need no agent: Kubernetes, ACM, Azure Key Vault, F5 | |
+| 3 | Deploy on renewal, and the loop that proves it landed | |
+| 4 | The agent: enrolment, local key generation, install and reload | |
+
+One sentence governs the phase, and it is not the same sentence that governed
+phase 4:
+
+> **Renewal creates new material. Deployment replaces material that is
+> currently carrying traffic.**
+
+A renewal that goes wrong leaves a certificate nobody installed — bad, and
+recoverable by trying again. A deployment that goes wrong replaces a working
+certificate on a live listener. Everything in step 1 is shaped by that
+difference: nothing is deployed that has not been parsed, nothing is deployed
+without the key that matches it when a target needs one, every attempt is
+recorded against the *place* it was made, and success is reported as what it
+actually is.
+
+**Step 1** makes a deployment a row somebody owns, exactly as renewal is. The
+same durable queue, the same lease, the same attempt log, the same
+deadline-aware backoff — a certificate that has been renewed and not installed
+runs down precisely the same clock as one that was never renewed at all, so the
+retry curve tightens towards expiry for the same reason.
+
+The one place the renewal queue's shape would have been actively wrong is the
+partial unique index. Renewal allows one outstanding job per certificate,
+because a second renewal issues a second certificate. Deployment is the opposite
+case: **the index is on the binding, not the certificate.** A wildcard on six
+load balancers needs six jobs outstanding at once, and copying renewal's
+constraint would have deployed to the first target and dropped five without a
+word.
+
+That is also why `certificates.deployment_target_id` — one certificate, one
+place, since migration 001 — is superseded by a binding table. One certificate
+in six places has six outcomes, six fingerprints, and six ways to be
+half-finished. A single `deployed_at` on the certificate averages them into a
+number that is true of nowhere.
+
+**What is deployed is the certificate as it stands now, not the fingerprint the
+job recorded at enqueue.** If a second renewal happened while the job waited,
+installing what the job was created for would push an older certificate onto a
+live listener — and that renewal's own enqueue may well have been a no-op,
+because the binding already had a job outstanding. The captured fingerprint stays
+as provenance; it never selects the bytes.
+
+The first deployer is the generic signed webhook, which is the escape hatch: any
+receiver anybody can write fifteen lines of HTTP handler for becomes a
+deployment target. Two of its rules are stricter than the notification
+webhook's, and both follow from what the endpoint can *do* rather than what it
+carries:
+
+- **A signing secret is mandatory.** An unsigned alert webhook means a receiver
+  might act on a fabricated alert. An unsigned *deployment* webhook means anyone
+  who can reach the receiver can install a certificate on whatever it feeds —
+  their certificate, their key, your hostname.
+- **Private keys do not cross plaintext HTTP off the machine.** The exception is
+  a loopback address, where there is no wire; that is the local-agent case, and
+  refusing it would rule out the one topology where plaintext is harmless. A
+  hostname that merely resolves to loopback today does not count.
+
+`deployment_targets.deploys_private_key` is a plain column rather than something
+derived from the sealed config at read time, because **"which places does this
+organisation ship private keys to" has to be answerable with a SELECT** — by
+somebody who does not hold the KEK and cannot decrypt a single deployment
+credential.
+
+Verified live end to end against a receiver written independently in Python,
+which verified the documented HMAC itself: issue, bind, deploy, and the receiver
+installed it and brought up a TLS listener; scan so discovery links the
+endpoint; renew without deploying, and **both halves agreed from different
+evidence** — the binding said *"1 holding an older certificate"* from its
+recorded fingerprint with no network at all, and the verifier said **409 STALE**
+from an actual handshake. Deploy, and it went to `200 VERIFIED`. Then the
+receiver was made to refuse: three failures, the job stayed `PENDING`, one
+CRITICAL arrived, and the binding kept the fingerprint it was really holding
+rather than the one that failed to arrive. Signing the delivery with the wrong
+secret produced `401: bad signature` from the receiver and that exact sentence
+in the attempt log.
+
+Running it caught a defect the tests did not. The binding summary reported only
+what each place was holding, so a target that held the current certificate *and*
+had failed its last three deployments read as **"All 1 target hold the current
+certificate"** — true, reassuring, and precisely the half-told story this
+product exists to stop other tools telling. What a place holds and whether the
+last attempt to change it worked are two facts, and both belong in the sentence.
+
+**Still to come in this phase:** the deployers that reach real infrastructure
+without an agent, then the agent itself — one binary that enrols over mTLS,
+inventories certificate stores (filesystem, Java keystore, Windows store,
+nginx/Apache/HAProxy, IIS), **generates keys locally so private keys never
+traverse the network**, submits CSRs, installs renewals, and runs a reload hook.
 
 Local key generation is what makes this architecturally safer than the
-incumbents rather than merely cheaper.
+incumbents rather than merely cheaper — and it is the answer to the rule above
+about plaintext and loopback, rather than an exception to it.
 
 ### Phase 7 — More CAs
 
@@ -726,6 +818,16 @@ Tracked honestly rather than quietly:
 - Post-renewal verification only covers endpoints discovery has already
   observed. A certificate deployed somewhere nothing has scanned is reported as
   unverifiable rather than checked
+- A successful renewal does not yet enqueue its own deployments; deployment is
+  triggered by hand. That is phase 6 step 3, deliberately after the deployers
+  that reach real infrastructure exist — pushing automatically to production
+  through one newly written deployer is not a thing to switch on early
+- `certificates.deployment_target_id` survives from migration 001 and is no
+  longer the answer to where a certificate is deployed. It is unread by anything
+  in the deployment path and should be dropped once nothing else references it
+- Deployment is not staged. A certificate bound to forty targets goes to all
+  forty as fast as the workers drain the queue; there is no canary, no ordering,
+  and no pause between the first target and the rest
 - The OCSP responder check is an HTTP GET, not an RFC 6960 request, and reports
   responders as healthy that are not
 - `migrations/001_initial_schema.sql` references `auth.users` and `auth.jwt()`

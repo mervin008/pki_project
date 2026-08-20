@@ -11,6 +11,7 @@ import (
 	"github.com/certpilot/certpilot/core/api"
 	"github.com/certpilot/certpilot/core/engine/cloudsync"
 	"github.com/certpilot/certpilot/core/engine/ctlog"
+	"github.com/certpilot/certpilot/core/engine/deploy"
 	"github.com/certpilot/certpilot/core/engine/discovery"
 	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
@@ -42,6 +43,7 @@ type Server struct {
 	discoverySch *discovery.Scheduler
 	ctMonitor    *ctlog.Monitor
 	cloudEngine  *cloudsync.Engine
+	deployQueue  *deploy.Queue
 	cfg          *config.CoreConfig
 }
 
@@ -146,6 +148,11 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	// scan has an address for and no transparency log will ever mention if
 	// they came from an internal CA.
 	cloudEngine := cloudsync.NewEngine(st, keyring, cloudsync.WithBroker(broker))
+	// And the other half of renewal. Everything above observes; this changes
+	// something that is already carrying traffic, so it is a durable queue with
+	// leases and an attempt log for exactly the reasons renewal is.
+	deployExec := deploy.NewExecutor(st, keyring, broker)
+	deployQueue := deploy.NewQueue(st, deployExec, broker)
 
 	// The dispatcher is an ordinary broker subscriber. That is the point: it
 	// makes outbound HTTP and SMTP calls, and a wedged destination can only cost
@@ -211,6 +218,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		discoverySch: discoverySch,
 		ctMonitor:    ctMonitor,
 		cloudEngine:  cloudEngine,
+		deployQueue:  deployQueue,
 		cfg:          cfg,
 	}, nil
 }
@@ -271,6 +279,7 @@ func (s *Server) Start() error {
 	s.discoverySch.Start()
 	s.ctMonitor.Start()
 	s.cloudEngine.Start()
+	s.deployQueue.Start()
 
 	// After the producers, so nothing is published before there is anything
 	// subscribed to deliver it.
@@ -295,6 +304,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.discoverySch.Stop()
 	s.ctMonitor.Stop()
 	s.cloudEngine.Stop()
+	// After the renewal queue, which is what enqueues most deployments: a
+	// deployment enqueued during shutdown is not lost, but a worker claiming
+	// one it has no time to finish leaves a lease to expire before another
+	// replica can take it.
+	s.deployQueue.Stop()
 	// A range scan can run for minutes. Left alone it would hold the grace
 	// period open and then be killed mid-write anyway; cancelled, it records
 	// what it found and stops.

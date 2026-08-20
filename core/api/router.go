@@ -68,6 +68,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	ackHandler := NewAcknowledgementHandler(deps.Store)
 	ctHandler := NewCTHandler(deps.Store, deps.CTMonitor)
 	cloudHandler := NewCloudHandler(deps.Store, deps.CloudEngine, deps.Keyring)
+	deployHandler := NewDeploymentHandler(deps.Store, deps.Keyring)
 
 	v1 := engine.Group("/api/v1")
 	// Display tokens are resolved first, and only take effect when no
@@ -184,6 +185,37 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/certificates/:id/renewal-info", middleware.RequireRole(middleware.RoleOperator), renewalHandler.RefreshRenewalInfo)
 		// Check now whether a renewal actually reached the servers it was for.
 		v1.POST("/certificates/:id/verify", middleware.RequireRole(middleware.RoleOperator), renewalHandler.Verify)
+
+		// ── Deployment ──
+		// The other half of renewal. Everything above this line observes;
+		// this changes something that is already carrying traffic, which is
+		// why every write here is operator or admin and every one is audited.
+		//
+		// Reading is open to any authenticated user: the target list carries
+		// names, types, and whether a target receives private keys — never the
+		// sealed credentials themselves.
+		v1.GET("/deployment-targets", deployHandler.ListTargets)
+		v1.POST("/deployment-targets", middleware.RequireRole(middleware.RoleOperator), deployHandler.CreateTarget)
+		v1.PUT("/deployment-targets/:id", middleware.RequireRole(middleware.RoleOperator), deployHandler.UpdateTarget)
+		// Admin to delete: removing a target silently stops every certificate
+		// bound to it from being deployed anywhere, and renewals carry on
+		// looking healthy.
+		v1.DELETE("/deployment-targets/:id", middleware.RequireRole(middleware.RoleAdmin), deployHandler.DeleteTarget)
+
+		// Where one certificate goes. Bound and unbound at operator, because a
+		// binding is a standing instruction to write to somebody's machine.
+		v1.GET("/certificates/:id/targets", deployHandler.ListBindings)
+		v1.POST("/certificates/:id/targets", middleware.RequireRole(middleware.RoleOperator), deployHandler.CreateBinding)
+		v1.DELETE("/certificates/:id/targets/:bindingId", middleware.RequireRole(middleware.RoleOperator), deployHandler.DeleteBinding)
+		// Install it now. Queues rather than deploys: a certificate on eight
+		// targets is eight outbound calls that may each need a reload, and a
+		// synchronous handler would be cut off partway with half an estate
+		// updated and no way to say which half.
+		v1.POST("/certificates/:id/deploy", middleware.RequireRole(middleware.RoleOperator), deployHandler.Deploy)
+
+		v1.GET("/deployments", deployHandler.ListJobs)
+		v1.GET("/deployments/:id", deployHandler.GetJob)
+		v1.DELETE("/deployments/:id", middleware.RequireRole(middleware.RoleAdmin), deployHandler.CancelJob)
 
 		// ── Display Tokens ──
 		// Admin-only throughout: minting a credential that authenticates to

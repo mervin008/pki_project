@@ -148,8 +148,9 @@ func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.
 	}
 
 	// A renewal is not done when the certificate is stored. It is done when the
-	// thing serving it is serving it — and CertPilot deploys nothing yet, so
-	// that gap is the normal state rather than an edge case.
+	// thing serving it is serving it — and nothing here deploys it, so that gap
+	// is the normal state rather than an edge case. Deployment exists as its
+	// own queue; a renewal does not yet enqueue one.
 	//
 	// Written through the narrow verification writer rather than as fields on
 	// the row above. UpdateCertificate has an explicit column list, and adding

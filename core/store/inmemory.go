@@ -46,6 +46,9 @@ type MemoryStore struct {
 	cloudConnections   map[string]*CloudConnection
 	cloudCertificates  []*CloudCertificate
 	renewalJobs        []*RenewalJob
+	// Where certificates go, and the queue that puts them there.
+	deployments    map[string]*CertificateDeployment
+	deploymentJobs []*DeploymentJob
 }
 
 // clone returns a shallow copy of a stored record.
@@ -242,6 +245,10 @@ func NewMemoryStore() *MemoryStore {
 		// domain nobody asked it to watch.
 		ctMonitors:       make(map[string]*CTMonitor),
 		cloudConnections: make(map[string]*CloudConnection),
+		// Empty: a deployment target is a place this system writes to, and a
+		// seeded one would have a fresh install pushing certificates somewhere
+		// nobody configured.
+		deployments: make(map[string]*CertificateDeployment),
 	}
 }
 
@@ -624,7 +631,47 @@ func (m *MemoryStore) CreateDeploymentTarget(ctx context.Context, target *Deploy
 	if target.ID == "" {
 		target.ID = uuid.New().String()
 	}
+	now := time.Now()
+	if target.CreatedAt.IsZero() {
+		target.CreatedAt = now
+	}
+	target.UpdatedAt = now
 	m.targets[target.ID] = clone(target)
+	return nil
+}
+
+func (m *MemoryStore) UpdateDeploymentTarget(ctx context.Context, target *DeploymentTarget) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.targets[target.ID]; !ok {
+		return fmt.Errorf("deployment target %s not found", target.ID)
+	}
+	target.UpdatedAt = time.Now()
+	m.targets[target.ID] = clone(target)
+	return nil
+}
+
+func (m *MemoryStore) MarkDeploymentTargetUsed(ctx context.Context, id string,
+	at time.Time, success bool, detail string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	t, ok := m.targets[id]
+	if !ok {
+		return fmt.Errorf("deployment target %s not found", id)
+	}
+
+	when := at
+	status := DeploymentFailed
+	t.LastDeploymentError = detail
+	if success {
+		status = DeploymentDeployed
+		t.LastDeploymentError = ""
+		t.LastSuccessAt = &when
+	}
+	t.LastDeploymentAt = &when
+	t.LastDeploymentStatus = &status
+	t.UpdatedAt = time.Now()
 	return nil
 }
 
@@ -632,6 +679,14 @@ func (m *MemoryStore) DeleteDeploymentTarget(ctx context.Context, id string) err
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.targets, id)
+	// The bindings go with it. In PostgreSQL this is an ON DELETE CASCADE;
+	// leaving them here would let a certificate keep a deployment pointing at a
+	// target that no longer exists.
+	for did, d := range m.deployments {
+		if d.TargetID == id {
+			delete(m.deployments, did)
+		}
+	}
 	return nil
 }
 
@@ -2295,4 +2350,329 @@ func (m *MemoryStore) GetEndpointsServingCertificate(ctx context.Context, certif
 	}
 	sort.Strings(endpoints)
 	return endpoints, nil
+}
+
+// ── Certificate ↔ target bindings ───────────────────────────
+
+func (m *MemoryStore) ListCertificateDeployments(ctx context.Context, certificateID string) ([]*CertificateDeployment, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*CertificateDeployment, 0, len(m.deployments))
+	for _, d := range m.deployments {
+		if certificateID != "" && d.CertificateID != certificateID {
+			continue
+		}
+		copied := clone(d)
+		m.decorateDeploymentLocked(copied)
+		out = append(out, copied)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TargetName != out[j].TargetName {
+			return out[i].TargetName < out[j].TargetName
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (m *MemoryStore) GetCertificateDeployment(ctx context.Context, id string) (*CertificateDeployment, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	d, ok := m.deployments[id]
+	if !ok {
+		return nil, fmt.Errorf("deployment %s not found", id)
+	}
+	copied := clone(d)
+	m.decorateDeploymentLocked(copied)
+	return copied, nil
+}
+
+// decorateDeploymentLocked fills in the target fields the Postgres query joins.
+// Callers hold the lock.
+func (m *MemoryStore) decorateDeploymentLocked(d *CertificateDeployment) {
+	if t, ok := m.targets[d.TargetID]; ok {
+		d.TargetName, d.TargetType = t.Name, t.TargetType
+	}
+}
+
+func (m *MemoryStore) CreateCertificateDeployment(ctx context.Context, d *CertificateDeployment) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// The in-memory stand-in for the unique constraint on (certificate, target):
+	// binding a certificate to a target it is already bound to is a request for
+	// a state that already holds, so the existing row is updated in place.
+	for _, existing := range m.deployments {
+		if existing.CertificateID == d.CertificateID && existing.TargetID == d.TargetID {
+			existing.IsEnabled = d.IsEnabled
+			existing.Options = d.Options
+			existing.UpdatedAt = time.Now()
+			*d = *clone(existing)
+			m.decorateDeploymentLocked(d)
+			return nil
+		}
+	}
+
+	stored := clone(d)
+	if stored.ID == "" {
+		stored.ID = uuid.New().String()
+	}
+	now := time.Now()
+	stored.CreatedAt, stored.UpdatedAt = now, now
+	m.deployments[stored.ID] = stored
+	*d = *clone(stored)
+	m.decorateDeploymentLocked(d)
+	return nil
+}
+
+func (m *MemoryStore) DeleteCertificateDeployment(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.deployments, id)
+	return nil
+}
+
+func (m *MemoryStore) RecordDeploymentOutcome(ctx context.Context, id string, outcome DeploymentOutcome) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	d, ok := m.deployments[id]
+	if !ok {
+		return fmt.Errorf("deployment %s not found", id)
+	}
+	d.LastStatus = outcome.Status
+	d.LastError = outcome.Error
+	// Only a success moves the fingerprint, and only to what was installed. A
+	// failed deploy leaves the previous value alone: the place is still holding
+	// whatever it was holding.
+	if outcome.Status == DeploymentDeployed && outcome.Fingerprint != "" {
+		when := outcome.At
+		d.DeployedFingerprint = outcome.Fingerprint
+		d.DeployedAt = &when
+	}
+	d.UpdatedAt = time.Now()
+	return nil
+}
+
+// ── Deployment queue ────────────────────────────────────────
+
+func (m *MemoryStore) EnqueueDeployment(ctx context.Context, job *DeploymentJob) (bool, error) {
+	if job.DeploymentID == "" {
+		return false, fmt.Errorf("a deployment job needs a deployment")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// The in-memory stand-in for the partial unique index: at most one
+	// outstanding job per binding — per place, not per certificate.
+	for _, existing := range m.deploymentJobs {
+		if existing.DeploymentID == job.DeploymentID && existing.Outstanding() {
+			*job = *clone(existing)
+			return false, nil
+		}
+	}
+
+	stored := clone(job)
+	if stored.ID == "" {
+		stored.ID = uuid.New().String()
+	}
+	if stored.Status == "" {
+		stored.Status = DeployPending
+	}
+	if stored.Reason == "" {
+		stored.Reason = DeployReasonManual
+	}
+	if stored.RunAfter.IsZero() {
+		stored.RunAfter = time.Now()
+	}
+	if stored.AttemptLog == nil {
+		stored.AttemptLog = []DeploymentAttempt{}
+	}
+	now := time.Now()
+	stored.CreatedAt, stored.UpdatedAt = now, now
+
+	m.deploymentJobs = append(m.deploymentJobs, stored)
+	*job = *clone(stored)
+	return true, nil
+}
+
+func (m *MemoryStore) ClaimDeploymentJob(ctx context.Context, worker string, lease time.Duration, now time.Time) (*DeploymentJob, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var best *DeploymentJob
+	for _, job := range m.deploymentJobs {
+		ready := (job.Status == DeployPending && !job.RunAfter.After(now)) ||
+			(job.Status == DeployRunning && job.LockedUntil != nil && job.LockedUntil.Before(now))
+		if !ready {
+			continue
+		}
+		if best == nil || moreUrgentDeployment(job, best) {
+			best = job
+		}
+	}
+	if best == nil {
+		return nil, nil
+	}
+
+	until := now.Add(lease)
+	holder := worker
+	best.Status = DeployRunning
+	best.LockedBy = &holder
+	best.LockedUntil = &until
+	best.Attempts++
+	if best.StartedAt == nil {
+		started := now
+		best.StartedAt = &started
+	}
+	best.UpdatedAt = time.Now()
+	return clone(best), nil
+}
+
+// moreUrgentDeployment ranks by the expiry being raced, matching the queue's
+// ORDER BY, so the screen agrees with what is actually happening next.
+func moreUrgentDeployment(a, b *DeploymentJob) bool {
+	switch {
+	case a.NotAfter == nil && b.NotAfter == nil:
+		return a.RunAfter.Before(b.RunAfter)
+	case a.NotAfter == nil:
+		return false
+	case b.NotAfter == nil:
+		return true
+	case a.NotAfter.Equal(*b.NotAfter):
+		return a.RunAfter.Before(b.RunAfter)
+	}
+	return a.NotAfter.Before(*b.NotAfter)
+}
+
+func (m *MemoryStore) ExtendDeploymentLease(ctx context.Context, id, worker string, until time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, job := range m.deploymentJobs {
+		if job.ID != id {
+			continue
+		}
+		if job.Status != DeployRunning || job.LockedBy == nil || *job.LockedBy != worker {
+			return fmt.Errorf("deployment job %s is no longer held by %s", id, worker)
+		}
+		when := until
+		job.LockedUntil = &when
+		job.UpdatedAt = time.Now()
+		return nil
+	}
+	return fmt.Errorf("deployment job %s not found", id)
+}
+
+func (m *MemoryStore) CompleteDeploymentJob(ctx context.Context, id, status string,
+	attempt DeploymentAttempt, runAfter time.Time, escalate bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, job := range m.deploymentJobs {
+		if job.ID != id {
+			continue
+		}
+		job.Status = status
+		job.LastError = attempt.Error
+		job.LockedBy, job.LockedUntil = nil, nil
+
+		log := append(append([]DeploymentAttempt{}, job.AttemptLog...), attempt)
+		if len(log) > maxAttemptLog {
+			log = log[len(log)-maxAttemptLog:]
+		}
+		job.AttemptLog = log
+
+		if status == DeployPending {
+			job.RunAfter = runAfter
+		} else {
+			done := time.Now()
+			job.CompletedAt = &done
+		}
+		if escalate && job.EscalatedAt == nil {
+			when := time.Now()
+			job.EscalatedAt = &when
+		}
+		job.UpdatedAt = time.Now()
+		return nil
+	}
+	return fmt.Errorf("deployment job %s not found", id)
+}
+
+func (m *MemoryStore) GetDeploymentJob(ctx context.Context, id string) (*DeploymentJob, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, job := range m.deploymentJobs {
+		if job.ID == id {
+			return clone(job), nil
+		}
+	}
+	return nil, fmt.Errorf("deployment job %s not found", id)
+}
+
+func (m *MemoryStore) ListDeploymentJobs(ctx context.Context, filter DeploymentJobFilter) ([]*DeploymentJob, int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	matched := make([]*DeploymentJob, 0)
+	for _, job := range m.deploymentJobs {
+		if filter.CertificateID != "" && job.CertificateID != filter.CertificateID {
+			continue
+		}
+		if filter.TargetID != "" && job.TargetID != filter.TargetID {
+			continue
+		}
+		if filter.DeploymentID != "" && job.DeploymentID != filter.DeploymentID {
+			continue
+		}
+		if filter.Status != "" && job.Status != filter.Status {
+			continue
+		}
+		if filter.OutstandingOnly && !job.Outstanding() {
+			continue
+		}
+		if filter.EscalatedOnly && job.EscalatedAt == nil {
+			continue
+		}
+		matched = append(matched, clone(job))
+	}
+
+	sort.Slice(matched, func(i, j int) bool {
+		if matched[i].NotAfter != nil && matched[j].NotAfter != nil &&
+			!matched[i].NotAfter.Equal(*matched[j].NotAfter) {
+			return matched[i].NotAfter.Before(*matched[j].NotAfter)
+		}
+		if (matched[i].NotAfter == nil) != (matched[j].NotAfter == nil) {
+			return matched[j].NotAfter == nil
+		}
+		return matched[i].CreatedAt.After(matched[j].CreatedAt)
+	})
+
+	total := int64(len(matched))
+	return paginate(matched, filter.Limit, filter.Offset), total, nil
+}
+
+func (m *MemoryStore) CancelDeploymentJob(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, job := range m.deploymentJobs {
+		if job.ID != id {
+			continue
+		}
+		if !job.Outstanding() {
+			return fmt.Errorf("deployment job %s is not outstanding", id)
+		}
+		job.Status = DeployCancelled
+		job.LockedBy, job.LockedUntil = nil, nil
+		done := time.Now()
+		job.CompletedAt = &done
+		job.UpdatedAt = done
+		return nil
+	}
+	return fmt.Errorf("deployment job %s is not outstanding", id)
 }

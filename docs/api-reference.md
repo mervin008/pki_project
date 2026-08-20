@@ -1005,7 +1005,7 @@ POST /api/v1/certificates/{id}/verify        Check the servers now     (operator
 ```
 
 A renewal is not done when the certificate is stored. It is done when the thing
-serving it is serving it — and CertPilot deploys nothing yet, so a successful
+serving it is serving it — and a renewal does not deploy itself, so a successful
 renewal routinely leaves a new certificate in the database and the old one in
 front of the users, expiring on the old schedule under a green dashboard.
 
@@ -1131,6 +1131,225 @@ DELETE /api/v1/renewals/{id}
 
 Admin, and the response says what it costs. Cancelling is never how a failure is
 handled — a renewal nobody cancelled keeps trying.
+
+## Deployment
+
+```
+GET    /api/v1/deployment-targets                      List targets              (any)
+POST   /api/v1/deployment-targets                      Create                   (operator)
+PUT    /api/v1/deployment-targets/:id                  Update                   (operator)
+DELETE /api/v1/deployment-targets/:id                  Delete                   (admin)
+
+GET    /api/v1/certificates/:id/targets                Where it goes            (any)
+POST   /api/v1/certificates/:id/targets                Bind to a target         (operator)
+DELETE /api/v1/certificates/:id/targets/:bindingId     Unbind                   (operator)
+POST   /api/v1/certificates/:id/deploy                 Install it now           (operator)
+
+GET    /api/v1/deployments                             The deployment queue     (any)
+GET    /api/v1/deployments/:id                         One job                  (any)
+DELETE /api/v1/deployments/:id                         Cancel                   (admin)
+```
+
+Everything above deployment in this document observes. This changes something
+that is already carrying traffic:
+
+> Renewal creates new material. Deployment replaces material that is currently
+> in use.
+
+### Targets, and the column that answers a security question
+
+```json
+POST /api/v1/deployment-targets
+{
+  "name": "lab nginx",
+  "description": "receiver that writes /etc/nginx/certs and reloads",
+  "target_type": "webhook",
+  "config": {
+    "url": "https://deploy.internal/install",
+    "signing_secret": "at-least-sixteen-characters",
+    "include_private_key": true,
+    "headers": {"X-Tenant": "eu"}
+  }
+}
+```
+
+The configuration is sealed with the keyring under
+`secrets.ContextDeploymentConfig` and never leaves the process. What the list
+*does* carry is `deploys_private_key`:
+
+```json
+GET /api/v1/deployment-targets
+{ "count": 6, "carrying_private_key": 1, "supported_types": ["webhook"], "data": [ … ] }
+```
+
+A plain column, set when the target is created, deliberately not derived from
+the sealed config at read time. **"Which places does this organisation ship
+private keys to" is a question a security team should be able to answer with a
+SELECT** — without the KEK, and without something that can decrypt every
+deployment credential in the system having to be involved.
+
+`supported_types` is shorter than what the schema permits. `deployment_targets`
+has allowed `filesystem`, `aws_acm`, `kubernetes`, `gcp_lb` and `azure_kv` since
+migration 001; accepting one because a check constraint tolerates it would
+create a target that can be configured, bound, and queued, and that fails at the
+last possible moment.
+
+### The webhook deployer
+
+The escape hatch: anything you can put fifteen lines of HTTP handler in front of
+is a deployment target. The body is a documented, stable shape:
+
+```json
+{
+  "event": "cert.deploy",
+  "certificate_id": "…",
+  "common_name": "app.example.com",
+  "sans": ["app.example.com"],
+  "serial_number": "…",
+  "fingerprint_sha256": "…",
+  "not_before": "2026-08-21T00:06:47Z",
+  "not_after": "2027-08-21T00:06:47Z",
+  "certificate_pem": "-----BEGIN CERTIFICATE-----\n…",
+  "chain_pem": "-----BEGIN CERTIFICATE-----\n…",
+  "private_key_pem": "-----BEGIN PRIVATE KEY-----\n…",
+  "options": {"path": "/etc/nginx/certs/app"},
+  "timestamp": "2026-08-21T00:06:17Z",
+  "source": "certpilot"
+}
+```
+
+`options` is the binding's own placement, passed through verbatim, so one target
+can serve many certificates that land in different places on it.
+
+Signed exactly as an alert webhook is — `X-CertPilot-Signature` is the hex
+HMAC-SHA256 of `<unix-seconds> "." <raw body>`, with `X-CertPilot-Timestamp`
+carrying the seconds. One scheme, one implementation
+([`pkg/webhooksig`](../pkg/webhooksig)), so a receiver written once works for
+both.
+
+Two rules here are stricter than on a notification webhook, and both follow from
+what this endpoint can *do* rather than what it carries:
+
+- **`signing_secret` is mandatory.** An unsigned alert webhook means a receiver
+  might act on a fabricated alert. An unsigned deployment webhook means anyone
+  who can reach the receiver can install their certificate and their key under
+  your hostname.
+- **`include_private_key` cannot be combined with a plain-http URL** unless the
+  host is a loopback address, where there is no wire to intercept. A hostname
+  that merely resolves to loopback today does not count: what a name points at
+  when the deployment actually runs is not what it points at now.
+
+### Binding: one row per place
+
+```json
+POST /api/v1/certificates/{id}/targets
+{ "target_id": "…", "options": {"path": "/etc/nginx/certs/app"} }
+```
+
+```json
+201 Created
+{ "message": "app.example.com will be deployed to lab nginx. Binding does not install it — POST /certificates/{id}/deploy does." }
+```
+
+A binding to a target that carries the private key is refused when CertPilot
+holds no key for the certificate. Caught here rather than at deploy time,
+because otherwise it is a configuration that fails on every renewal forever and
+is discovered the week it matters.
+
+Asking where a certificate stands is a question about places:
+
+```json
+GET /api/v1/certificates/{id}/targets
+{ "count": 2,
+  "summary": "2 targets: 1 up to date, 1 holding an older certificate." }
+```
+
+That sentence costs no network — it compares recorded fingerprints. Post-renewal
+verification reaches the same kind of conclusion by opening a connection. Two
+independent kinds of evidence, and they should agree.
+
+The summary also reports failure, not only state:
+
+```
+"All 1 target hold the current certificate. The last deployment to 1 target failed."
+```
+
+Both halves are needed. This shipped reporting only the first, and a live run
+produced *"All 1 target hold the current certificate"* over a deployment that
+had failed three times and escalated.
+
+### Deploying
+
+```json
+POST /api/v1/certificates/{id}/deploy
+202 Accepted
+{ "queued": 1,
+  "message": "app.example.com: queued for 1 target; 1 target already had a deployment outstanding; 1 target switched off and skipped." }
+```
+
+Queued rather than deployed: eight targets is eight machines that may each need
+a reload, and a synchronous handler would be cut off by the server's write
+timeout somewhere in the middle, leaving half an estate updated and the client
+with no way to know which half.
+
+The message accounts for what did *not* happen too. A flat "queued" over an
+estate where three of five targets were switched off is the kind of half-truth
+that gets believed.
+
+**What is deployed is the certificate as it stands now**, not the fingerprint
+the job recorded when it was created. If a second renewal happened while the job
+waited, installing what the job was created for would push an older certificate
+to a live listener — and that renewal's own enqueue may have been a no-op,
+because the binding already had a job outstanding. The captured fingerprint is
+provenance, never a selector.
+
+### The queue
+
+```json
+GET /api/v1/deployments?certificate_id=…&outstanding=true
+{ "total": 1, "outstanding": 1, "escalated": 1,
+  "summary": "1 deployment is failing: app.example.com at lab nginx (3 attempts). The certificates are fine; what serves them is not being updated." }
+```
+
+Durable rows with leases, an attempt log, and deadline-aware backoff — the same
+machinery as the renewal queue, because a certificate that has been renewed and
+not installed runs down exactly the clock of one that was never renewed at all.
+
+A failing deployment stays `PENDING`. There is no attempt count at which a
+certificate stops needing to be where it is served from. It escalates instead —
+after three failures, or after one when there is less than a week of runway —
+and `cert.deploy_failed` fires once, at that moment:
+
+```
+CRITICAL — Cannot install app.example.com at lab nginx
+
+app.example.com has failed to install at lab nginx 3 times. The certificate is
+fine; what is serving it is not being updated, so it expires on the schedule of
+whatever is there now.
+```
+
+A failed deploy never moves the binding's `deployed_fingerprint`. The place is
+still holding whatever it was holding, and overwriting it with the fingerprint
+that failed to arrive would be the record claiming a deployment that did not
+happen.
+
+One thing differs from the renewal queue, and it is the load-bearing line: the
+partial unique index is on the **binding**, not the certificate. Renewal allows
+one outstanding job per certificate because a second renewal issues a second
+certificate. A certificate bound to six targets needs six jobs outstanding at
+once, and copying renewal's constraint would have deployed to the first and
+dropped five in silence.
+
+### Cancelling a deployment
+
+```
+DELETE /api/v1/deployments/{id}
+{ "message": "Deployment cancelled. The target keeps whatever certificate it already has, and nothing will update it." }
+```
+
+Deleting a *target* says the same thing more loudly, because the bindings
+cascade with it and the certificates carry on renewing perfectly happily while
+reaching nothing.
 
 ## Ownership and acknowledgement
 

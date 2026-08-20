@@ -20,9 +20,10 @@ const (
 	verifyTick = 1 * time.Minute
 	// VerifyGrace is how long after a renewal the first check waits.
 	//
-	// CertPilot does not deploy anything yet, so a renewal reaches the server
-	// when a person or another system puts it there. Checking in the same
-	// second would report every renewal as undeployed, which is true and
+	// A renewal does not reach the server in the same second it is issued —
+	// deployment is a separate step, and even when CertPilot performs it the
+	// far side may take a reload to pick the certificate up. Checking
+	// immediately would report every renewal as undeployed, which is true and
 	// useless.
 	VerifyGrace = 30 * time.Minute
 	// verifyBatch bounds one pass.

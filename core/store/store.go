@@ -40,11 +40,59 @@ type Store interface {
 	UpdateCAAccount(ctx context.Context, acc *CAAccount) error
 	DeleteCAAccount(ctx context.Context, id string) error
 
-	// ── Deployment Targets ──────────────────────────────────
+	// ── Deployment targets ──────────────────────────────────
+	//
+	// Deployment is the second thing in this system that changes the world, and
+	// the more dangerous of the two: renewal creates new material, deployment
+	// replaces material that is currently carrying traffic.
 	ListDeploymentTargets(ctx context.Context) ([]*DeploymentTarget, error)
 	GetDeploymentTarget(ctx context.Context, id string) (*DeploymentTarget, error)
 	CreateDeploymentTarget(ctx context.Context, target *DeploymentTarget) error
+	UpdateDeploymentTarget(ctx context.Context, target *DeploymentTarget) error
 	DeleteDeploymentTarget(ctx context.Context, id string) error
+	// MarkDeploymentTargetUsed records the outcome of one deploy against the
+	// target itself.
+	//
+	// Narrow rather than a full-row write, and separate from the binding's own
+	// outcome: the queue runs concurrently with whoever is editing the target,
+	// and a worker holding a copy from before an edit must not be able to write
+	// stale credentials back as a side effect of recording that it deployed.
+	MarkDeploymentTargetUsed(ctx context.Context, id string, at time.Time, success bool, detail string) error
+
+	// ── Certificate ↔ target bindings ───────────────────────
+	//
+	// Where a certificate goes, one row per place. Migration 001 modelled this
+	// as a single column on the certificate; one wildcard on six load balancers
+	// is six deployments with six outcomes, and a single deployed_at would
+	// average them into a number that is true of nowhere.
+	ListCertificateDeployments(ctx context.Context, certificateID string) ([]*CertificateDeployment, error)
+	GetCertificateDeployment(ctx context.Context, id string) (*CertificateDeployment, error)
+	CreateCertificateDeployment(ctx context.Context, d *CertificateDeployment) error
+	DeleteCertificateDeployment(ctx context.Context, id string) error
+	// RecordDeploymentOutcome writes what one attempt did to one binding.
+	RecordDeploymentOutcome(ctx context.Context, id string, outcome DeploymentOutcome) error
+
+	// ── Deployment queue ────────────────────────────────────
+
+	// EnqueueDeployment creates a job unless one is already outstanding for
+	// this binding.
+	//
+	// Per binding, not per certificate. That is the one place the renewal
+	// queue's shape would have been actively wrong: a certificate bound to six
+	// targets needs six jobs outstanding at once, and a constraint copied from
+	// renewal would have deployed to the first and silently dropped five.
+	EnqueueDeployment(ctx context.Context, job *DeploymentJob) (created bool, err error)
+	// ClaimDeploymentJob takes the most urgent ready job and leases it.
+	ClaimDeploymentJob(ctx context.Context, worker string, lease time.Duration, now time.Time) (*DeploymentJob, error)
+	// ExtendDeploymentLease keeps a long-running job's claim alive.
+	ExtendDeploymentLease(ctx context.Context, id, worker string, until time.Time) error
+	// CompleteDeploymentJob records the outcome of an attempt.
+	CompleteDeploymentJob(ctx context.Context, id string, status string, attempt DeploymentAttempt,
+		runAfter time.Time, escalate bool) error
+	GetDeploymentJob(ctx context.Context, id string) (*DeploymentJob, error)
+	ListDeploymentJobs(ctx context.Context, filter DeploymentJobFilter) ([]*DeploymentJob, int64, error)
+	// CancelDeploymentJob stops an outstanding job.
+	CancelDeploymentJob(ctx context.Context, id string) error
 
 	// ── Policies ────────────────────────────────────────────
 	ListPolicies(ctx context.Context) ([]*Policy, error)

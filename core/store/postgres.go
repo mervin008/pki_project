@@ -717,10 +717,30 @@ func (s *PostgresStore) DeleteCAAccount(ctx context.Context, id string) error {
 	return err
 }
 
-// ── Deployment Targets ──────────────────────────────────
+// ── Deployment targets ──────────────────────────────────
+
+// deploymentTargetColumns is the read shape, in one place so a column added to
+// the table cannot be picked up by the list query and missed by the detail one.
+const deploymentTargetColumns = `id, name, coalesce(description, ''), target_type,
+		coalesce(config_encrypted, ''), coalesce(is_enabled, true), coalesce(deploys_private_key, false),
+		last_deployment_at, last_deployment_status, coalesce(last_deployment_error, ''), last_success_at,
+		created_by, created_at, updated_at`
+
+func scanDeploymentTarget(row pgx.Row) (*DeploymentTarget, error) {
+	t := &DeploymentTarget{}
+	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.TargetType,
+		&t.ConfigEncrypted, &t.IsEnabled, &t.DeploysPrivateKey,
+		&t.LastDeploymentAt, &t.LastDeploymentStatus, &t.LastDeploymentError, &t.LastSuccessAt,
+		&t.CreatedBy, &t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
+}
 
 func (s *PostgresStore) ListDeploymentTargets(ctx context.Context) ([]*DeploymentTarget, error) {
-	rows, err := s.pool.Query(ctx, "SELECT id, name, target_type, config_encrypted, last_deployment_at, last_deployment_status, created_by, created_at, updated_at FROM public.deployment_targets ORDER BY name ASC")
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+deploymentTargetColumns+" FROM public.deployment_targets ORDER BY name ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -728,32 +748,210 @@ func (s *PostgresStore) ListDeploymentTargets(ctx context.Context) ([]*Deploymen
 
 	targets := []*DeploymentTarget{}
 	for rows.Next() {
-		t := &DeploymentTarget{}
-		if err := rows.Scan(&t.ID, &t.Name, &t.TargetType, &t.ConfigEncrypted, &t.LastDeploymentAt, &t.LastDeploymentStatus, &t.CreatedBy, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		t, err := scanDeploymentTarget(rows)
+		if err != nil {
 			return nil, err
 		}
 		targets = append(targets, t)
 	}
-	return targets, nil
+	return targets, rows.Err()
 }
 
 func (s *PostgresStore) GetDeploymentTarget(ctx context.Context, id string) (*DeploymentTarget, error) {
-	t := &DeploymentTarget{}
-	err := s.pool.QueryRow(ctx, "SELECT id, name, target_type, config_encrypted, last_deployment_at, last_deployment_status, created_by, created_at, updated_at FROM public.deployment_targets WHERE id = $1", id).Scan(
-		&t.ID, &t.Name, &t.TargetType, &t.ConfigEncrypted, &t.LastDeploymentAt, &t.LastDeploymentStatus, &t.CreatedBy, &t.CreatedAt, &t.UpdatedAt,
-	)
+	t, err := scanDeploymentTarget(s.pool.QueryRow(ctx,
+		"SELECT "+deploymentTargetColumns+" FROM public.deployment_targets WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("deployment target %s not found", id)
+	}
 	return t, err
 }
 
 func (s *PostgresStore) CreateDeploymentTarget(ctx context.Context, target *DeploymentTarget) error {
-	return s.pool.QueryRow(ctx, "INSERT INTO public.deployment_targets (name, target_type, config_encrypted) VALUES ($1, $2, $3) RETURNING id, created_at, updated_at",
-		target.Name, target.TargetType, target.ConfigEncrypted,
+	return s.pool.QueryRow(ctx, `
+		INSERT INTO public.deployment_targets
+			(name, description, target_type, config_encrypted, is_enabled, deploys_private_key, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, created_at, updated_at`,
+		target.Name, nullIfEmpty(target.Description), target.TargetType,
+		nullIfEmpty(target.ConfigEncrypted), target.IsEnabled, target.DeploysPrivateKey, target.CreatedBy,
 	).Scan(&target.ID, &target.CreatedAt, &target.UpdatedAt)
+}
+
+func (s *PostgresStore) UpdateDeploymentTarget(ctx context.Context, target *DeploymentTarget) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.deployment_targets
+		SET name = $2, description = $3, target_type = $4, config_encrypted = $5,
+		    is_enabled = $6, deploys_private_key = $7, updated_at = now()
+		WHERE id = $1`,
+		target.ID, target.Name, nullIfEmpty(target.Description), target.TargetType,
+		nullIfEmpty(target.ConfigEncrypted), target.IsEnabled, target.DeploysPrivateKey)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("deployment target %s not found", target.ID)
+	}
+	return nil
 }
 
 func (s *PostgresStore) DeleteDeploymentTarget(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, "DELETE FROM public.deployment_targets WHERE id = $1", id)
 	return err
+}
+
+// MarkDeploymentTargetUsed records one deploy against the target.
+//
+// last_deployment_at always moves; last_success_at only when it worked. The
+// same split ct_monitors and cloud_connections carry, for the same reason: a
+// target that has been failing all week must not read as one that simply has
+// had nothing to do.
+func (s *PostgresStore) MarkDeploymentTargetUsed(ctx context.Context, id string,
+	at time.Time, success bool, detail string) error {
+	status := DeploymentFailed
+	if success {
+		status = DeploymentDeployed
+	}
+
+	query := `
+		UPDATE public.deployment_targets
+		SET last_deployment_at = $2,
+		    last_deployment_status = $3,
+		    last_deployment_error = $4,
+		    updated_at = now()`
+	if success {
+		query += ", last_success_at = $2"
+	}
+	query += " WHERE id = $1"
+
+	errText := ""
+	if !success {
+		errText = detail
+	}
+	_, err := s.pool.Exec(ctx, query, id, at, status, nullIfEmpty(errText))
+	return err
+}
+
+// ── Certificate ↔ target bindings ───────────────────────
+
+const certificateDeploymentColumns = `d.id, d.certificate_id, d.target_id, coalesce(d.is_enabled, true),
+		coalesce(d.options, '{}'::jsonb), coalesce(d.deployed_fingerprint, ''), d.deployed_at,
+		coalesce(d.last_status, ''), coalesce(d.last_error, ''),
+		d.created_by, d.created_at, d.updated_at,
+		coalesce(t.name, ''), coalesce(t.target_type, '')`
+
+func scanCertificateDeployment(row pgx.Row) (*CertificateDeployment, error) {
+	d := &CertificateDeployment{}
+	var optionsJSON []byte
+	err := row.Scan(&d.ID, &d.CertificateID, &d.TargetID, &d.IsEnabled,
+		&optionsJSON, &d.DeployedFingerprint, &d.DeployedAt,
+		&d.LastStatus, &d.LastError,
+		&d.CreatedBy, &d.CreatedAt, &d.UpdatedAt,
+		&d.TargetName, &d.TargetType)
+	if err != nil {
+		return nil, err
+	}
+	if len(optionsJSON) > 0 {
+		_ = json.Unmarshal(optionsJSON, &d.Options)
+	}
+	return d, nil
+}
+
+func (s *PostgresStore) ListCertificateDeployments(ctx context.Context, certificateID string) ([]*CertificateDeployment, error) {
+	query := "SELECT " + certificateDeploymentColumns + `
+		FROM public.certificate_deployments d
+		LEFT JOIN public.deployment_targets t ON t.id = d.target_id`
+	args := []any{}
+	if certificateID != "" {
+		query += " WHERE d.certificate_id = $1"
+		args = append(args, certificateID)
+	}
+	query += " ORDER BY t.name ASC, d.created_at ASC"
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []*CertificateDeployment{}
+	for rows.Next() {
+		d, err := scanCertificateDeployment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) GetCertificateDeployment(ctx context.Context, id string) (*CertificateDeployment, error) {
+	d, err := scanCertificateDeployment(s.pool.QueryRow(ctx,
+		"SELECT "+certificateDeploymentColumns+`
+		 FROM public.certificate_deployments d
+		 LEFT JOIN public.deployment_targets t ON t.id = d.target_id
+		 WHERE d.id = $1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("deployment %s not found", id)
+	}
+	return d, err
+}
+
+func (s *PostgresStore) CreateCertificateDeployment(ctx context.Context, d *CertificateDeployment) error {
+	options := d.Options
+	if options == nil {
+		options = map[string]any{}
+	}
+	optionsJSON, err := json.Marshal(options)
+	if err != nil {
+		return err
+	}
+
+	// ON CONFLICT rather than an error: binding a certificate to a target it is
+	// already bound to is a request for a state that already holds, and the
+	// caller wants the row either way.
+	return s.pool.QueryRow(ctx, `
+		INSERT INTO public.certificate_deployments
+			(certificate_id, target_id, is_enabled, options, created_by)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (certificate_id, target_id) DO UPDATE
+		SET is_enabled = excluded.is_enabled, options = excluded.options, updated_at = now()
+		RETURNING id, created_at, updated_at`,
+		d.CertificateID, d.TargetID, d.IsEnabled, optionsJSON, d.CreatedBy,
+	).Scan(&d.ID, &d.CreatedAt, &d.UpdatedAt)
+}
+
+func (s *PostgresStore) DeleteCertificateDeployment(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, "DELETE FROM public.certificate_deployments WHERE id = $1", id)
+	return err
+}
+
+// RecordDeploymentOutcome writes what one attempt did to one binding.
+//
+// deployed_fingerprint moves only on success, and only to what was actually
+// installed. A failed deploy leaves the previous value alone, because the place
+// is still holding whatever it was holding — overwriting it with the
+// fingerprint that failed to arrive would be the record claiming a deployment
+// that did not happen.
+func (s *PostgresStore) RecordDeploymentOutcome(ctx context.Context, id string, outcome DeploymentOutcome) error {
+	query := `
+		UPDATE public.certificate_deployments
+		SET last_status = $2, last_error = $3, updated_at = now()`
+	args := []any{id, outcome.Status, nullIfEmpty(outcome.Error)}
+
+	if outcome.Status == DeploymentDeployed && outcome.Fingerprint != "" {
+		args = append(args, outcome.Fingerprint, outcome.At)
+		query += ", deployed_fingerprint = $4, deployed_at = $5"
+	}
+	query += " WHERE id = $1"
+
+	tag, err := s.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("deployment %s not found", id)
+	}
+	return nil
 }
 
 // ── Policies ────────────────────────────────────────────
@@ -2922,4 +3120,247 @@ func (s *PostgresStore) GetEndpointsServingCertificate(ctx context.Context, cert
 		endpoints = append(endpoints, net.JoinHostPort(host, strconv.Itoa(port)))
 	}
 	return endpoints, rows.Err()
+}
+
+// ── Deployment queue ────────────────────────────────────────
+
+const deploymentJobColumns = `id, deployment_id, certificate_id, target_id, reason, status,
+		run_after, coalesce(attempts, 0), locked_by, locked_until,
+		coalesce(last_error, ''), coalesce(attempt_log, '[]'::jsonb),
+		coalesce(fingerprint, ''), not_after, escalated_at,
+		triggered_by, actor_email, started_at, completed_at, created_at, updated_at`
+
+func scanDeploymentJob(row pgx.Row) (*DeploymentJob, error) {
+	j := &DeploymentJob{}
+	var logJSON []byte
+	err := row.Scan(
+		&j.ID, &j.DeploymentID, &j.CertificateID, &j.TargetID, &j.Reason, &j.Status,
+		&j.RunAfter, &j.Attempts, &j.LockedBy, &j.LockedUntil,
+		&j.LastError, &logJSON,
+		&j.Fingerprint, &j.NotAfter, &j.EscalatedAt,
+		&j.TriggeredBy, &j.ActorEmail, &j.StartedAt, &j.CompletedAt, &j.CreatedAt, &j.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(logJSON) > 0 {
+		_ = json.Unmarshal(logJSON, &j.AttemptLog)
+	}
+	if j.AttemptLog == nil {
+		j.AttemptLog = []DeploymentAttempt{}
+	}
+	return j, nil
+}
+
+// EnqueueDeployment creates a job unless one is outstanding for this binding.
+//
+// The conflict target is deployment_id — the place — not certificate_id. A
+// certificate bound to six targets needs six outstanding jobs, and copying the
+// renewal queue's constraint here would have deployed to the first target and
+// discarded the other five without a word.
+func (s *PostgresStore) EnqueueDeployment(ctx context.Context, job *DeploymentJob) (bool, error) {
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO public.deployment_jobs
+			(deployment_id, certificate_id, target_id, reason, status, run_after,
+			 fingerprint, not_after, triggered_by, actor_email)
+		VALUES ($1, $2, $3, $4, 'PENDING', $5, $6, $7, $8, $9)
+		ON CONFLICT (deployment_id) WHERE status IN ('PENDING', 'RUNNING') DO NOTHING
+		RETURNING `+deploymentJobColumns,
+		job.DeploymentID, job.CertificateID, job.TargetID, job.Reason, job.RunAfter,
+		nullIfEmpty(job.Fingerprint), job.NotAfter, job.TriggeredBy, job.ActorEmail)
+
+	created, err := scanDeploymentJob(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, findErr := s.outstandingDeploymentJob(ctx, job.DeploymentID)
+		if findErr != nil {
+			return false, findErr
+		}
+		if existing != nil {
+			*job = *existing
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	*job = *created
+	return true, nil
+}
+
+func (s *PostgresStore) outstandingDeploymentJob(ctx context.Context, deploymentID string) (*DeploymentJob, error) {
+	job, err := scanDeploymentJob(s.pool.QueryRow(ctx,
+		"SELECT "+deploymentJobColumns+` FROM public.deployment_jobs
+		 WHERE deployment_id = $1 AND status IN ('PENDING', 'RUNNING')
+		 ORDER BY created_at DESC LIMIT 1`, deploymentID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return job, err
+}
+
+func (s *PostgresStore) ClaimDeploymentJob(ctx context.Context, worker string, lease time.Duration, now time.Time) (*DeploymentJob, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE public.deployment_jobs
+		SET status = 'RUNNING',
+		    locked_by = $1,
+		    locked_until = $2,
+		    attempts = attempts + 1,
+		    started_at = coalesce(started_at, $3),
+		    updated_at = now()
+		WHERE id = (
+			SELECT id FROM public.deployment_jobs
+			WHERE (status = 'PENDING' AND run_after <= $3)
+			   OR (status = 'RUNNING' AND locked_until IS NOT NULL AND locked_until < $3)
+			ORDER BY not_after ASC NULLS LAST, run_after ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING `+deploymentJobColumns,
+		worker, now.Add(lease), now)
+
+	job, err := scanDeploymentJob(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return job, err
+}
+
+func (s *PostgresStore) ExtendDeploymentLease(ctx context.Context, id, worker string, until time.Time) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.deployment_jobs
+		SET locked_until = $3, updated_at = now()
+		WHERE id = $1 AND locked_by = $2 AND status = 'RUNNING'`, id, worker, until)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("deployment job %s is no longer held by %s", id, worker)
+	}
+	return nil
+}
+
+func (s *PostgresStore) CompleteDeploymentJob(ctx context.Context, id, status string,
+	attempt DeploymentAttempt, runAfter time.Time, escalate bool) error {
+	attemptJSON, err := json.Marshal([]DeploymentAttempt{attempt})
+	if err != nil {
+		return err
+	}
+
+	query := `
+		UPDATE public.deployment_jobs
+		SET status = $2,
+		    last_error = $3,
+		    attempt_log = (
+		        SELECT coalesce(jsonb_agg(entry), '[]'::jsonb)
+		        FROM (
+		            SELECT entry FROM jsonb_array_elements(coalesce(attempt_log, '[]'::jsonb) || $4::jsonb) AS entry
+		            OFFSET greatest(jsonb_array_length(coalesce(attempt_log, '[]'::jsonb)) + 1 - 50, 0)
+		        ) trimmed
+		    ),
+		    locked_by = NULL,
+		    locked_until = NULL,
+		    updated_at = now()`
+	args := []any{id, status, nullIfEmpty(attempt.Error), attemptJSON}
+
+	if status == DeployPending {
+		query += ", run_after = $5"
+		args = append(args, runAfter)
+	} else {
+		query += ", completed_at = now()"
+	}
+	if escalate {
+		query += ", escalated_at = coalesce(escalated_at, now())"
+	}
+	query += " WHERE id = $1"
+
+	tag, err := s.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("deployment job %s not found", id)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetDeploymentJob(ctx context.Context, id string) (*DeploymentJob, error) {
+	job, err := scanDeploymentJob(s.pool.QueryRow(ctx,
+		"SELECT "+deploymentJobColumns+" FROM public.deployment_jobs WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("deployment job %s not found", id)
+	}
+	return job, err
+}
+
+func (s *PostgresStore) ListDeploymentJobs(ctx context.Context, filter DeploymentJobFilter) ([]*DeploymentJob, int64, error) {
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(clause string, value any) {
+		args = append(args, value)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
+
+	if filter.CertificateID != "" {
+		add("certificate_id = $%d", filter.CertificateID)
+	}
+	if filter.TargetID != "" {
+		add("target_id = $%d", filter.TargetID)
+	}
+	if filter.DeploymentID != "" {
+		add("deployment_id = $%d", filter.DeploymentID)
+	}
+	if filter.Status != "" {
+		add("status = $%d", filter.Status)
+	}
+	if filter.OutstandingOnly {
+		where = append(where, "status IN ('PENDING', 'RUNNING')")
+	}
+	if filter.EscalatedOnly {
+		where = append(where, "escalated_at IS NOT NULL")
+	}
+	clause := strings.Join(where, " AND ")
+
+	var total int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT count(*) FROM public.deployment_jobs WHERE "+clause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	args = append(args, limit, filter.Offset)
+	query := "SELECT " + deploymentJobColumns + " FROM public.deployment_jobs WHERE " + clause +
+		fmt.Sprintf(" ORDER BY not_after ASC NULLS LAST, created_at DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]*DeploymentJob, 0)
+	for rows.Next() {
+		job, err := scanDeploymentJob(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, job)
+	}
+	return out, total, rows.Err()
+}
+
+func (s *PostgresStore) CancelDeploymentJob(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.deployment_jobs
+		SET status = 'CANCELLED', completed_at = now(), locked_by = NULL, locked_until = NULL, updated_at = now()
+		WHERE id = $1 AND status IN ('PENDING', 'RUNNING')`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("deployment job %s is not outstanding", id)
+	}
+	return nil
 }
