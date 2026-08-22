@@ -173,8 +173,16 @@ func (r *Runner) save(dir string, key crypto.Signer, issued Issued) (*Held, erro
 }
 
 // HeldCertificates lists what this host is holding.
-func (r *Runner) HeldCertificates() []*Held {
-	root := filepath.Join(r.stateDir, certsDir)
+func (r *Runner) HeldCertificates() []*Held { return HeldIn(r.stateDir) }
+
+// HeldIn lists what a state directory is holding, without an identity.
+//
+// Separate from the method so that installing works on a host whose credential
+// has been revoked or whose core is unreachable. Putting a certificate this
+// machine already holds where its own server reads it needs permission from
+// nobody.
+func HeldIn(stateDir string) []*Held {
+	root := filepath.Join(stateDir, certsDir)
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil

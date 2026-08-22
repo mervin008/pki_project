@@ -269,6 +269,15 @@ type DeploymentTarget struct {
 	// — without the KEK, and without decrypting anything.
 	DeploysPrivateKey bool `json:"deploys_private_key"`
 
+	// AgentID is set when this target is a host running the agent.
+	//
+	// It changes who does the work rather than what the work is. Everything
+	// else in this table is deployed to by a core worker opening a connection;
+	// an agent target is deployed to by the host itself claiming the job,
+	// because the whole reason that host runs an agent is that nothing can
+	// reach inwards to it. The core queue skips these for that reason.
+	AgentID *string `json:"agent_id,omitempty"`
+
 	// Attempted versus succeeded. A target that has been failing all week must
 	// not read as one that simply has had nothing to do.
 	LastDeploymentAt     *time.Time `json:"last_deployment_at,omitempty"`
@@ -1497,6 +1506,81 @@ type AgentCertificateFilter struct {
 	Finding string
 	// IncludeRemoved brings back files a later scan no longer found.
 	IncludeRemoved bool
+	Limit          int
+	Offset         int
+}
+
+// What one declared destination on a host is currently doing.
+const (
+	InstallInstalled   = "INSTALLED"
+	InstallFailed      = "FAILED"
+	InstallUnfulfilled = "UNFULFILLED"
+)
+
+// AgentInstallation is one named place on one host that a certificate goes.
+//
+// The host's own view, kept beside the central one rather than instead of it.
+// `CertificateDeployment` answers "what is this certificate's state at that
+// place" in the same shape as every other target type, which is what makes an
+// agent a deployment target like any other. This answers a question that only
+// exists for agents: this machine has been configured to install a certificate
+// nobody granted it, and nothing else in the system can see that.
+//
+// There is no command field this can be written *from*. ReloadCommand arrives
+// from the host for display and travels in one direction only; a core that
+// could set it would be a fleet-wide remote execution channel with a
+// certificate manager on the front.
+type AgentInstallation struct {
+	ID      string `json:"id"`
+	AgentID string `json:"agent_id"`
+
+	// Name is the destination's name in the host's spec — "nginx", "haproxy".
+	Name string `json:"name"`
+	// CertificateName is the name the spec asks for, as written. Kept even when
+	// nothing matched it, because the unmatched string is the finding.
+	CertificateName string `json:"certificate_name"`
+
+	CertificateID     *string    `json:"certificate_id,omitempty"`
+	FingerprintSHA256 string     `json:"fingerprint_sha256,omitempty"`
+	NotAfter          *time.Time `json:"not_after,omitempty"`
+
+	// Paths are the files this destination writes, in the order it writes them.
+	Paths []string `json:"paths,omitempty"`
+
+	Status string `json:"status"`
+	Detail string `json:"detail,omitempty"`
+	Error  string `json:"last_error,omitempty"`
+
+	// RolledBack records that a failed attempt put the previous material back.
+	// Separate from the error: an install that failed and restored what was
+	// working is an inconvenience, one that did not is an outage, and a single
+	// status cannot say which.
+	RolledBack bool `json:"rolled_back"`
+
+	InstalledAt *time.Time `json:"installed_at,omitempty"`
+	ReloadedAt  *time.Time `json:"reloaded_at,omitempty"`
+
+	ReloadCommand string `json:"reload_command,omitempty"`
+	CheckCommand  string `json:"check_command,omitempty"`
+
+	// AgentName and Hostname are joined in for listings, so a page of what the
+	// fleet has installed does not issue one lookup per row.
+	AgentName string `json:"agent_name,omitempty"`
+	Hostname  string `json:"hostname,omitempty"`
+
+	ReportedAt time.Time `json:"reported_at"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// AgentInstallationFilter narrows a listing.
+type AgentInstallationFilter struct {
+	AgentID       string
+	CertificateID string
+	Status        string
+	// NeedsAttention returns the two rows a central team actually wants: what
+	// is broken, and what is configured for a certificate that does not exist.
+	NeedsAttention bool
 	Limit          int
 	Offset         int
 }

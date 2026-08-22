@@ -89,7 +89,7 @@ type Deployer interface {
 // tolerates it would create a target that can be configured, bound, and queued,
 // and that fails at the last moment with an error about an unknown type.
 func Types() []string {
-	return []string{TypeWebhook}
+	return []string{TypeWebhook, TypeAgent}
 }
 
 // ValidateConfig checks a target configuration and returns the JSON that will
@@ -104,6 +104,10 @@ func Types() []string {
 // answer available only to something that can decrypt every deployment
 // credential in the system.
 func ValidateConfig(targetType string, config map[string]any) (raw []byte, deploysPrivateKey bool, err error) {
+	if strings.EqualFold(strings.TrimSpace(targetType), TypeAgent) {
+		return nil, false, fmt.Errorf(
+			"an agent target cannot be created here. It appears on its own when a host running the agent reports where it installs certificates, and is named after that host")
+	}
 	d, err := build(targetType, config)
 	if err != nil {
 		return nil, false, err
@@ -130,6 +134,8 @@ func build(targetType string, config map[string]any) (Deployer, error) {
 	switch strings.TrimSpace(strings.ToLower(targetType)) {
 	case TypeWebhook:
 		return newWebhookDeployer(config)
+	case TypeAgent:
+		return newAgentDeployer(config)
 	case "":
 		return nil, fmt.Errorf("a deployment target needs a target_type; supported: %s", strings.Join(Types(), ", "))
 	default:

@@ -3,6 +3,7 @@ package api
 import (
 	"github.com/certpilot/certpilot/core/engine/cloudsync"
 	"github.com/certpilot/certpilot/core/engine/ctlog"
+	"github.com/certpilot/certpilot/core/engine/deploy"
 	"github.com/certpilot/certpilot/core/engine/discovery"
 	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
@@ -31,17 +32,21 @@ type RouterDeps struct {
 	RenewalExec   *renewal.Executor
 	RenewalSched  *renewal.Scheduler
 	RenewalQueue  *renewal.Queue
-	ARIPoller     *renewal.ARIPoller
-	Verifier      *renewal.Verifier
-	PolicyEngine  *policy.Engine
-	Scanner       *discovery.Scanner
-	CTMonitor     *ctlog.Monitor
-	CloudEngine   *cloudsync.Engine
-	Keyring       *secrets.Keyring
-	Broker        *events.Broker
-	Dispatcher    *notifications.Dispatcher
-	Auth          *middleware.Authenticator
-	Config        *config.CoreConfig
+	// DeployQueue is used by one route: the one where a host reports what it
+	// did with a job it claimed. Completing that job through the queue's own
+	// retry curve is what keeps the agent path and the local one from drifting.
+	DeployQueue  *deploy.Queue
+	ARIPoller    *renewal.ARIPoller
+	Verifier     *renewal.Verifier
+	PolicyEngine *policy.Engine
+	Scanner      *discovery.Scanner
+	CTMonitor    *ctlog.Monitor
+	CloudEngine  *cloudsync.Engine
+	Keyring      *secrets.Keyring
+	Broker       *events.Broker
+	Dispatcher   *notifications.Dispatcher
+	Auth         *middleware.Authenticator
+	Config       *config.CoreConfig
 }
 
 // SetupRouter configures all REST API routes and attaches middleware.
@@ -66,7 +71,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	displayHandler := NewDisplayTokenHandler(deps.Store)
 	notifHandler := NewNotificationHandler(deps.Store, deps.Keyring, deps.Dispatcher)
 	ackHandler := NewAcknowledgementHandler(deps.Store)
-	agentHandler := NewAgentHandler(deps.Store, deps.PluginMgr, deps.Keyring, deps.Broker)
+	agentHandler := NewAgentHandler(deps.Store, deps.PluginMgr, deps.Keyring, deps.Broker, deps.DeployQueue)
 	ctHandler := NewCTHandler(deps.Store, deps.CTMonitor)
 	cloudHandler := NewCloudHandler(deps.Store, deps.CloudEngine, deps.Keyring)
 	deployHandler := NewDeploymentHandler(deps.Store, deps.Keyring)
@@ -96,6 +101,16 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// request. CertPilot signs what an operator granted this host and never
 		// holds a private key it could lose or be compelled to produce.
 		signed.POST("/certificates", agentHandler.RequestCertificate)
+		// Where the host put them, and what happened when it did. Reported
+		// upwards only: there is deliberately no route by which this core can
+		// tell a host which files to write or what command to run.
+		signed.POST("/installations", agentHandler.ReportInstallations)
+		// The inversion that makes an agent a deployment target. Every other
+		// target is deployed to by a core worker opening a connection; a host
+		// behind two firewalls claims the job itself, off the same queue, with
+		// the same lease and the same retry curve.
+		signed.POST("/deployments/claim", agentHandler.ClaimDeployments)
+		signed.POST("/deployments/result", agentHandler.ReportDeploymentResult)
 	}
 
 	v1 := engine.Group("/api/v1")
@@ -263,6 +278,11 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// ever mention. Reading is open to any authenticated user — it carries
 		// paths and permissions, never key material.
 		v1.GET("/agent-certificates", agentHandler.ListCertificates)
+		// Where the fleet has put its certificates. `?attention=true` returns
+		// the two rows nothing else in this system can produce: a destination
+		// that failed on the far side of every firewall, and a host configured
+		// to install a certificate that does not exist.
+		v1.GET("/agent-installations", agentHandler.ListInstallations)
 
 		// What a host may ask for. Readable by any authenticated user — a grant
 		// is a statement of policy and holds no secret — and written by an

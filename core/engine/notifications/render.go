@@ -291,6 +291,45 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "Refused because", Value: fallback(str(payload, "reason"), "—")},
 		}
 
+	case events.TopicAgentInstallFailed:
+		host := fallback(str(payload, "agent"), "a host")
+		where := fallback(str(payload, "destination"), "a destination")
+		cn := fallback(str(payload, "common_name"), "a certificate")
+		alert.Title = fmt.Sprintf("Could not install %s on %s", cn, host)
+		// Two sentences, and which second sentence appears is the whole point.
+		// A rollback means the listener is still serving what it was; no
+		// rollback means nobody knows what it is serving.
+		if boolean(payload, "rolled_back") {
+			alert.Summary = fmt.Sprintf(
+				"%s could not install %s at %s, and put back what was there before. That destination is still serving the older certificate, so this is a deployment to fix rather than an outage to attend to.",
+				host, cn, where)
+		} else {
+			alert.Summary = fmt.Sprintf(
+				"%s could not install %s at %s and could not put back what was there before. Whatever reads those files may now be serving material this host did not intend to install.",
+				host, cn, where)
+		}
+		alert.Fields = []Field{
+			{Label: "Host", Value: host},
+			{Label: "Destination", Value: where},
+			{Label: "Certificate", Value: cn},
+			{Label: "Previous certificate restored", Value: yesNo(boolean(payload, "rolled_back"))},
+			{Label: "Failed because", Value: fallback(str(payload, "error"), "—")},
+		}
+
+	case events.TopicAgentInstallUnfulfilled:
+		host := fallback(str(payload, "agent"), "a host")
+		names := fallback(listText(payload, "names"), "a certificate")
+		alert.Title = fmt.Sprintf("%s is configured to install a certificate it does not have", host)
+		alert.Summary = fmt.Sprintf(
+			"%s declares somewhere to install %s and holds no such certificate. Nothing is failing yet, and nothing will happen when the renewal it is waiting for arrives — check the name against the grant, because this is usually one character.",
+			host, names)
+		alert.Fields = []Field{
+			{Label: "Host", Value: host},
+			{Label: "Hostname", Value: fallback(str(payload, "hostname"), "—")},
+			{Label: "Declared for", Value: names},
+			{Label: "Destinations", Value: fallback(listText(payload, "destinations"), "—")},
+		}
+
 	case events.TopicCertExpiring:
 		cn := str(payload, "common_name")
 		alert.Title = fmt.Sprintf("Certificate expiring: %s", fallback(cn, "unnamed"))
@@ -567,6 +606,25 @@ func dateText(value string) string {
 // listText renders a payload field that holds a list of strings, which is how
 // a discovery alert names the hosts it found. Truncated rather than dropped: a
 // Slack message listing four hundred hosts is one nobody reads to the end.
+// boolean reads a flag out of a payload that has been through JSON, where a
+// bool may arrive as a bool or as the string "true".
+func boolean(m map[string]any, key string) bool {
+	switch v := m[key].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	return false
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
 func listText(payload map[string]any, key string) string {
 	raw, ok := payload[key].([]any)
 	if !ok {

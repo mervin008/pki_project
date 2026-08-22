@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/certpilot/certpilot/core/engine/deploy"
 	"github.com/certpilot/certpilot/core/engine/fleet"
 	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/pluginmgr"
@@ -59,15 +60,25 @@ type AgentHandler struct {
 	broker    *events.Broker
 	inventory *fleet.Inventory
 	issuer    *fleet.Issuer
+	installs  *fleet.Installs
+	// deployQueue is here for one method: completing a job a host ran itself.
+	// The agent path goes through the queue's own retry curve and escalation
+	// rule rather than a second copy of them, because the pacing is the part
+	// most likely to be subtly wrong and least likely to be noticed. Nil when
+	// deployments are not running on this core, which the handler says.
+	deployQueue *deploy.Queue
 }
 
 // NewAgentHandler creates the handler.
-func NewAgentHandler(s store.Store, pm *pluginmgr.Manager, kr *secrets.Keyring, broker *events.Broker) *AgentHandler {
+func NewAgentHandler(s store.Store, pm *pluginmgr.Manager, kr *secrets.Keyring,
+	broker *events.Broker, deployQueue *deploy.Queue) *AgentHandler {
 	return &AgentHandler{
-		store:     s,
-		broker:    broker,
-		inventory: fleet.NewInventory(s, broker),
-		issuer:    fleet.NewIssuer(s, pm, kr, broker),
+		store:       s,
+		broker:      broker,
+		inventory:   fleet.NewInventory(s, broker),
+		issuer:      fleet.NewIssuer(s, pm, kr, broker),
+		installs:    fleet.NewInstalls(s, broker),
+		deployQueue: deployQueue,
 	}
 }
 

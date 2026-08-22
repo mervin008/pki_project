@@ -384,6 +384,49 @@ type Store interface {
 	// nil when nothing matches, which is the ordinary case.
 	GetCertificateBySupersededFingerprint(ctx context.Context, fingerprint string) (*Certificate, error)
 
+	// ── What each host has installed where ─────────────────
+
+	// EnsureAgentDeploymentTarget returns the deployment target that is this
+	// agent, creating it the first time the host reports a destination.
+	//
+	// Created by a report rather than by an operator filling in a form. Four
+	// hundred hosts are four hundred targets, and a product that asks somebody
+	// to create them by hand gets a script that creates them by hand — the same
+	// reasoning that made agent grants match on labels rather than host ids.
+	EnsureAgentDeploymentTarget(ctx context.Context, agent *Agent) (*DeploymentTarget, error)
+	// ReplaceAgentInstallations writes the full state of one host's
+	// destinations, removing any it no longer declares.
+	//
+	// Full state rather than a delta, exactly like the inventory: a lost report
+	// costs nothing because the next one carries everything, and neither side
+	// keeps a cursor the other could disagree with.
+	ReplaceAgentInstallations(ctx context.Context, agentID string, installs []*AgentInstallation) error
+	ListAgentInstallations(ctx context.Context, filter AgentInstallationFilter) ([]*AgentInstallation, int64, error)
+	// EnsureCertificateDeployment returns the binding for a certificate at a
+	// target, creating it if this is the first time the two have met.
+	EnsureCertificateDeployment(ctx context.Context, d *CertificateDeployment) (*CertificateDeployment, error)
+	// ClaimAgentDeploymentJobs leases the jobs waiting for one host.
+	//
+	// The counterpart of ClaimDeploymentJob, and the reason that one excludes
+	// agent targets. A job for a host behind two firewalls cannot be run by a
+	// core worker, and a worker that claimed one would fail it repeatedly until
+	// the attempt budget ran out — loudly wrong about something that works.
+	ClaimAgentDeploymentJobs(ctx context.Context, agentID, worker string,
+		lease time.Duration, now time.Time, limit int) ([]*DeploymentJob, error)
+	// PruneAgentBindings removes the bindings on one agent's target for
+	// certificates that host is no longer installing.
+	//
+	// The agent reports full state, so the bindings have to be full state too.
+	// Without this, an agent that renews leaves the binding for the certificate
+	// it replaced sitting beside the new one, and both say that place is
+	// holding the current certificate — one of which is false, asserted with
+	// exactly the same confidence as the true one.
+	//
+	// Scoped to a target rather than general, because a binding an operator
+	// created on a webhook target is a standing instruction that nothing should
+	// delete on a host's say-so.
+	PruneAgentBindings(ctx context.Context, targetID string, keepCertificateIDs []string) (int, error)
+
 	// ── What a host may ask for ─────────────────────────────
 	//
 	// Nothing is issued to an agent that an operator has not granted in

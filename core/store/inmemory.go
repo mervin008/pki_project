@@ -53,6 +53,7 @@ type MemoryStore struct {
 	enrolTokens    map[string]*AgentEnrolToken
 	agentCerts     []*AgentCertificate
 	agentGrants    map[string]*AgentGrant
+	agentInstalls  []*AgentInstallation
 }
 
 // clone returns a shallow copy of a stored record.
@@ -2525,6 +2526,11 @@ func (m *MemoryStore) ClaimDeploymentJob(ctx context.Context, worker string, lea
 		if !ready {
 			continue
 		}
+		// Agent targets are deployed to by the host itself. See the note on the
+		// same exclusion in PostgresStore.ClaimDeploymentJob.
+		if target, ok := m.targets[job.TargetID]; ok && target.AgentID != nil {
+			continue
+		}
 		if best == nil || moreUrgentDeployment(job, best) {
 			best = job
 		}
@@ -3151,4 +3157,228 @@ func (m *MemoryStore) GetGrantsForAgent(ctx context.Context, agentID string) ([]
 		return out[i].CreatedAt.After(out[j].CreatedAt)
 	})
 	return out, nil
+}
+
+// ── What each host has installed where ──────────────────────
+
+func (m *MemoryStore) EnsureAgentDeploymentTarget(ctx context.Context, agent *Agent) (*DeploymentTarget, error) {
+	if agent == nil || agent.ID == "" {
+		return nil, fmt.Errorf("an agent is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, target := range m.targets {
+		if target.AgentID != nil && *target.AgentID == agent.ID {
+			return clone(target), nil
+		}
+	}
+
+	agentID := agent.ID
+	name := agent.Name
+	for _, target := range m.targets {
+		if target.Name == name {
+			name = fmt.Sprintf("%s (agent %s)", agent.Name, shortID(agent.ID))
+			break
+		}
+	}
+
+	now := time.Now()
+	target := &DeploymentTarget{
+		ID:         uuid.New().String(),
+		Name:       name,
+		TargetType: "agent",
+		AgentID:    &agentID,
+		IsEnabled:  true,
+		Description: fmt.Sprintf(
+			"The CertPilot agent on %s. Certificates are installed by the host itself, from a spec on the host.",
+			agent.Name),
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	m.targets[target.ID] = target
+	return clone(target), nil
+}
+
+func (m *MemoryStore) ReplaceAgentInstallations(ctx context.Context, agentID string,
+	installs []*AgentInstallation) error {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	kept := []*AgentInstallation{}
+	for _, existing := range m.agentInstalls {
+		if existing.AgentID != agentID {
+			kept = append(kept, existing)
+		}
+	}
+	now := time.Now()
+	for _, inst := range installs {
+		stored := clone(inst)
+		stored.AgentID = agentID
+		if stored.ID == "" {
+			stored.ID = uuid.New().String()
+		}
+		if stored.CreatedAt.IsZero() {
+			stored.CreatedAt = now
+		}
+		stored.UpdatedAt = now
+		if agent, ok := m.agents[agentID]; ok {
+			stored.AgentName, stored.Hostname = agent.Name, agent.Hostname
+		}
+		kept = append(kept, stored)
+	}
+	m.agentInstalls = kept
+	return nil
+}
+
+func (m *MemoryStore) ListAgentInstallations(ctx context.Context,
+	filter AgentInstallationFilter) ([]*AgentInstallation, int64, error) {
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	matched := []*AgentInstallation{}
+	for _, inst := range m.agentInstalls {
+		switch {
+		case filter.AgentID != "" && inst.AgentID != filter.AgentID:
+			continue
+		case filter.CertificateID != "" && (inst.CertificateID == nil || *inst.CertificateID != filter.CertificateID):
+			continue
+		case filter.Status != "" && !strings.EqualFold(inst.Status, filter.Status):
+			continue
+		case filter.NeedsAttention && inst.Status == InstallInstalled:
+			continue
+		}
+		matched = append(matched, clone(inst))
+	}
+
+	sort.Slice(matched, func(i, j int) bool {
+		if rank(matched[i].Status) != rank(matched[j].Status) {
+			return rank(matched[i].Status) < rank(matched[j].Status)
+		}
+		if matched[i].AgentName != matched[j].AgentName {
+			return matched[i].AgentName < matched[j].AgentName
+		}
+		return matched[i].Name < matched[j].Name
+	})
+
+	total := int64(len(matched))
+	return paginate(matched, filter.Limit, filter.Offset), total, nil
+}
+
+// rank orders a listing the way the queries do: what is broken first, then what
+// is configured for something that does not exist, then everything working.
+func rank(status string) int {
+	switch status {
+	case InstallFailed:
+		return 0
+	case InstallUnfulfilled:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func (m *MemoryStore) EnsureCertificateDeployment(ctx context.Context,
+	d *CertificateDeployment) (*CertificateDeployment, error) {
+
+	m.mu.Lock()
+	for _, existing := range m.deployments {
+		if existing.CertificateID == d.CertificateID && existing.TargetID == d.TargetID {
+			if d.Options != nil {
+				existing.Options = d.Options
+			}
+			existing.UpdatedAt = time.Now()
+			out := clone(existing)
+			m.mu.Unlock()
+			return out, nil
+		}
+	}
+	m.mu.Unlock()
+
+	if err := m.CreateCertificateDeployment(ctx, d); err != nil {
+		return nil, err
+	}
+	return m.GetCertificateDeployment(ctx, d.ID)
+}
+
+func (m *MemoryStore) ClaimAgentDeploymentJobs(ctx context.Context, agentID, worker string,
+	lease time.Duration, now time.Time, limit int) ([]*DeploymentJob, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	mine := map[string]bool{}
+	for _, target := range m.targets {
+		if target.AgentID != nil && *target.AgentID == agentID && target.IsEnabled {
+			mine[target.ID] = true
+		}
+	}
+
+	claimable := []*DeploymentJob{}
+	for _, job := range m.deploymentJobs {
+		ready := (job.Status == DeployPending && !job.RunAfter.After(now)) ||
+			(job.Status == DeployRunning && job.LockedUntil != nil && job.LockedUntil.Before(now))
+		if ready && mine[job.TargetID] {
+			claimable = append(claimable, job)
+		}
+	}
+	sort.Slice(claimable, func(i, j int) bool { return moreUrgentDeployment(claimable[i], claimable[j]) })
+	if len(claimable) > limit {
+		claimable = claimable[:limit]
+	}
+
+	until := now.Add(lease)
+	out := []*DeploymentJob{}
+	for _, job := range claimable {
+		holder := worker
+		job.Status = DeployRunning
+		job.LockedBy = &holder
+		job.LockedUntil = &until
+		job.Attempts++
+		if job.StartedAt == nil {
+			started := now
+			job.StartedAt = &started
+		}
+		job.UpdatedAt = time.Now()
+		out = append(out, clone(job))
+	}
+	return out, nil
+}
+
+func (m *MemoryStore) PruneAgentBindings(ctx context.Context, targetID string,
+	keepCertificateIDs []string) (int, error) {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	target, ok := m.targets[targetID]
+	if !ok || target.AgentID == nil {
+		return 0, nil
+	}
+	keep := map[string]bool{}
+	for _, id := range keepCertificateIDs {
+		keep[id] = true
+	}
+
+	removed := 0
+	for id, binding := range m.deployments {
+		if binding.TargetID != targetID || keep[binding.CertificateID] {
+			continue
+		}
+		delete(m.deployments, id)
+		removed++
+		kept := m.deploymentJobs[:0]
+		for _, job := range m.deploymentJobs {
+			if job.DeploymentID != id {
+				kept = append(kept, job)
+			}
+		}
+		m.deploymentJobs = kept
+	}
+	return removed, nil
 }

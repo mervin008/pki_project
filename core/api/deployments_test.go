@@ -201,9 +201,17 @@ func TestTheBindingSummaryNamesTheInterestingCase(t *testing.T) {
 			[]*store.CertificateDeployment{{}, {}},
 			"nothing has been deployed yet",
 		},
-		"all current": {
+		// Its own branch, because the plural form produced "All 1 target hold
+		// the current certificate" in a live run — a sentence that reads as a
+		// machine talking, in the one place a person goes to find out whether
+		// their certificate arrived.
+		"the only place has it": {
 			[]*store.CertificateDeployment{{DeployedFingerprint: "new"}},
-			"hold the current certificate",
+			"The one place this goes is holding the current certificate",
+		},
+		"all current": {
+			[]*store.CertificateDeployment{{DeployedFingerprint: "new"}, {DeployedFingerprint: "new"}},
+			"All 2 targets hold the current certificate",
 		},
 		"one behind": {
 			[]*store.CertificateDeployment{{DeployedFingerprint: "new"}, {DeployedFingerprint: "old"}},

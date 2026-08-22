@@ -21,11 +21,12 @@ first-class element of the UI, the client judges freshness by data age rather
 than by whether a socket has errored, and a dead feed visibly degrades the
 page instead of leaving the last good numbers on it.
 
-> **Status: early development.** The core, the gateway plugin architecture, and
-> the ACME and self-signed gateways work end to end. Deployment to servers, the
-> host agent, network discovery at scale, and the PQC posture reporting are not
-> built yet. The [feature table](#what-works-today) below is accurate; anything
-> not listed there does not exist. Do not run this in production.
+> **Status: early development.** The core, the gateway plugin architecture, the
+> ACME and self-signed gateways, and the host agent work end to end. Deployment
+> to cloud load balancers, network discovery at scale, and the PQC posture
+> reporting are not built yet. The [feature table](#what-works-today) below is
+> accurate; anything not listed there does not exist. Do not run this in
+> production.
 
 ## Why
 
@@ -109,8 +110,8 @@ explicitly.
 | Renewal queue | ✅ | Durable jobs with leases, an attempt log, and backoff that tightens as expiry approaches. Safe on N replicas with no leader. Per-CA rate limits defer rather than fail |
 | Post-renewal verification | ✅ | Re-probes the endpoints discovery has seen serving a certificate and reports when a renewal never reached them — the green-dashboard-over-an-expiring-estate failure, caught |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
-| Deployment to servers | ⚠️ | Durable, retried, audited deployment to a generic signed webhook — enough for anything you can put an HTTP receiver in front of. Kubernetes, ACM, Key Vault and F5 are next; deployment is triggered by hand, not yet by renewal |
-| Host agent | ⚠️ | One binary that enrols, inventories, and **requests certificates with keys it generates locally and never sends** — CertPilot cannot produce them and does not claim to. Bounded by grants an operator writes in advance. It does not yet install what it holds where a server reads it |
+| Deployment to servers | ⚠️ | Durable, retried, audited deployment to a generic signed webhook, and to a host running the agent — which installs, validates and reloads on the far side of every firewall, and rolls back what was working if either fails. ACM, Key Vault and F5 are next; deployment is triggered by hand, not yet by renewal |
+| Host agent | ✅ | One binary that enrols, inventories, **requests certificates with keys it generates locally and never sends** — CertPilot cannot produce them and does not claim to — then installs them where the server actually reads them and reloads it. Bounded by grants an operator writes in advance |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
 | Vault, GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
 
@@ -888,6 +889,64 @@ host can. *When* is the core's decision — a host that picked its own moment
 could decide to renew hourly, and four hundred of them would be a denial of
 service against your CA.
 
+### Installing it where the server actually reads it
+
+A certificate in the agent's state directory is not a certificate nginx is
+serving. Tell the host where it goes:
+
+```json
+/etc/certpilot/installs.json
+{ "destinations": [
+    { "name": "nginx",
+      "certificate": "shop.web.example.com",
+      "cert_path": "/etc/nginx/ssl/shop.crt",
+      "key_path":  "/etc/nginx/ssl/shop.key",
+      "owner": "root", "group": "www-data", "key_mode": "0640",
+      "check":  ["/usr/sbin/nginx", "-t"],
+      "reload": ["/usr/sbin/nginx", "-s", "reload"] } ] }
+```
+
+```
+$ certpilot-agent install
+nginx          INSTALLED    wrote /etc/nginx/ssl/shop.crt, /etc/nginx/ssl/shop.key and ran /usr/sbin/nginx -s reload
+```
+
+**That file lives on the host and CertPilot cannot write it.** There is no wire
+format for a destination and no API that sets one, deliberately: a server that
+could hand a host a command to run would be a fleet-wide remote execution
+channel with a certificate manager on the front of it. CertPilot says *install
+certificate X*; the host decides what that means.
+
+`check` runs before `reload` — the certificate is written, the server is asked
+whether it can live with it, and only then is the running process told to pick
+it up. If the check fails, the previous material goes back and nothing is ever
+reloaded. If the *reload* fails, the previous material goes back **and the
+reload runs again**, because by then the process is running on something that is
+no longer on disk.
+
+```
+WARNING — Could not install shop.web.example.com on web-01
+
+web-01 could not install shop.web.example.com at nginx, and put back what was
+there before. That destination is still serving the older certificate, so this
+is a deployment to fix rather than an outage to attend to.
+```
+
+Nothing is written and nothing is reloaded when the bytes already match — but
+the declared mode is enforced every pass, so a key somebody chmodded to 0644
+during an incident is quietly put back. And a destination declared for a
+certificate the host does not hold gets said out loud, because there is no
+binding, no certificate and no failed attempt to notice — just a machine that
+will do nothing at all when the renewal it is waiting for never arrives. It is
+almost always one character.
+
+The host then shows up as a deployment target like any other, with one
+inversion: it **claims** its jobs rather than being connected to, because
+nothing can reach inwards to it. Same queue, same lease, same retry curve. And
+`deploys_private_key` is `false` — the key was generated there, so agent hosts
+are correctly absent from the answer to *where does this organisation ship
+private keys*.
+
 ## Security model
 
 Read this before deploying anything.
@@ -1067,12 +1126,14 @@ frame parsing, CA chain resolution, and the display-token client.
 See [ROADMAP.md](ROADMAP.md). Monitoring, discovery, and the renewal engine are
 complete: a streaming dashboard and wall display, network / CT / cloud
 discovery, and renewal as a durable queue with ARI and post-renewal
-verification. Deployment has begun — a certificate can now be installed
-somewhere, durably and with an attempt log — and the agent has an identity built
-on a key it generated and never sent, an inventory of the certificate files on
-its host, and the ability to obtain certificates whose private keys CertPilot
-has never seen and cannot produce. What remains of that phase is installing them
-where the server actually reads them.
+verification. Deployment works: a certificate is installed
+somewhere durably, with an attempt log, and the agent is now one of those
+places. It has an identity built on a key it generated and never sent, an
+inventory of the certificate files on its host, certificates whose private keys
+CertPilot has never seen and cannot produce, and it installs them where the
+server actually reads them — validating before it reloads, and putting back what
+was working if either step fails. What remains of that phase is the deployers
+that need no agent, and deployment triggered by renewal rather than by hand.
 
 ## License
 

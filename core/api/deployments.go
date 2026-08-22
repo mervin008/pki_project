@@ -261,6 +261,11 @@ func summarizeBindings(cert *store.Certificate, bindings []*store.CertificateDep
 	// half-told story this product exists to stop other tools telling.
 	var state string
 	switch {
+	case behind == 0 && never == 0 && current == 1:
+		// Its own branch rather than a plural helper, because "All 1 target
+		// hold the current certificate" is what the general form produces and
+		// it reads as a machine talking.
+		state = "The one place this goes is holding the current certificate"
 	case behind == 0 && never == 0:
 		state = fmt.Sprintf("All %s hold the current certificate", placesText(current))
 	case current == 0 && behind == 0:

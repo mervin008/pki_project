@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -752,14 +753,14 @@ func (s *PostgresStore) DeleteCAAccount(ctx context.Context, id string) error {
 // deploymentTargetColumns is the read shape, in one place so a column added to
 // the table cannot be picked up by the list query and missed by the detail one.
 const deploymentTargetColumns = `id, name, coalesce(description, ''), target_type,
-		coalesce(config_encrypted, ''), coalesce(is_enabled, true), coalesce(deploys_private_key, false),
+		coalesce(config_encrypted, ''), coalesce(is_enabled, true), coalesce(deploys_private_key, false), agent_id,
 		last_deployment_at, last_deployment_status, coalesce(last_deployment_error, ''), last_success_at,
 		created_by, created_at, updated_at`
 
 func scanDeploymentTarget(row pgx.Row) (*DeploymentTarget, error) {
 	t := &DeploymentTarget{}
 	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.TargetType,
-		&t.ConfigEncrypted, &t.IsEnabled, &t.DeploysPrivateKey,
+		&t.ConfigEncrypted, &t.IsEnabled, &t.DeploysPrivateKey, &t.AgentID,
 		&t.LastDeploymentAt, &t.LastDeploymentStatus, &t.LastDeploymentError, &t.LastSuccessAt,
 		&t.CreatedBy, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
@@ -3238,11 +3239,18 @@ func (s *PostgresStore) ClaimDeploymentJob(ctx context.Context, worker string, l
 		    started_at = coalesce(started_at, $3),
 		    updated_at = now()
 		WHERE id = (
-			SELECT id FROM public.deployment_jobs
-			WHERE (status = 'PENDING' AND run_after <= $3)
-			   OR (status = 'RUNNING' AND locked_until IS NOT NULL AND locked_until < $3)
-			ORDER BY not_after ASC NULLS LAST, run_after ASC
-			FOR UPDATE SKIP LOCKED
+			SELECT c.id FROM public.deployment_jobs c
+			JOIN public.deployment_targets t ON t.id = c.target_id
+			-- Agent targets are deployed to by the host, not from here. A core
+			-- worker that claimed one would fail it for as long as the attempt
+			-- budget lasted, being loudly wrong about something that works —
+			-- the same shape of defect as a renewal sweep claiming jobs for
+			-- certificates whose keys it does not hold.
+			WHERE t.agent_id IS NULL
+			  AND ((c.status = 'PENDING' AND c.run_after <= $3)
+			    OR (c.status = 'RUNNING' AND c.locked_until IS NOT NULL AND c.locked_until < $3))
+			ORDER BY c.not_after ASC NULLS LAST, c.run_after ASC
+			FOR UPDATE OF c SKIP LOCKED
 			LIMIT 1
 		)
 		RETURNING `+deploymentJobColumns,
@@ -4086,4 +4094,337 @@ func orEmptyMap(m map[string]string) map[string]string {
 		return map[string]string{}
 	}
 	return m
+}
+
+// ── What each host has installed where ──────────────────────
+
+const agentInstallationColumns = `i.id, i.agent_id, i.name, i.certificate_name,
+		i.certificate_id, coalesce(i.fingerprint_sha256, ''), i.not_after,
+		coalesce(i.paths, '[]'::jsonb), i.status, coalesce(i.detail, ''), coalesce(i.last_error, ''),
+		coalesce(i.rolled_back, false), i.installed_at, i.reloaded_at,
+		coalesce(i.reload_command, ''), coalesce(i.check_command, ''),
+		i.reported_at, i.created_at, i.updated_at,
+		coalesce(a.name, ''), coalesce(a.hostname, '')`
+
+func scanAgentInstallation(row pgx.Row) (*AgentInstallation, error) {
+	inst := &AgentInstallation{}
+	var pathsJSON []byte
+	err := row.Scan(&inst.ID, &inst.AgentID, &inst.Name, &inst.CertificateName,
+		&inst.CertificateID, &inst.FingerprintSHA256, &inst.NotAfter,
+		&pathsJSON, &inst.Status, &inst.Detail, &inst.Error,
+		&inst.RolledBack, &inst.InstalledAt, &inst.ReloadedAt,
+		&inst.ReloadCommand, &inst.CheckCommand,
+		&inst.ReportedAt, &inst.CreatedAt, &inst.UpdatedAt,
+		&inst.AgentName, &inst.Hostname)
+	if err != nil {
+		return nil, err
+	}
+	if len(pathsJSON) > 0 {
+		_ = json.Unmarshal(pathsJSON, &inst.Paths)
+	}
+	return inst, nil
+}
+
+// EnsureAgentDeploymentTarget returns the target that is this agent.
+//
+// The conflict is resolved on agent_id rather than on the name, because the
+// name is the part that can change: a host renamed in the core must not become
+// a second place its certificates are deployed to.
+func (s *PostgresStore) EnsureAgentDeploymentTarget(ctx context.Context, agent *Agent) (*DeploymentTarget, error) {
+	if agent == nil || agent.ID == "" {
+		return nil, fmt.Errorf("an agent is required")
+	}
+
+	existing, err := scanDeploymentTarget(s.pool.QueryRow(ctx,
+		"SELECT "+deploymentTargetColumns+" FROM public.deployment_targets WHERE agent_id = $1", agent.ID))
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+
+	description := fmt.Sprintf(
+		"The CertPilot agent on %s. Certificates are installed by the host itself, from a spec on the host.",
+		firstNonEmpty(agent.Hostname, agent.Name))
+
+	// Two names tried in order. `deployment_targets.name` is unique across every
+	// target type, so a webhook target somebody already called "web-01" would
+	// otherwise stop that host from ever becoming a target at all — a collision
+	// between two unrelated things that a person would have no way to diagnose
+	// from the error.
+	candidates := []string{agent.Name, fmt.Sprintf("%s (agent %s)", agent.Name, shortID(agent.ID))}
+	var lastErr error
+	for _, name := range candidates {
+		target, err := scanDeploymentTarget(s.pool.QueryRow(ctx, `
+			INSERT INTO public.deployment_targets
+				(name, description, target_type, agent_id, is_enabled, deploys_private_key, config_encrypted)
+			VALUES ($1, $2, 'agent', $3, true, false, '')
+			ON CONFLICT (agent_id) WHERE agent_id IS NOT NULL
+			DO UPDATE SET description = excluded.description, updated_at = now()
+			RETURNING `+deploymentTargetColumns, name, description, agent.ID))
+		if err == nil {
+			return target, nil
+		}
+		lastErr = err
+		if !isUniqueViolation(err) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("could not create a deployment target for agent %s: %w", agent.Name, lastErr)
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// ReplaceAgentInstallations writes the full state of one host's destinations.
+//
+// In one transaction, and destinations the host no longer declares are deleted
+// rather than left behind. A destination removed from the spec is a place that
+// is no longer being maintained, and leaving the row would show a central team
+// a certificate installed somewhere nothing is keeping up to date.
+func (s *PostgresStore) ReplaceAgentInstallations(ctx context.Context, agentID string,
+	installs []*AgentInstallation) error {
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	names := make([]string, 0, len(installs))
+	for _, inst := range installs {
+		names = append(names, inst.Name)
+
+		pathsJSON, err := json.Marshal(nonNilStrings(inst.Paths))
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.agent_installations
+				(agent_id, name, certificate_name, certificate_id, fingerprint_sha256, not_after,
+				 paths, status, detail, last_error, rolled_back, installed_at, reloaded_at,
+				 reload_command, check_command, reported_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
+			ON CONFLICT (agent_id, name) DO UPDATE SET
+				certificate_name = excluded.certificate_name,
+				certificate_id = excluded.certificate_id,
+				fingerprint_sha256 = excluded.fingerprint_sha256,
+				not_after = excluded.not_after,
+				paths = excluded.paths,
+				status = excluded.status,
+				detail = excluded.detail,
+				last_error = excluded.last_error,
+				rolled_back = excluded.rolled_back,
+				installed_at = excluded.installed_at,
+				reloaded_at = excluded.reloaded_at,
+				reload_command = excluded.reload_command,
+				check_command = excluded.check_command,
+				reported_at = excluded.reported_at,
+				updated_at = now()`,
+			agentID, inst.Name, inst.CertificateName, inst.CertificateID,
+			nullIfEmpty(inst.FingerprintSHA256), inst.NotAfter,
+			pathsJSON, inst.Status, nullIfEmpty(inst.Detail), nullIfEmpty(inst.Error),
+			inst.RolledBack, inst.InstalledAt, inst.ReloadedAt,
+			nullIfEmpty(inst.ReloadCommand), nullIfEmpty(inst.CheckCommand), inst.ReportedAt)
+		if err != nil {
+			return err
+		}
+	}
+
+	// = ANY on an empty array removes everything, which is exactly right: a
+	// host that has emptied its spec has no destinations, and the central view
+	// must stop showing the ones it used to have.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM public.agent_installations WHERE agent_id = $1 AND NOT (name = ANY($2))`,
+		agentID, names); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PostgresStore) ListAgentInstallations(ctx context.Context,
+	filter AgentInstallationFilter) ([]*AgentInstallation, int64, error) {
+
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(clause string, value any) {
+		args = append(args, value)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
+	if filter.AgentID != "" {
+		add("i.agent_id = $%d", filter.AgentID)
+	}
+	if filter.CertificateID != "" {
+		add("i.certificate_id = $%d", filter.CertificateID)
+	}
+	if filter.Status != "" {
+		add("i.status = $%d", strings.ToUpper(filter.Status))
+	}
+	if filter.NeedsAttention {
+		where = append(where, "i.status IN ('FAILED', 'UNFULFILLED')")
+	}
+	clause := strings.Join(where, " AND ")
+
+	var total int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT count(*) FROM public.agent_installations i WHERE "+clause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	limit, offset := filter.Limit, filter.Offset
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	args = append(args, limit, offset)
+	query := "SELECT " + agentInstallationColumns + `
+		FROM public.agent_installations i
+		LEFT JOIN public.agents a ON a.id = i.agent_id
+		WHERE ` + clause + fmt.Sprintf(`
+		ORDER BY i.status <> 'FAILED', i.status <> 'UNFULFILLED', a.name ASC, i.name ASC
+		LIMIT $%d OFFSET $%d`, len(args)-1, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := []*AgentInstallation{}
+	for rows.Next() {
+		inst, err := scanAgentInstallation(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, inst)
+	}
+	return out, total, rows.Err()
+}
+
+func (s *PostgresStore) EnsureCertificateDeployment(ctx context.Context,
+	d *CertificateDeployment) (*CertificateDeployment, error) {
+
+	options := d.Options
+	if options == nil {
+		options = map[string]any{}
+	}
+	optionsJSON, err := json.Marshal(options)
+	if err != nil {
+		return nil, err
+	}
+
+	var id string
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO public.certificate_deployments (certificate_id, target_id, is_enabled, options, created_by)
+		VALUES ($1, $2, true, $3::jsonb, $4)
+		ON CONFLICT (certificate_id, target_id)
+		DO UPDATE SET options = excluded.options, updated_at = now()
+		RETURNING id`,
+		d.CertificateID, d.TargetID, optionsJSON, d.CreatedBy).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetCertificateDeployment(ctx, id)
+}
+
+// ClaimAgentDeploymentJobs leases the jobs waiting for one host.
+//
+// Scoped to this agent's own target by a join rather than by a column on the
+// job, so a host cannot claim work for another host by asking for it: the id
+// comes from the signature the middleware verified, and the join is what turns
+// that into a set of rows.
+func (s *PostgresStore) ClaimAgentDeploymentJobs(ctx context.Context, agentID, worker string,
+	lease time.Duration, now time.Time, limit int) ([]*DeploymentJob, error) {
+
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	rows, err := s.pool.Query(ctx, `
+		UPDATE public.deployment_jobs j
+		SET status = 'RUNNING',
+		    locked_by = $2,
+		    locked_until = $3,
+		    attempts = attempts + 1,
+		    started_at = coalesce(started_at, $4),
+		    updated_at = now()
+		WHERE j.id IN (
+			SELECT c.id FROM public.deployment_jobs c
+			JOIN public.deployment_targets t ON t.id = c.target_id
+			WHERE t.agent_id = $1
+			  AND t.is_enabled
+			  AND ((c.status = 'PENDING' AND c.run_after <= $4)
+			    OR (c.status = 'RUNNING' AND c.locked_until IS NOT NULL AND c.locked_until < $4))
+			ORDER BY c.not_after ASC NULLS LAST, c.run_after ASC
+			-- OF c, not bare FOR UPDATE. A bare one in a joined subquery locks
+			-- the deployment_targets row as well, so every agent polling for
+			-- work would take a row lock on its own target and an operator
+			-- renaming one would block behind the fleet.
+			FOR UPDATE OF c SKIP LOCKED
+			LIMIT $5
+		)
+		RETURNING `+deploymentJobColumns,
+		agentID, worker, now.Add(lease), now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []*DeploymentJob{}
+	for rows.Next() {
+		job, err := scanDeploymentJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, job)
+	}
+	return out, rows.Err()
+}
+
+func nonNilStrings(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
+}
+
+// PruneAgentBindings removes bindings for certificates a host no longer holds.
+//
+// Outstanding jobs go with them, by the foreign key's cascade. That is right: a
+// job to install a certificate this host has replaced would, if it ever ran,
+// push an older certificate onto a live listener.
+func (s *PostgresStore) PruneAgentBindings(ctx context.Context, targetID string,
+	keepCertificateIDs []string) (int, error) {
+
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM public.certificate_deployments d
+		USING public.deployment_targets t
+		WHERE d.target_id = $1
+		  AND t.id = d.target_id
+		  -- Belt and braces. This only ever runs for an agent's own target, and
+		  -- a bug that pointed it at a webhook target would silently delete
+		  -- standing instructions an operator wrote.
+		  AND t.agent_id IS NOT NULL
+		  AND NOT (d.certificate_id = ANY($2::uuid[]))`, targetID, keepCertificateIDs)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
 }

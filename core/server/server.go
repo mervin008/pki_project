@@ -186,6 +186,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		RenewalExec:   renewalExec,
 		RenewalSched:  renewalSched,
 		RenewalQueue:  renewalQueue,
+		DeployQueue:   deployQueue,
 		ARIPoller:     ariPoller,
 		Verifier:      verifier,
 		PolicyEngine:  policyEng,

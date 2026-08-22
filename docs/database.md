@@ -304,6 +304,27 @@ A leader would have given one replica all the work and a failover window during
 which no certificate renews at all. These two lines give N equal workers and no
 window.
 
+### Migration 022 and the third widening of a closed list
+
+`deployment_targets.target_type` refused `'agent'`, for exactly the reason
+`certificates.discovered_via` refused `'CLOUD'` and then `'AGENT'`: a check
+constraint listing values is a decision that the set is closed, and every one of
+these widenings has been a case where it was not.
+
+Three times is a pattern rather than a coincidence, so it is written down here
+rather than patched quietly each time. The rule that falls out of it: **a check
+constraint that enumerates a domain of "kinds of thing" will need widening; one
+that enumerates a lifecycle (`PENDING`, `RUNNING`, `SUCCEEDED`) will not.** The
+first is an inventory of the world, which grows. The second is a state machine,
+which is designed.
+
+Migration 022 also carries the first table in this schema deliberately shaped by
+what it must *not* be able to hold. `agent_installations` has `reload_command`
+and `check_command` columns, and there is no path anywhere in the Go layer by
+which the core can write them: they arrive from the host, for display. A column
+the core could set would make this table a queue for arbitrary code on every
+machine in the estate, authenticated by whoever can write one row.
+
 ### Migration 021, and a constraint that has now been the last to notice twice
 
 `certificates_discovered_via_check` refused `'AGENT'`. Migration 012 widened the
@@ -318,7 +339,7 @@ been anywhere else is not the same thing as one somebody pasted into a form, and
 the difference is the entire point of the agent.
 
 Both times it was found by running rather than testing, because the in-memory
-store enforces no constraints. That is now five defects of this shape, and the
+store enforces no constraints. That is now six defects of this shape, and the
 list has stopped being a coincidence:
 
 | Migration | What only PostgreSQL knew |
@@ -327,8 +348,9 @@ list has stopped being a coincidence:
 | 016 | `UpdateCertificate`'s explicit column list silently dropped new writes |
 | 018 | An untyped `$1` in `$1 - <interval>` was inferred as an interval |
 | 021 | `discovered_via` refused `'AGENT'` |
+| 022 | `deployment_targets.target_type` refused `'agent'` |
 
-(The fifth was a deployment binding summary that read as an all-clear over a
+(The remaining one was a deployment binding summary that read as an all-clear over a
 failing target — not a constraint, but the same root: the in-memory store cannot
 express what the database enforces, so the tests could not fail.) A
 container-backed suite remains the fix and remains unwritten.

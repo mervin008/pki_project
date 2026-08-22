@@ -402,3 +402,66 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
+
+// CompleteReported records the outcome of a job that was run somewhere else.
+//
+// The one job in this system that no worker here performs. An agent host is
+// behind two firewalls with nothing able to reach inwards, so it claims the job
+// over its own signed API and installs the certificate from a spec on the host
+// — and then has to be able to say what happened.
+//
+// It goes through the same retry curve, the same escalation rule and the same
+// attempt log as a deployment this process ran itself, deliberately. The pacing
+// is the part most likely to be subtly wrong and least likely to be noticed,
+// and a second copy of it written for the agent path would drift from this one
+// within a release. What differs is one field: the attempt log names the host
+// rather than a replica, because "every failure came from one machine" is the
+// same question in both cases.
+func (q *Queue) CompleteReported(ctx context.Context, job *store.DeploymentJob,
+	worker string, startedAt time.Time, detail string, cause error) error {
+
+	now := q.now()
+	// Passed in rather than derived from this queue's own lease. A host claims
+	// for much longer than a local worker does — it has files to write, a
+	// configuration to check and a service to reload before it can say anything
+	// — so working the start time back from `q.lease` put it in the future and
+	// wrote a negative duration into the attempt log.
+	started := startedAt
+	if started.IsZero() || started.After(now) {
+		started = now
+	}
+	attempt := store.DeploymentAttempt{
+		Number: job.Attempts,
+		// How long the machine took, which is the interesting number: a reload
+		// that takes ninety seconds is a fact about that host worth having.
+		StartedAt:  started,
+		DurationMS: now.Sub(started).Milliseconds(),
+		Worker:     worker,
+		Detail:     detail,
+	}
+
+	status := store.DeploySucceeded
+	escalate := false
+	if cause != nil {
+		attempt.Error = cause.Error()
+		// Left PENDING rather than FAILED, exactly as a local failure is. A
+		// certificate that has been renewed and not installed is on the same
+		// clock as one that was never renewed, so there is no attempt count at
+		// which giving up is the right answer.
+		status = store.DeployPending
+		escalate = q.shouldEscalate(job, now)
+	}
+
+	if err := q.store.CompleteDeploymentJob(ctx, job.ID, status, attempt, q.retryAt(job, now), escalate); err != nil {
+		return err
+	}
+	if cause != nil {
+		slog.Warn("a host reported that it could not install a certificate",
+			"job", job.ID, "deployment", job.DeploymentID, "host", worker,
+			"attempt", job.Attempts, "escalated", escalate, "error", cause)
+		if escalate && job.EscalatedAt == nil {
+			q.announceEscalation(ctx, job, cause, now)
+		}
+	}
+	return nil
+}

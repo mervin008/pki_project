@@ -105,7 +105,24 @@ const (
 	// needs to fix, or the first use of a credential taken off a host that has
 	// been broken into. A person can tell those apart. Nothing here can.
 	TopicAgentRequestRefused = "agent.request_refused"
-	TopicGatewayStatus       = "gateway.status"
+	// TopicAgentInstallFailed carries a host that could not put a certificate
+	// where the server reads it.
+	//
+	// The one deployment failure in this system that happened on the far side
+	// of every firewall, reported by the only process that could see it. It
+	// carries whether the previous material was put back, because a failed
+	// install that rolled back is an inconvenience and one that did not is an
+	// outage, and the difference has to survive into the message.
+	TopicAgentInstallFailed = "agent.install_failed"
+	// TopicAgentInstallUnfulfilled carries a host configured to install a
+	// certificate it does not hold.
+	//
+	// Almost always one character wrong in a hostname, and invisible to
+	// everything else: there is no binding, no certificate, and no failed
+	// attempt — just a machine that will do nothing at all when the renewal it
+	// is waiting for never arrives.
+	TopicAgentInstallUnfulfilled = "agent.install_unfulfilled"
+	TopicGatewayStatus           = "gateway.status"
 	// TopicDiscoveryUnmanaged carries the one finding a discovery scan exists
 	// to produce: an endpoint serving a certificate this system has never seen.
 	// Published so it reaches the channels a team already configured, rather
@@ -196,6 +213,8 @@ func AllTopics() []string {
 		TopicAgentKeyMismatch,
 		TopicAgentUnmanaged,
 		TopicAgentRequestRefused,
+		TopicAgentInstallFailed,
+		TopicAgentInstallUnfulfilled,
 		TopicGatewayStatus,
 		TopicDiscoveryUnmanaged,
 		TopicDiscoveryChanged,

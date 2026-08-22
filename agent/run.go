@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -35,6 +36,13 @@ type Runner struct {
 	inventoryEvery time.Duration
 	lastInventory  time.Time
 	stateDir       string
+	specPath       string
+	// hadSpec remembers that this host has declared destinations before, so
+	// deleting the spec file reports once rather than going quiet. A host that
+	// stops reporting and a host with nothing to report look identical in the
+	// core, and only one of them is a machine somebody just stopped
+	// maintaining.
+	hadSpec bool
 }
 
 // NewRunner creates a runner from a saved identity.
@@ -64,8 +72,20 @@ func NewRunner(client *Client, state State, stateDir string) *Runner {
 		scanPaths:      paths,
 		inventoryEvery: DefaultInventoryInterval,
 		stateDir:       stateDir,
+		specPath:       DefaultSpecPath(stateDir),
 	}
 }
+
+// WithSpecPath overrides where this host's install destinations are read from.
+func (r *Runner) WithSpecPath(path string) *Runner {
+	if strings.TrimSpace(path) != "" {
+		r.specPath = path
+	}
+	return r
+}
+
+// SpecPath is where this host reads its install destinations from.
+func (r *Runner) SpecPath() string { return r.specPath }
 
 // WithInventoryInterval overrides how often the host is scanned.
 func (r *Runner) WithInventoryInterval(d time.Duration) *Runner {
@@ -134,10 +154,12 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			failures = 0
 			r.warnOnDrift(served)
-			// Renewal before inventory, so a certificate replaced this cycle is
-			// reported in the state it is actually in rather than as the one it
-			// has just stopped being.
+			// Renew, install what was renewed, then look at the host. Each
+			// step reports the state the previous one left behind, so a
+			// certificate replaced this cycle is inventoried as the file it is
+			// now rather than as the one it has just stopped being.
 			r.RenewDue(ctx)
+			r.InstallCycle(ctx, true)
 			r.inventoryIfDue(ctx)
 
 		case errors.Is(err, ErrRevoked):
@@ -160,6 +182,11 @@ func (r *Runner) Run(ctx context.Context) error {
 
 		wait := r.interval
 		if failures > 0 {
+			// Installing is local work, so it still happens. A core that cannot
+			// be reached is a reason not to renew and not to report; it is not
+			// a reason to leave a certificate this host already holds out of
+			// the file the server actually reads.
+			r.InstallCycle(ctx, false)
 			wait = backoff(failures)
 		}
 

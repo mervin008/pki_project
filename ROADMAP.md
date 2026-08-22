@@ -684,7 +684,7 @@ do something about it.
 | 4a | The agent: enrolment, and an identity the core cannot impersonate | ✅ |
 | 4b | The agent inventories the certificate stores on its own host | ✅ |
 | 4c | Local key generation and CSR submission | ✅ |
-| 4d | Install and reload, as a deployment target | |
+| 4d | Install and reload, as a deployment target | ✅ |
 | 2 | The deployers that need no agent: ACM, Azure Key Vault, F5 | deferred |
 | 3 | Deploy on renewal, and the loop that proves it landed | deferred |
 
@@ -1021,10 +1021,122 @@ guess that turns out wrong is evidence the key is elsewhere, not evidence the
 pair is broken — so a stem-named key that mismatches is still a finding, and a
 conventionally-named one is only accepted if it matches.
 
-**Still to come:** installing what the agent holds where the server actually
-reads it, with a reload hook — at which point the agent becomes a deployment
-target like any other, and the loopback exception in step 1's webhook rules
-stops being an exception and becomes the normal case.
+**Step 4d** is where the agent stops holding certificates and starts installing
+them.
+
+Everything up to here lands in the agent's own state directory, which is not
+where nginx reads. Closing that gap is the first time this binary writes to a
+file another process depends on, so it is the second thing in the system
+governed by the sentence at the top of this phase — and the first one where the
+process doing the replacing is on the far side of every firewall, with nobody
+watching.
+
+**Where a certificate goes, and above all what to run afterwards, is declared on
+the host.** There is no wire format for a destination in `pkg/agentapi`, and
+that absence is the security argument of the step rather than an oversight: a
+core that could hand a host a command to run would be a fleet-wide remote
+execution channel with a certificate manager on the front of it, authenticated
+by whoever can write one row. The core may say *install certificate X*; it may
+never say *and here is what to run*. `agent_installations.reload_command` exists
+so a central team can see that installing a certificate on that machine runs
+`nginx -s reload` without having shell on it — and seeing it is the opposite of
+being able to set it.
+
+The install is three steps, not one, and the middle one carries the weight:
+
+> Write the files. Ask the server whether it can live with them. Only then tell
+> the running process to pick them up.
+
+A `check` that fails costs a rollback of files nothing has read yet. The same
+failure without a check costs a listener. So a failed check restores the files
+and never reloads, and a failed *reload* restores them **and reloads again** —
+because at that point the process is running on material that is no longer on
+disk, and putting the files back is not enough on its own. What was there is
+kept in memory rather than in a `.bak`, because a private key copied to
+`server.key.bak` is a private key nobody is tracking.
+
+Three smaller decisions:
+
+**Nothing is written or reloaded when the bytes already match.** An agent that
+reloaded nginx every five minutes because it could would be a worse problem than
+the stale certificate it was fixing. But the declared mode and ownership are
+enforced on every pass, without a write and without a reload — so a key somebody
+chmodded to 0644 during an incident three weeks ago is quietly put back. That is
+step 4b's CRITICAL finding, fixed by the only process in the system that can.
+
+**The agent refuses a world-readable `key_mode`, at load, naming the mode.** It
+must not create the finding it exists to report — and the fix for that finding
+is reissuance, not a later `chmod`, so writing one on request would be a tool
+manufacturing its own alerts.
+
+**A destination declared for a certificate the host does not hold is a finding,
+not silence.** `UNFULFILLED` is the status nothing else in this system can
+produce: there is no binding, no certificate and no failed attempt, just a
+machine configured for a name nobody granted it that will do nothing at all when
+the renewal it is waiting for never arrives. It is almost always one character.
+
+Then the agent becomes a deployment target like any other — with one inversion.
+Every other target is deployed to by a core worker opening a connection; a host
+behind two firewalls **claims the job itself**, off the same queue, with the same
+lease, the same retry curve and the same attempt log. Only the worker moves. The
+core's own claim query excludes agent targets for the reason the renewal sweep
+excludes agent-custody keys: a worker that took one would fail it until the
+attempt budget ran out, being loudly wrong about something that works.
+
+The target appears on its own when a host first reports a destination, because
+four hundred hosts are four hundred targets and a product that asks somebody to
+create them by hand gets a script that creates them by hand. It carries
+`deploys_private_key: false` as a fact rather than a default: the key was
+generated on that host and is already there, so agent hosts are correctly absent
+from the answer to "where does this organisation ship private keys" — which is
+the property step 4c existed to create, showing up in a column somebody else
+reads.
+
+Verified live against a host built to behave like a real one: a TLS listener
+holding its material in memory and reloading on SIGHUP, a `check` that verifies
+the certificate and key match with `openssl`, and a `reload` that signals the
+process. Install, and **an actual TLS handshake returned the certificate the
+host had generated the key for** — not a status column agreeing with itself.
+Then a new certificate arrived with the check failing: the destination kept the
+old bytes, the listener kept serving them, and the message said so. Then the
+check passed and the *reload* failed: same outcome, arrived at differently.
+Then recovery, and the handshake returned the new certificate. A second host
+holding a valid credential tried to report the first host's deployment as done
+and got `403 not_permitted`. And the core queue, given four poll cycles at a job
+for an agent target, left it at `attempts=0`.
+
+Running it caught four things the tests did not, and one the tests caught first.
+
+The one the tests caught is the worst: **the rollback deleted a file that had
+been working.** `for _, f := range files` hands out a copy of each element, so
+capturing the previous contents wrote them to a value that was then discarded,
+and the restore — finding no previous contents — concluded the file had not
+existed and removed it. Nothing would have surfaced that until a reload failed
+in production.
+
+Of the four found by running: **an agent that renewed left two bindings on one
+destination**, both saying that place was holding the current certificate. An
+agent obtains a new certificate rather than replacing one in place, so the old
+binding stayed beside the new one — two confident sentences about one file,
+where only one of them is true, which is precisely the failure mode this
+product exists not to have. Bindings are reconciled to the report now, exactly
+as the installations are.
+
+**The ordinary HAProxy destination was refused.** `cert_path` and `key_path`
+being the same file is the layout HAProxy wants, and the file correctly takes
+the key's mode — but the guard against a world-readable certificate mode fired
+on the *default* rather than on anything anybody had written, rejecting the
+destination this project keeps finding at 0644 and wants people to write.
+
+**The attempt log recorded a negative duration.** The start time was worked back
+from the queue's own three-minute lease, and a host claims for ten — because it
+has files to write, a configuration to check and a service to reload before it
+can say anything — so the arithmetic put the start of the attempt seven minutes
+in the future.
+
+And the binding summary said **"All 1 target hold the current certificate"** —
+the plural form producing a sentence that reads as a machine talking, in the one
+place a person goes to find out whether their certificate arrived.
 
 ### Phase 7 — More CAs
 
@@ -1093,6 +1205,19 @@ Tracked honestly rather than quietly:
   across algorithms and one field that meant two things would be worse
 - Certificates issued to an agent are never revoked when that agent is revoked.
   The credential stops working; the certificates keep working until they expire
+- An agent renewing obtains a *new* certificate row rather than superseding the
+  one it replaces, so the old row stays `ISSUED` and will eventually alert about
+  a certificate nothing is serving. The install reconciliation removes its
+  binding, which is the half that matters for deployment; the certificate record
+  itself is not yet linked to its replacement the way a core-side renewal is
+- An agent installation is not staged either. A host with six destinations for
+  one certificate writes and reloads all six in the order the spec lists them,
+  and a `check` that passes on the first and fails on the sixth leaves five
+  reloaded and one rolled back
+- The host's install spec is trusted as written. A path traversal is not
+  possible — every path is absolute and the agent runs as whoever runs it — but
+  an agent running as root will happily write a certificate over anything the
+  spec names, because the file is owned by whoever administers the host
 - Which configurations name a certificate file is found by text search, not by
   parsing. nginx `include`, Apache variables, and generated configuration will
   be missed — deliberately erring towards reporting a file as unreferenced,

@@ -1641,6 +1641,126 @@ grant's `renew_before_days`. A host that picked its own moment could decide to
 renew hourly, and four hundred of them would be a denial of service against the
 CA.
 
+### Installing, and reloading
+
+```
+GET  /api/v1/agent-installations           Where the fleet put them    (any)
+POST /api/v1/agent/installations           A host reports              (signed)
+POST /api/v1/agent/deployments/claim       A host takes work           (signed)
+POST /api/v1/agent/deployments/result      A host says what happened   (signed)
+```
+
+A certificate in the agent's state directory is not a certificate nginx is
+serving. This is the step that closes that gap, and it is the first time the
+agent writes to a file another process depends on — so it is governed by phase
+6's sentence: *renewal creates new material; deployment replaces material that
+is currently carrying traffic.*
+
+**Where a certificate goes, and what to run afterwards, is declared on the host
+— never sent by the core.** There is no wire format for a destination in
+`pkg/agentapi`, deliberately, because a core that could hand a host a command to
+run would be a fleet-wide remote execution channel with a certificate manager on
+the front of it. The core may say *"install certificate X"*; it may never say
+*"and here is what to run".*
+
+```json
+/etc/certpilot/installs.json
+{ "destinations": [
+    { "name": "nginx",
+      "certificate": "shop.example.com",
+      "cert_path": "/etc/nginx/ssl/shop.crt",
+      "key_path":  "/etc/nginx/ssl/shop.key",
+      "chain_path": "/etc/nginx/ssl/chain.pem",
+      "owner": "root", "group": "www-data",
+      "cert_mode": "0644", "key_mode": "0640",
+      "check":  ["/usr/sbin/nginx", "-t"],
+      "reload": ["/usr/sbin/nginx", "-s", "reload"] } ] }
+```
+
+`cert_path` and `key_path` may be the same file, which is the layout HAProxy
+wants. That file then takes the **key's** mode whatever `cert_mode` says —
+because it holds a private key, and 0644 is exactly what step 4b keeps finding
+on it.
+
+### Install, check, then reload — in that order
+
+`check` is the most valuable line in the file. The certificate is written, the
+server is asked whether it can live with it, and only then is the running
+process told to pick it up. A check that fails costs a rollback of files nothing
+has read yet; the same failure without a check costs a listener.
+
+| | |
+|:---|:---|
+| Every file is written to a temporary name **in its own directory** and renamed over the target | A reader sees the old contents or the new ones, never half of either. Rename is atomic within a filesystem and not across one, which is why the temporary file is not in `/tmp` |
+| What was there is kept **in memory**, not in a `.bak` | A private key copied to `server.key.bak` is a private key nobody is tracking |
+| A failed `check` restores the files and never reloads | Nothing was ever loaded, so the running process is still on what worked |
+| A failed `reload` restores the files **and reloads again** | The process is running on material that is no longer on disk; putting the files back is not enough on its own |
+| Nothing is written or reloaded when the bytes already match | An agent that reloaded nginx every five minutes because it could would be a worse problem than the stale certificate it was fixing |
+| The declared mode and ownership are enforced **without** a write or a reload | A key somebody chmodded to 0644 during an incident is the finding step 4b reports as CRITICAL, and this is the one process in the system that can quietly put it back |
+
+The agent refuses a `key_mode` that is world-readable, at load, naming the mode.
+**It must not create the finding it exists to report** — and the fix for that
+finding is reissuance, not a later `chmod`.
+
+Commands are an argument vector run with no shell and a bare `PATH`, and
+`argv[0]` must be absolute: this very often runs as root out of a systemd unit
+whose `PATH` is not the one the person editing the file was looking at.
+
+### An agent is a deployment target like any other
+
+```
+POST /api/v1/certificates/{id}/deploy    →  202, a job per binding
+```
+
+Every other target type is deployed to by a core worker opening a connection. A
+host behind two firewalls **claims the job itself** — same queue, same lease,
+same retry curve, same attempt log. Only the worker moves, and the attempt log
+names the machine rather than a replica.
+
+The core's own claim query excludes agent targets. A worker that took one would
+fail it until the attempt budget ran out, being loudly wrong about something
+that in fact works.
+
+The target appears on its own, the first time a host reports a destination —
+four hundred hosts are four hundred targets, and a product that asks somebody to
+create them by hand gets a script that creates them by hand. It is created with
+`deploys_private_key: false`, and that is a fact rather than a default: the key
+was generated on that host and is already there, so agent hosts are correctly
+absent from the answer to *"where does this organisation ship private keys"*.
+
+Reporting on a job belonging to another host is `403 {"code":
+"not_permitted"}`. Without that check a host with a valid credential could mark
+another machine's deployment as done, and the binding would record a certificate
+as installed somewhere that had never seen it.
+
+### The status nothing else can produce
+
+```
+GET /api/v1/agent-installations?attention=true
+```
+
+| Status | |
+|:---|:---|
+| `INSTALLED` | This destination holds what the host holds |
+| `FAILED` | The last attempt did not finish. `rolled_back` says whether the previous material was put back — an inconvenience or an outage, and a single status cannot say which |
+| `UNFULFILLED` | **This host is configured to install a certificate it does not hold** |
+
+The last one is the reason this endpoint exists. A remote scanner sees what a
+listener serves; the issuance record sees what was asked for. Neither can see
+that a machine has been configured for a name nobody granted it — there is no
+binding, no certificate and no failed attempt, just a host that will do nothing
+at all when the renewal it is waiting for never arrives. It is almost always one
+character.
+
+Reports are **full state**, like the inventory: a lost one costs nothing because
+the next carries everything. Bindings are reconciled to match, so an agent that
+renews does not leave the binding for the certificate it replaced sitting beside
+the new one — both claiming that place holds the current certificate.
+
+Alerts fire on **transitions**, not on states. A destination that has been
+failing since Tuesday must not send a message every cycle until somebody mutes
+the channel that also carries CA expiry alerts.
+
 ## Ownership and acknowledgement
 
 ```

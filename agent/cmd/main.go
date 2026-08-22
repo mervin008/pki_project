@@ -49,6 +49,8 @@ func main() {
 		err = runScan(os.Args[2:])
 	case "request":
 		err = runRequest(ctx, os.Args[2:])
+	case "install":
+		err = runInstall(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -70,13 +72,17 @@ func usage() {
 	fmt.Fprint(os.Stderr, `certpilot-agent — the CertPilot host agent
 
   certpilot-agent enrol  --server=URL --token=TOKEN [--name=NAME] [--interval=5m]
-  certpilot-agent run    [--state-dir=DIR]
+  certpilot-agent run    [--state-dir=DIR] [--installs=FILE]
   certpilot-agent scan   [--path=DIR ...]      what this host would report
   certpilot-agent request --name=HOST [--name=...] [--key-type=ECDSA]
+  certpilot-agent install [--installs=FILE] [--force] [--offline]
   certpilot-agent status [--state-dir=DIR]
 
 Enrolment generates this host's identity key locally. The private half is never
 sent to the core and there is no flag that would send it.
+
+Destinations — which files a certificate is written to and what to run
+afterwards — are read from a file on this host, never sent by the core.
 
 State directory defaults to `+"`"+`$CERTPILOT_AGENT_STATE`+"`"+`, then /var/lib/certpilot-agent
 when running as root, then ~/.certpilot-agent.
@@ -122,7 +128,8 @@ func runEnrol(ctx context.Context, args []string) error {
 func runAgent(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	stateDir := fs.String("state-dir", agent.DefaultStateDir(), "where this agent's identity is kept")
-	once := fs.Bool("once", false, "report once — heartbeat and inventory — then exit")
+	specPath := fs.String("installs", "", "where the destinations are declared (defaults to /etc/certpilot/installs.json)")
+	once := fs.Bool("once", false, "do one cycle — heartbeat, renew, install, inventory — then exit")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -132,7 +139,8 @@ func runAgent(ctx context.Context, args []string) error {
 		return err
 	}
 
-	runner := agent.NewRunner(agent.NewClient(state.Server, state.AgentID, key), state, *stateDir)
+	runner := agent.NewRunner(agent.NewClient(state.Server, state.AgentID, key), state, *stateDir).
+		WithSpecPath(*specPath)
 	if *once {
 		// Everything one cycle of the daemon would do: report, renew what is
 		// due, and inventory. "Once" has to mean all of it, or an estate
@@ -143,12 +151,16 @@ func runAgent(ctx context.Context, args []string) error {
 			return err
 		}
 		renewed := runner.RenewDue(ctx)
+		installed := runner.InstallCycle(ctx, true)
 		report, err := runner.ReportInventory(ctx)
 		if err != nil {
 			return err
 		}
 		if renewed > 0 {
 			fmt.Printf("renewed %d certificate(s)\n", renewed)
+		}
+		for _, inst := range installed.Installations {
+			fmt.Printf("%-12s %-12s %s\n", inst.Name, inst.Status, installDetail(inst))
 		}
 		fmt.Printf("reported: %d certificate file(s) from %d file(s) scanned\n",
 			len(report.Certificates), report.FilesSeen)
@@ -282,4 +294,97 @@ func runRequest(ctx context.Context, args []string) error {
 	fmt.Println("The private key was generated on this host and was never sent anywhere.")
 	fmt.Println("CertPilot cannot produce it, and does not claim to.")
 	return nil
+}
+
+// runInstall applies this host's destinations without waiting for a cycle.
+//
+// The command somebody runs after editing the spec file, and the one they run
+// during an incident. --offline does the local work and tells the core nothing,
+// which is what a host with a broken credential or an unreachable core still
+// needs to be able to do: installing a certificate this machine already holds
+// requires no permission from anywhere.
+func runInstall(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("install", flag.ExitOnError)
+	stateDir := fs.String("state-dir", agent.DefaultStateDir(), "where this agent's identity is kept")
+	specPath := fs.String("installs", "", "where the destinations are declared (defaults to /etc/certpilot/installs.json)")
+	force := fs.Bool("force", false, "rewrite and reload even when the files already match")
+	offline := fs.Bool("offline", false, "do the local work and report nothing to the core")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *offline {
+		// No identity is loaded at all on this path. A host whose credential
+		// has been revoked can still put the certificate it holds where its
+		// server reads it.
+		path := *specPath
+		if path == "" {
+			path = agent.DefaultSpecPath(*stateDir)
+		}
+		spec, err := agent.LoadInstallSpec(path)
+		if err != nil {
+			return err
+		}
+		if !spec.Found {
+			return fmt.Errorf("no destinations are declared on this host; expected %s", path)
+		}
+		held := agent.HeldIn(*stateDir)
+		report := agent.NewInstaller(spec, path, held).Apply(ctx, forceAll(spec, *force))
+		return printInstallations(report)
+	}
+
+	key, state, err := agent.LoadIdentity(*stateDir)
+	if err != nil {
+		return err
+	}
+	runner := agent.NewRunner(agent.NewClient(state.Server, state.AgentID, key), state, *stateDir).
+		WithSpecPath(*specPath)
+	if *force {
+		return printInstallations(runner.ForceInstall(ctx))
+	}
+	return printInstallations(runner.InstallCycle(ctx, true))
+}
+
+// forceAll builds the force set for an offline run.
+func forceAll(spec agent.InstallSpec, force bool) map[string]bool {
+	if !force {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, d := range spec.Destinations {
+		out[d.Name] = true
+	}
+	return out
+}
+
+func printInstallations(report agentapi.InstallationReport) error {
+	if len(report.Installations) == 0 && len(report.Errors) == 0 {
+		fmt.Println("no destinations are declared on this host")
+		return nil
+	}
+	for _, problem := range report.Errors {
+		fmt.Printf("error: %s\n", problem)
+	}
+	failed := 0
+	for _, inst := range report.Installations {
+		fmt.Printf("%-14s %-12s %s\n", inst.Name, inst.Status, installDetail(inst))
+		if inst.Status == agentapi.InstallFailed {
+			failed++
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d destination(s) could not be installed", failed)
+	}
+	return nil
+}
+
+// installDetail picks the sentence worth printing for one destination.
+func installDetail(inst agentapi.Installation) string {
+	if inst.Error != "" {
+		if inst.Detail != "" {
+			return inst.Error + " — " + inst.Detail
+		}
+		return inst.Error
+	}
+	return inst.Detail
 }
