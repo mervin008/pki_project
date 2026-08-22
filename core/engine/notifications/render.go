@@ -165,10 +165,22 @@ func AlertFromEvent(evt events.Event) Alert {
 		alert.Summary = fmt.Sprintf(
 			"%s has failed to install at %s %s. The certificate is fine; what is serving it is not being updated, so it expires on the schedule of whatever is there now.",
 			fallback(cn, "A certificate"), target, attemptsText(num(payload, "attempts")))
+		// What is stuck behind it, which changes what somebody does about it. A
+		// single failing target is an errand; a failing target holding eleven
+		// others still is why eleven machines are on a certificate that expires
+		// next week — and they are held deliberately, so saying so is the
+		// difference between one problem and an apparent second one.
+		if waiting := int(num(payload, "waiting_behind")); waiting > 0 {
+			alert.Summary += fmt.Sprintf(
+				" %s %s waiting behind it and will not be attempted until this one succeeds: a failing target stops the rollout rather than letting a bad certificate march through the estate.",
+				pluralText(waiting, "other target", "other targets"),
+				pickIsAre(waiting))
+		}
 		alert.Fields = []Field{
 			{Label: "Common name", Value: fallback(cn, "—")},
 			{Label: "Target", Value: target},
 			{Label: "Certificate expires", Value: dateText(str(payload, "not_after"))},
+			{Label: "Held back by this", Value: heldBackText(int(num(payload, "waiting_behind")))},
 			{Label: "Last error", Value: fallback(str(payload, "error"), "—")},
 		}
 
@@ -616,6 +628,29 @@ func boolean(m map[string]any, key string) bool {
 		return strings.EqualFold(strings.TrimSpace(v), "true")
 	}
 	return false
+}
+
+// pluralText numbers a noun the way a person writes it.
+func pluralText(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+func pickIsAre(n int) string {
+	if n == 1 {
+		return "is"
+	}
+	return "are"
+}
+
+// heldBackText renders the field for the commonest case, which is none.
+func heldBackText(n int) string {
+	if n == 0 {
+		return "nothing — this is the only outstanding deployment"
+	}
+	return pluralText(n, "deployment", "deployments")
 }
 
 func yesNo(v bool) string {

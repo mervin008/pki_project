@@ -685,8 +685,8 @@ do something about it.
 | 4b | The agent inventories the certificate stores on its own host | ✅ |
 | 4c | Local key generation and CSR submission | ✅ |
 | 4d | Install and reload, as a deployment target | ✅ |
+| 3 | Deploy on renewal, and the loop that proves it landed | ✅ |
 | 2 | The deployers that need no agent: ACM, Azure Key Vault, F5 | deferred |
-| 3 | Deploy on renewal, and the loop that proves it landed | deferred |
 
 **Steps 2 and 3 are deliberately out of order.** Kubernetes was going to be the
 first agentless deployer and it should not be: clusters that manage certificates
@@ -1138,6 +1138,97 @@ And the binding summary said **"All 1 target hold the current certificate"** —
 the plural form producing a sentence that reads as a machine talking, in the one
 place a person goes to find out whether their certificate arrived.
 
+**Step 3** is where the button presses itself, and it is the most dangerous
+change in the phase. The sentence at the top of it stops being about one
+deployment and becomes about all of them at once:
+
+> Automatic deployment on renewal is the feature that turns one mistake into a
+> fleet-wide one.
+
+So the whole step is brakes rather than accelerator, and the two that matter are
+a default and a predicate.
+
+**The default: new bindings deploy automatically, and every binding that existed
+before this did not.** Those look contradictory and are not. A binding created
+from now on is created by somebody who knows the feature exists, and "install
+this certificate there" plainly includes "when it changes". A binding that
+already existed was made under a regime where nothing deployed by itself, and an
+upgrade that silently began writing to production servers would be exactly the
+fleet-wide mistake above, delivered by a package manager. The cost of that
+choice is real — a switch nobody turns on is a feature nobody has — and it is
+paid in words rather than in defaults, on the page an operator is already
+looking at: *"1 target will not be updated when it renews, and will hold an
+older certificate until deployed by hand."*
+
+**The predicate: a job that has not itself failed waits while another job for
+the same certificate has.** That is a canary that needs no configuration to
+exist, on every certificate, with nobody having declared anything. The first
+target attempted proves the certificate is installable; if it does not, the rest
+of the estate is never touched. When the failure clears, they resume on their
+own.
+
+Explicit deployment waves were designed and dropped in favour of it. Ordering is
+a real feature and a later one, and shipping the two together would have been
+two half-built controls instead of one working one.
+
+The bound it gives is worth stating exactly rather than generously. **A bad
+rollout reaches at most as many targets as there are workers**, not one and not
+all of them — two per replica, because both workers claim before either has
+failed. Measured, not assumed: with three targets and all three receivers
+refusing, two were contacted twice each over several retry cycles and the third
+was never contacted at all.
+
+The other half of the step is the loop closing. Deployment's success is a claim
+that bytes were accepted; the verifier's is evidence from a handshake. Until
+now, a renewal scheduled that check half an hour out because deployment was a
+person doing something later — so once every place a certificate belongs is
+holding it, the check comes forward to three minutes. Not zero: a verification
+that ran the instant a deployer returned would report the reload it did not wait
+for, and a false STALE costs the same afternoon as a real one. And not at all
+until the rollout is complete, because a partial one verified early is a STALE
+nobody needed to see.
+
+One deliberate non-choice: deployments are enqueued by a direct call from the
+renewal executor, not by subscribing to the `cert.renewed` event it publishes
+two lines later. The broker drops the oldest event on a slow consumer, which is
+the right policy for a wall display and precisely the wrong one here. A dropped
+event would be a certificate that renewed and silently never deployed — the
+failure this phase exists to prevent, produced by the machinery meant to prevent
+it.
+
+Verified live against three independent receivers. A renewal nobody asked for
+queued three deployments, all three installed, and each receiver recorded the
+new fingerprint from its own side; the binding summary and the receivers agreed
+from different evidence. Then the estate was broken: two targets refused, the
+third was never contacted, and after three attempts the alert said *"1 other
+target is waiting behind it and will not be attempted until this one succeeds"*
+— because a rollout halted on purpose looks exactly like a queue that has
+stopped working, and the message has to say which it is. The estate was then
+fixed, nothing was pressed, and the rollout drained by itself with the untouched
+third target getting the certificate.
+
+Running it caught three things, and one of them was the feature not working at
+all.
+
+**The halt leaked once per retry cycle.** The predicate looked for a job that
+had failed and was *waiting*, and a failing job spends part of every cycle
+RUNNING — so during those seconds nothing looked failed and the rollout marched
+on one target at a time. Having failed is a property of the job; being idle is a
+property of the moment, and the first version keyed on the wrong one.
+
+**The in-memory store dropped the new column on update.** `deploy_on_renewal`
+was added to the model and not to the writer that copies fields onto an existing
+binding, so switching it off silently did nothing. That is migration 016's
+lesson for the second time, in the store that is supposed to be the simple one.
+
+**And a cleanup script deleted six certificates it had not asked for.** It
+requested `?search=<name>`; the certificates endpoint has never read a `search`
+parameter, so the filter was dropped, the list came back as the whole estate,
+and the loop deleting what it matched deleted everything. The fix is not to add
+the parameter: **a filter an endpoint does not understand is now a 400 that
+names it.** A narrowing parameter that silently does not narrow is harmless on a
+page a person reads and destructive the moment anything acts on the result.
+
 ### Phase 7 — More CAs
 
 HashiCorp Vault PKI first — it is what most organisations running private PKI
@@ -1179,16 +1270,13 @@ Tracked honestly rather than quietly:
 - Post-renewal verification only covers endpoints discovery has already
   observed. A certificate deployed somewhere nothing has scanned is reported as
   unverifiable rather than checked
-- A successful renewal does not yet enqueue its own deployments; deployment is
-  triggered by hand. That is phase 6 step 3, deliberately after the deployers
-  that reach real infrastructure exist — pushing automatically to production
-  through one newly written deployer is not a thing to switch on early
 - `certificates.deployment_target_id` survives from migration 001 and is no
   longer the answer to where a certificate is deployed. It is unread by anything
   in the deployment path and should be dropped once nothing else references it
-- Deployment is not staged. A certificate bound to forty targets goes to all
-  forty as fast as the workers drain the queue; there is no canary, no ordering,
-  and no pause between the first target and the rest
+- Deployment ordering is not expressible. A failing target now halts the rest of
+  a rollout automatically, which bounds a bad one to at most `workers` targets
+  per replica — but there is no way to say "staging first, then production", and
+  no way to make the canary exactly one rather than one per worker
 - Agent request signatures are bounded against replay by a five-minute window
   and nothing else. Stated rather than papered over: see phase 6 step 4a on why
   there is no nonce

@@ -110,7 +110,7 @@ explicitly.
 | Renewal queue | ✅ | Durable jobs with leases, an attempt log, and backoff that tightens as expiry approaches. Safe on N replicas with no leader. Per-CA rate limits defer rather than fail |
 | Post-renewal verification | ✅ | Re-probes the endpoints discovery has seen serving a certificate and reports when a renewal never reached them — the green-dashboard-over-an-expiring-estate failure, caught |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
-| Deployment to servers | ⚠️ | Durable, retried, audited deployment to a generic signed webhook, and to a host running the agent — which installs, validates and reloads on the far side of every firewall, and rolls back what was working if either fails. ACM, Key Vault and F5 are next; deployment is triggered by hand, not yet by renewal |
+| Deployment to servers | ⚠️ | Durable, retried, audited deployment to a generic signed webhook, and to a host running the agent — which installs, validates and reloads on the far side of every firewall, and rolls back what was working if either fails. **A renewal deploys itself**, and a failing target halts the rest of the rollout rather than letting a bad certificate march through the estate. ACM, Key Vault and F5 are next |
 | Host agent | ✅ | One binary that enrols, inventories, **requests certificates with keys it generates locally and never sends** — CertPilot cannot produce them and does not claim to — then installs them where the server actually reads them and reloads it. Bounded by grants an operator writes in advance |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
 | Vault, GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
@@ -946,6 +946,55 @@ nothing can reach inwards to it. Same queue, same lease, same retry curve. And
 `deploys_private_key` is `false` — the key was generated there, so agent hosts
 are correctly absent from the answer to *where does this organisation ship
 private keys*.
+
+### A renewal that deploys itself
+
+Bind a certificate to the places it belongs and renewal stops being half a job:
+
+```
+INFO  queued deployments for a renewed certificate  queued=3 not_automatic=0
+INFO  certificate deployed  target=step3-lb1
+INFO  certificate deployed  target=step3-lb2
+INFO  certificate deployed  target=step3-lb3
+INFO  certificate deployed to every place it is bound
+```
+
+This is the most dangerous feature in CertPilot, because automatic deployment on
+renewal is what turns one mistake into a fleet-wide one. Two brakes:
+
+**A failing target stops the rollout.** A deployment that has not itself failed
+waits while another for the same certificate has, so the first target attempted
+becomes a canary on every certificate, with nobody having configured anything.
+A bad certificate reaches at most as many targets as there are workers — two per
+replica — rather than all forty. When the failure clears, the rest resume on
+their own.
+
+```
+CRITICAL — Cannot install shop.example.com at lb2
+
+shop.example.com has failed to install at lb2 3 times. The certificate is fine;
+what is serving it is not being updated, so it expires on the schedule of
+whatever is there now. 1 other target is waiting behind it and will not be
+attempted until this one succeeds: a failing target stops the rollout rather
+than letting a bad certificate march through the estate.
+```
+
+**Bindings that predate the feature do not deploy automatically.** New ones do —
+"install this certificate there" includes "when it changes" — but an upgrade
+must not quietly start writing to production servers. The cost of that is a
+switch nobody turns on, so the page says it:
+
+```
+4 targets: 3 up to date, 1 never deployed. 1 target will not be updated when it
+renews, and will hold an older certificate until deployed by hand.
+```
+
+And the loop closes. A deployment's success is a claim that bytes were accepted;
+[post-renewal verification](#a-renewal-is-not-done-when-the-certificate-is-stored) is
+evidence from a real handshake. Once every place a certificate belongs is
+holding it, that check comes forward from half an hour to three minutes — not to
+zero, because a verification that ran the instant a deployer returned would
+report the reload it did not wait for.
 
 ## Security model
 

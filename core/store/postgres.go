@@ -865,6 +865,7 @@ func (s *PostgresStore) MarkDeploymentTargetUsed(ctx context.Context, id string,
 // ── Certificate ↔ target bindings ───────────────────────
 
 const certificateDeploymentColumns = `d.id, d.certificate_id, d.target_id, coalesce(d.is_enabled, true),
+		coalesce(d.deploy_on_renewal, false),
 		coalesce(d.options, '{}'::jsonb), coalesce(d.deployed_fingerprint, ''), d.deployed_at,
 		coalesce(d.last_status, ''), coalesce(d.last_error, ''),
 		d.created_by, d.created_at, d.updated_at,
@@ -873,7 +874,7 @@ const certificateDeploymentColumns = `d.id, d.certificate_id, d.target_id, coale
 func scanCertificateDeployment(row pgx.Row) (*CertificateDeployment, error) {
 	d := &CertificateDeployment{}
 	var optionsJSON []byte
-	err := row.Scan(&d.ID, &d.CertificateID, &d.TargetID, &d.IsEnabled,
+	err := row.Scan(&d.ID, &d.CertificateID, &d.TargetID, &d.IsEnabled, &d.DeployOnRenewal,
 		&optionsJSON, &d.DeployedFingerprint, &d.DeployedAt,
 		&d.LastStatus, &d.LastError,
 		&d.CreatedBy, &d.CreatedAt, &d.UpdatedAt,
@@ -942,12 +943,13 @@ func (s *PostgresStore) CreateCertificateDeployment(ctx context.Context, d *Cert
 	// caller wants the row either way.
 	return s.pool.QueryRow(ctx, `
 		INSERT INTO public.certificate_deployments
-			(certificate_id, target_id, is_enabled, options, created_by)
-		VALUES ($1, $2, $3, $4, $5)
+			(certificate_id, target_id, is_enabled, deploy_on_renewal, options, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (certificate_id, target_id) DO UPDATE
-		SET is_enabled = excluded.is_enabled, options = excluded.options, updated_at = now()
+		SET is_enabled = excluded.is_enabled, deploy_on_renewal = excluded.deploy_on_renewal,
+		    options = excluded.options, updated_at = now()
 		RETURNING id, created_at, updated_at`,
-		d.CertificateID, d.TargetID, d.IsEnabled, optionsJSON, d.CreatedBy,
+		d.CertificateID, d.TargetID, d.IsEnabled, d.DeployOnRenewal, optionsJSON, d.CreatedBy,
 	).Scan(&d.ID, &d.CreatedAt, &d.UpdatedAt)
 }
 
@@ -3249,6 +3251,31 @@ func (s *PostgresStore) ClaimDeploymentJob(ctx context.Context, worker string, l
 			WHERE t.agent_id IS NULL
 			  AND ((c.status = 'PENDING' AND c.run_after <= $3)
 			    OR (c.status = 'RUNNING' AND c.locked_until IS NOT NULL AND c.locked_until < $3))
+			  -- The canary, and it needs no configuration to exist.
+			  --
+			  -- A job that has not itself failed waits while another job for the
+			  -- same certificate has. The first target attempted therefore
+			  -- becomes the canary on every certificate, automatically: one bad
+			  -- renewal reaches one listener rather than forty, and the other
+			  -- thirty-nine resume the moment it clears.
+			  --
+			  -- Keyed on last_error rather than on attempts, which is the
+			  -- version that does not leak. A failing job spends part of every
+			  -- retry cycle in RUNNING, and a predicate looking for a *waiting*
+			  -- failure found none during those seconds — so the rollout
+			  -- marched on through the estate one retry at a time. Having
+			  -- failed is a property of the job; being idle is a property of
+			  -- the moment.
+			  --
+			  -- The exemption for jobs that have themselves failed is what stops
+			  -- two failures holding each other still for ever, which would
+			  -- freeze the retry curve rather than pace it.
+			  AND (coalesce(c.last_error, '') <> '' OR NOT EXISTS (
+			      SELECT 1 FROM public.deployment_jobs f
+			      WHERE f.certificate_id = c.certificate_id
+			        AND f.id <> c.id
+			        AND f.status IN ('PENDING', 'RUNNING')
+			        AND coalesce(f.last_error, '') <> ''))
 			ORDER BY c.not_after ASC NULLS LAST, c.run_after ASC
 			FOR UPDATE OF c SKIP LOCKED
 			LIMIT 1
@@ -4333,8 +4360,13 @@ func (s *PostgresStore) EnsureCertificateDeployment(ctx context.Context,
 
 	var id string
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO public.certificate_deployments (certificate_id, target_id, is_enabled, options, created_by)
-		VALUES ($1, $2, true, $3::jsonb, $4)
+		INSERT INTO public.certificate_deployments
+			(certificate_id, target_id, is_enabled, deploy_on_renewal, options, created_by)
+		-- deploy_on_renewal is true and is not the operator's choice here. An
+		-- agent binding exists because the host reported installing something,
+		-- and the host installs on its own cycle whether this column says so or
+		-- not. False would be a switch that claims to stop something it cannot.
+		VALUES ($1, $2, true, true, $3::jsonb, $4)
 		ON CONFLICT (certificate_id, target_id)
 		DO UPDATE SET options = excluded.options, updated_at = now()
 		RETURNING id`,
@@ -4372,6 +4404,31 @@ func (s *PostgresStore) ClaimAgentDeploymentJobs(ctx context.Context, agentID, w
 			  AND t.is_enabled
 			  AND ((c.status = 'PENDING' AND c.run_after <= $4)
 			    OR (c.status = 'RUNNING' AND c.locked_until IS NOT NULL AND c.locked_until < $4))
+			  -- The canary, and it needs no configuration to exist.
+			  --
+			  -- A job that has not itself failed waits while another job for the
+			  -- same certificate has. The first target attempted therefore
+			  -- becomes the canary on every certificate, automatically: one bad
+			  -- renewal reaches one listener rather than forty, and the other
+			  -- thirty-nine resume the moment it clears.
+			  --
+			  -- Keyed on last_error rather than on attempts, which is the
+			  -- version that does not leak. A failing job spends part of every
+			  -- retry cycle in RUNNING, and a predicate looking for a *waiting*
+			  -- failure found none during those seconds — so the rollout
+			  -- marched on through the estate one retry at a time. Having
+			  -- failed is a property of the job; being idle is a property of
+			  -- the moment.
+			  --
+			  -- The exemption for jobs that have themselves failed is what stops
+			  -- two failures holding each other still for ever, which would
+			  -- freeze the retry curve rather than pace it.
+			  AND (coalesce(c.last_error, '') <> '' OR NOT EXISTS (
+			      SELECT 1 FROM public.deployment_jobs f
+			      WHERE f.certificate_id = c.certificate_id
+			        AND f.id <> c.id
+			        AND f.status IN ('PENDING', 'RUNNING')
+			        AND coalesce(f.last_error, '') <> ''))
 			ORDER BY c.not_after ASC NULLS LAST, c.run_after ASC
 			-- OF c, not bare FOR UPDATE. A bare one in a joined subquery locks
 			-- the deployment_targets row as well, so every agent polling for

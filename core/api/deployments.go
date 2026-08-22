@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/certpilot/certpilot/core/engine/deploy"
 	"github.com/certpilot/certpilot/core/server/middleware"
@@ -237,10 +236,13 @@ func summarizeBindings(cert *store.Certificate, bindings []*store.CertificateDep
 		return "This certificate is not bound to any deployment target, so a renewal will update CertPilot's record and reach nothing."
 	}
 
-	current, behind, never, failing := 0, 0, 0, 0
+	current, behind, never, failing, manual := 0, 0, 0, 0, 0
 	for _, b := range bindings {
 		if b.LastStatus == store.DeploymentFailed {
 			failing++
+		}
+		if b.IsEnabled && !b.DeployOnRenewal {
+			manual++
 		}
 		switch {
 		case b.DeployedFingerprint == "":
@@ -285,9 +287,33 @@ func summarizeBindings(cert *store.Certificate, bindings []*store.CertificateDep
 	}
 
 	if failing > 0 {
-		return fmt.Sprintf("%s. The last deployment to %s failed.", state, placesText(failing))
+		state = fmt.Sprintf("%s. The last deployment to %s failed", state, placesText(failing))
 	}
-	return state + "."
+	state += "."
+
+	// The sentence that makes somebody act. Migration 023 switched every
+	// pre-existing binding to manual so that an upgrade could not begin writing
+	// to production servers on its own — and a switch nobody turns on is a
+	// feature nobody has, so the cost of that choice is paid here, in words, on
+	// the page an operator is already looking at.
+	switch {
+	case manual == 0:
+	case manual == len(bindings):
+		state += fmt.Sprintf(" None of them will be updated when it renews: %s deploy on renewal is switched off.",
+			pickThey(manual))
+	default:
+		state += fmt.Sprintf(" %s will not be updated when it renews, and will hold an older certificate until deployed by hand.",
+			placesText(manual))
+	}
+	return state
+}
+
+// pickThey keeps the "none of them" sentence grammatical for one target.
+func pickThey(n int) string {
+	if n == 1 {
+		return "its"
+	}
+	return "their"
 }
 
 func placesText(n int) string {
@@ -301,6 +327,10 @@ type bindingRequest struct {
 	TargetID  string         `json:"target_id" binding:"required"`
 	Options   map[string]any `json:"options"`
 	IsEnabled *bool          `json:"is_enabled"`
+	// DeployOnRenewal defaults to true when omitted, because that is what a
+	// binding means: install this certificate there, including when it changes.
+	// A caller that wants the old behaviour has to ask for it by name.
+	DeployOnRenewal *bool `json:"deploy_on_renewal"`
 }
 
 // CreateBinding handles POST /api/v1/certificates/:id/targets.
@@ -343,28 +373,52 @@ func (h *DeploymentHandler) CreateBinding(c *gin.Context) {
 	if req.IsEnabled != nil {
 		enabled = *req.IsEnabled
 	}
+	onRenewal := true
+	if req.DeployOnRenewal != nil {
+		onRenewal = *req.DeployOnRenewal
+	}
 
 	actor, _ := actorOf(c)
 	binding := &store.CertificateDeployment{
-		CertificateID: cert.ID,
-		TargetID:      target.ID,
-		IsEnabled:     enabled,
-		Options:       req.Options,
-		CreatedBy:     actor,
+		CertificateID:   cert.ID,
+		TargetID:        target.ID,
+		IsEnabled:       enabled,
+		DeployOnRenewal: onRenewal,
+		Options:         req.Options,
+		CreatedBy:       actor,
 	}
 	if err := h.store.CreateCertificateDeployment(c.Request.Context(), binding); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	h.audit(c, "deployment.bound", binding.ID, fmt.Sprintf(
-		`{"cn":%q,"target":%q,"carries_private_key":%t}`, cert.CommonName, target.Name, target.DeploysPrivateKey))
+		`{"cn":%q,"target":%q,"carries_private_key":%t,"deploy_on_renewal":%t}`,
+		cert.CommonName, target.Name, target.DeploysPrivateKey, onRenewal))
 
 	c.JSON(http.StatusCreated, gin.H{
-		"data": binding,
-		"message": fmt.Sprintf(
-			"%s will be deployed to %s. Binding does not install it — POST /certificates/%s/deploy does.",
-			cert.CommonName, target.Name, cert.ID),
+		"data":    binding,
+		"message": bindingMessage(cert, target, onRenewal),
 	})
+}
+
+// bindingMessage says what binding did and, more usefully, what it did not.
+//
+// Binding has never installed anything by itself, and it still does not. What
+// changed is what happens *next time*: a binding that deploys on renewal is a
+// standing instruction that will write to somebody's machine without anybody
+// pressing anything, and that is worth one sentence at the moment it is
+// created rather than a surprise at the next expiry.
+func bindingMessage(cert *store.Certificate, target *store.DeploymentTarget, onRenewal bool) string {
+	install := fmt.Sprintf(
+		"Binding does not install it now — POST /certificates/%s/deploy does.", cert.ID)
+	if onRenewal {
+		return fmt.Sprintf(
+			"%s will be deployed to %s, and installed there automatically every time it renews. %s",
+			cert.CommonName, target.Name, install)
+	}
+	return fmt.Sprintf(
+		"%s will be deployed to %s when somebody asks. It will not be installed there when it renews, so that target will hold an older certificate until it is deployed by hand. %s",
+		cert.CommonName, target.Name, install)
 }
 
 // DeleteBinding handles DELETE /api/v1/certificates/:id/targets/:bindingId.
@@ -423,67 +477,27 @@ func (h *DeploymentHandler) Deploy(c *gin.Context) {
 	}
 
 	actor, email := actorOf(c)
-	queued, existing, skipped := 0, 0, 0
-	jobs := make([]*store.DeploymentJob, 0, len(bindings))
 
-	for _, binding := range bindings {
-		if !binding.IsEnabled {
-			skipped++
-			continue
-		}
-		job := &store.DeploymentJob{
-			DeploymentID:  binding.ID,
-			CertificateID: cert.ID,
-			TargetID:      binding.TargetID,
-			Reason:        store.DeployReasonManual,
-			Status:        store.DeployPending,
-			RunAfter:      time.Now(),
-			Fingerprint:   cert.FingerprintSHA256,
-			NotAfter:      cert.NotAfter,
-			TriggeredBy:   actor,
-			ActorEmail:    email,
-		}
-		created, err := h.store.EnqueueDeployment(c.Request.Context(), job)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		if created {
-			queued++
-		} else {
-			existing++
-		}
-		jobs = append(jobs, job)
+	// The same planner a renewal uses. A renewal and an operator pressing this
+	// button differ in exactly one field, and everything that makes deployment
+	// safe has to apply identically to both — two code paths would mean the
+	// automatic one eventually diverging from the one people test by hand.
+	rollout, err := deploy.EnqueueFor(c.Request.Context(), h.store, cert,
+		store.DeployReasonManual, actor, email)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
 	h.audit(c, "cert.deploy_requested", cert.ID, fmt.Sprintf(
-		`{"cn":%q,"queued":%d,"already_queued":%d}`, cert.CommonName, queued, existing))
+		`{"cn":%q,"queued":%d,"already_queued":%d,"switched_off":%d}`,
+		cert.CommonName, rollout.Queued, rollout.Already, rollout.Skipped))
 
 	c.JSON(http.StatusAccepted, gin.H{
-		"data":    jobs,
-		"queued":  queued,
-		"message": deployQueuedMessage(cert.CommonName, queued, existing, skipped),
+		"data":    rollout.Jobs,
+		"queued":  rollout.Queued,
+		"message": deploy.RolloutMessage(cert.CommonName, rollout),
 	})
-}
-
-// deployQueuedMessage says what actually happened, including the parts that did
-// not happen. A response of "queued" over an estate where three of five targets
-// were switched off is the kind of half-truth that gets believed.
-func deployQueuedMessage(commonName string, queued, existing, skipped int) string {
-	parts := []string{}
-	if queued > 0 {
-		parts = append(parts, fmt.Sprintf("queued for %s", placesText(queued)))
-	}
-	if existing > 0 {
-		parts = append(parts, fmt.Sprintf("%s already had a deployment outstanding", placesText(existing)))
-	}
-	if skipped > 0 {
-		parts = append(parts, fmt.Sprintf("%s switched off and skipped", placesText(skipped)))
-	}
-	if len(parts) == 0 {
-		return fmt.Sprintf("Nothing to do for %s.", commonName)
-	}
-	return fmt.Sprintf("%s: %s.", commonName, strings.Join(parts, "; "))
 }
 
 // ListJobs handles GET /api/v1/deployments.

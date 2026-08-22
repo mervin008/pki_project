@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/certpilot/certpilot/core/engine/deploy"
 	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/pluginmgr"
 	"github.com/certpilot/certpilot/core/store"
@@ -148,10 +149,30 @@ func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.
 	}
 
 	// A renewal is not done when the certificate is stored. It is done when the
-	// thing serving it is serving it — and nothing here deploys it, so that gap
-	// is the normal state rather than an edge case. Deployment exists as its
-	// own queue; a renewal does not yet enqueue one.
+	// thing serving it is serving it.
 	//
+	// This is where that stops being somebody else's job. Deployments are
+	// enqueued directly rather than driven off the cert.renewed event published
+	// below: the broker drops the oldest event on a slow consumer, which is the
+	// right policy for a wall display and precisely the wrong one here — a
+	// dropped event would be a certificate that renewed and silently never
+	// deployed, which is the failure this phase exists to prevent, produced by
+	// the machinery meant to prevent it.
+	//
+	// A failure here is not fatal to the renewal, which has already happened.
+	// It is loud, because the certificate is now newer than the thing serving
+	// it and nothing is scheduled to fix that.
+	rollout, deployErr := deploy.EnqueueFor(ctx, e.store, cert, store.DeployReasonRenewal, nil, nil)
+	if deployErr != nil {
+		slog.Error("a certificate was renewed and its deployments could not be queued",
+			"cert_id", cert.ID, "common_name", cert.CommonName, "error", deployErr)
+	} else if rollout.Total() > 0 {
+		slog.Info("queued deployments for a renewed certificate",
+			"common_name", cert.CommonName, "queued", rollout.Queued,
+			"already_queued", rollout.Already, "switched_off", rollout.Skipped,
+			"not_automatic", rollout.OptedOut)
+	}
+
 	// Written through the narrow verification writer rather than as fields on
 	// the row above. UpdateCertificate has an explicit column list, and adding
 	// to the model without adding to that list drops the value in silence —

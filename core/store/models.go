@@ -1166,6 +1166,15 @@ type CertificateDeployment struct {
 	TargetID      string `json:"target_id"`
 	IsEnabled     bool   `json:"is_enabled"`
 
+	// DeployOnRenewal is whether a renewal installs here by itself.
+	//
+	// A binding created now defaults to true — "install this certificate there"
+	// obviously includes "when it changes". Bindings that predate the feature
+	// were set to false by migration 023, because an upgrade that silently
+	// began writing to production servers would be the fleet-wide mistake this
+	// switch exists to bound, delivered by a package manager.
+	DeployOnRenewal bool `json:"deploy_on_renewal"`
+
 	// Options is per-binding placement — which secret in which namespace, which
 	// path. Deliberately not a place for credentials: those belong to the
 	// target, which is the thing that holds a connection.

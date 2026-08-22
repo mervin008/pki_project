@@ -1340,6 +1340,60 @@ certificate. A certificate bound to six targets needs six jobs outstanding at
 once, and copying renewal's constraint would have deployed to the first and
 dropped five in silence.
 
+### Deploying on renewal
+
+```json
+POST /api/v1/certificates/{id}/targets
+{ "target_id": "…", "deploy_on_renewal": true }
+```
+
+`deploy_on_renewal` defaults to **true** for a binding created now, and is
+**false** for every binding that existed before migration 023. That is not a
+contradiction: a binding made from here on is made by somebody who knows the
+feature exists, and an upgrade must not silently begin writing to production
+servers. The binding summary says which is which, because a switch nobody turns
+on is a feature nobody has:
+
+```
+4 targets: 3 up to date, 1 never deployed. 1 target will not be updated when it
+renews, and will hold an older certificate until deployed by hand.
+```
+
+A renewal and this endpoint go through the same planner and differ in one field,
+the reason. Two code paths would mean the automatic one diverging from the one
+people test by hand.
+
+### A failing target halts the rollout
+
+**A deployment that has not itself failed waits while another for the same
+certificate has.** The first target attempted therefore becomes a canary on
+every certificate, with nobody having configured anything, and a bad certificate
+reaches at most as many targets as there are workers — two per replica — rather
+than all of them. When the failure clears, the rest resume on their own.
+
+Two failures do not hold each other still: the rule exempts jobs that have
+themselves failed, or the retry curve would never run.
+
+Because a deliberate halt and a broken queue look identical from outside, the
+escalation says which it is:
+
+> *1 other target is waiting behind it and will not be attempted until this one
+> succeeds: a failing target stops the rollout rather than letting a bad
+> certificate march through the estate.*
+
+There is no way to express ordering — "staging first, then production" — and no
+way to make the canary exactly one rather than one per worker. Both are recorded
+as gaps rather than implied.
+
+### The loop that proves it landed
+
+A deployment's success is a claim that bytes were accepted. The verifier's is
+evidence from a handshake. Once **every** place a certificate is bound to holds
+it, its check moves from the half hour a renewal schedules to three minutes —
+not to zero, because a verification that ran the instant a deployer returned
+would report the reload it did not wait for, and not at all on a partial
+rollout, because that is a STALE nobody needed to see.
+
 ### Cancelling a deployment
 
 ```

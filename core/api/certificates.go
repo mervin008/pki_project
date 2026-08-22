@@ -43,6 +43,25 @@ func NewCertificateHandler(s store.Store, pm *pluginmgr.Manager, exec *renewal.E
 
 // List handles GET /api/v1/certificates.
 func (h *CertificateHandler) List(c *gin.Context) {
+	// Refused rather than ignored, and this one was paid for. A cleanup script
+	// asked for `?search=rollout.step3.example.com`, which this handler has
+	// never read; the filter was dropped, the list came back as the whole
+	// estate, and the loop deleting what it matched deleted everything.
+	//
+	// A narrowing parameter that silently does not narrow turns a specific
+	// request into "all rows" — harmless on a GET a person reads, destructive
+	// the moment anything acts on the result. So an unrecognised filter is a
+	// 400 that names it.
+	if unknown := unexpectedQuery(c, "status", "environment", "common_name",
+		"ca_account_id", "limit", "offset"); unknown != "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf(
+				"%q is not a filter this endpoint understands, and returning every certificate instead of the ones you asked for would be worse than refusing. Supported: status, environment, common_name, ca_account_id, limit, offset",
+				unknown),
+		})
+		return
+	}
+
 	var filter store.CertificateFilter
 	filter.Status = c.Query("status")
 	filter.Environment = c.Query("environment")

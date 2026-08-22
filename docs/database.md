@@ -304,6 +304,28 @@ A leader would have given one replica all the work and a failover window during
 which no certificate renews at all. These two lines give N equal workers and no
 window.
 
+### Migration 023 and a default that does not apply to existing rows
+
+`certificate_deployments.deploy_on_renewal` defaults to `true`, and the same
+migration sets every row that already existed to `false`. Those two statements
+look like a mistake and are the point of the migration.
+
+A binding created from here on is created by somebody who knows that renewals
+now install by themselves. A binding that already existed was created under a
+regime where nothing deployed without a person pressing something, and turning
+it on at upgrade time would mean a package manager deciding to write to
+production servers. `ADD COLUMN ... DEFAULT true` backfills, so the `UPDATE`
+undoing it for existing rows is deliberate and is guarded on the migration not
+having been recorded as applied before — migrations here are append-only and
+checksummed, but "this ran twice" happens to people, and the cost of being
+wrong is an estate that quietly stops deploying.
+
+There is no `deploy_order` column, and its absence is also a decision. Waves
+were designed and dropped in favour of a rule that needs no configuration: the
+queue will not start a job for a certificate while another job for that
+certificate has failed. That lives entirely in the claim predicate, and the one
+index this migration adds is what makes it cheap.
+
 ### Migration 022 and the third widening of a closed list
 
 `deployment_targets.target_type` refused `'agent'`, for exactly the reason

@@ -2423,6 +2423,7 @@ func (m *MemoryStore) CreateCertificateDeployment(ctx context.Context, d *Certif
 	for _, existing := range m.deployments {
 		if existing.CertificateID == d.CertificateID && existing.TargetID == d.TargetID {
 			existing.IsEnabled = d.IsEnabled
+			existing.DeployOnRenewal = d.DeployOnRenewal
 			existing.Options = d.Options
 			existing.UpdatedAt = time.Now()
 			*d = *clone(existing)
@@ -2529,6 +2530,9 @@ func (m *MemoryStore) ClaimDeploymentJob(ctx context.Context, worker string, lea
 		// Agent targets are deployed to by the host itself. See the note on the
 		// same exclusion in PostgresStore.ClaimDeploymentJob.
 		if target, ok := m.targets[job.TargetID]; ok && target.AgentID != nil {
+			continue
+		}
+		if m.heldBackByAFailure(job) {
 			continue
 		}
 		if best == nil || moreUrgentDeployment(job, best) {
@@ -3323,7 +3327,7 @@ func (m *MemoryStore) ClaimAgentDeploymentJobs(ctx context.Context, agentID, wor
 	for _, job := range m.deploymentJobs {
 		ready := (job.Status == DeployPending && !job.RunAfter.After(now)) ||
 			(job.Status == DeployRunning && job.LockedUntil != nil && job.LockedUntil.Before(now))
-		if ready && mine[job.TargetID] {
+		if ready && mine[job.TargetID] && !m.heldBackByAFailure(job) {
 			claimable = append(claimable, job)
 		}
 	}
@@ -3381,4 +3385,34 @@ func (m *MemoryStore) PruneAgentBindings(ctx context.Context, targetID string,
 		m.deploymentJobs = kept
 	}
 	return removed, nil
+}
+
+// heldBackByAFailure reports whether this job must wait for another one.
+//
+// The canary, and it needs no configuration to exist. A job that has not itself
+// failed waits while another job for the same certificate has, so the first
+// target attempted becomes the canary on every certificate: one bad renewal
+// reaches one listener rather than forty.
+//
+// Keyed on having failed rather than on being idle. A failing job spends part
+// of every retry cycle RUNNING, and an earlier version that looked for a
+// *waiting* failure found none during those seconds — so the rollout marched on
+// through the estate one retry at a time. The exemption for jobs that have
+// themselves failed is what stops two failures holding each other still for
+// ever.
+//
+// Caller holds the lock.
+func (m *MemoryStore) heldBackByAFailure(job *DeploymentJob) bool {
+	if job.LastError != "" {
+		return false
+	}
+	for _, other := range m.deploymentJobs {
+		if other.ID == job.ID || other.CertificateID != job.CertificateID {
+			continue
+		}
+		if other.Outstanding() && other.LastError != "" {
+			return true
+		}
+	}
+	return false
 }

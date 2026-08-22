@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/certpilot/certpilot/core/engine/deploy"
 	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/store"
 	"github.com/certpilot/certpilot/pkg/agentapi"
@@ -210,6 +211,13 @@ func (in *Installs) reconcileBindings(ctx context.Context, agent *store.Agent,
 			outcome.Status == store.DeploymentDeployed, outcome.Error); err != nil {
 			slog.Error("could not record that a host installed something",
 				"agent", agent.Name, "target", target.ID, "error", err)
+		}
+		// The same loop the core's own deployments close. A host installing a
+		// certificate is a deployment; whether the thing in front of the users
+		// is serving it is still a separate question, and this brings the
+		// answer forward from the half hour a renewal schedules.
+		if outcome.Status == store.DeploymentDeployed {
+			deploy.Settled(ctx, in.store, certificateID)
 		}
 	}
 	return count

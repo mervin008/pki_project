@@ -370,6 +370,15 @@ func (q *Queue) announceEscalation(ctx context.Context, job *store.DeploymentJob
 		"error":          cause.Error(),
 	}
 
+	// What is stuck behind this one, which is the part that changes what
+	// somebody does about it. A single failing target is an errand; a failing
+	// target holding back eleven others is the reason the other eleven are
+	// still on a certificate that expires next week — and they are held back
+	// deliberately, so the message has to say so or it reads as a second fault.
+	if waiting := q.waitingBehind(ctx, job); waiting > 0 {
+		payload["waiting_behind"] = waiting
+	}
+
 	// Looked up per escalation rather than denormalised onto the job. This
 	// happens once per stuck deployment, and a job row carrying a copy of a
 	// name somebody has since changed would report the old one.
@@ -464,4 +473,33 @@ func (q *Queue) CompleteReported(ctx context.Context, job *store.DeploymentJob,
 		}
 	}
 	return nil
+}
+
+// waitingBehind counts the deployments this failure is holding still.
+//
+// The queue refuses to start a fresh job for a certificate while another job
+// for it is failing, so one bad target stops the rollout rather than letting it
+// march through the estate. That is the intended behaviour and it is invisible
+// from the outside — a person looking at eleven PENDING jobs that never move
+// would reasonably conclude the queue was broken.
+func (q *Queue) waitingBehind(ctx context.Context, job *store.DeploymentJob) int {
+	jobs, _, err := q.store.ListDeploymentJobs(ctx, store.DeploymentJobFilter{
+		CertificateID:   job.CertificateID,
+		OutstandingOnly: true,
+		Limit:           200,
+	})
+	if err != nil {
+		return 0
+	}
+	waiting := 0
+	for _, other := range jobs {
+		// The same rule the claim query uses: a job that has not itself failed
+		// is the one being held. Counting by attempts instead would include the
+		// other failures, which are not waiting on this — they are failing on
+		// their own account and have their own alert.
+		if other.ID != job.ID && other.LastError == "" {
+			waiting++
+		}
+	}
+	return waiting
 }

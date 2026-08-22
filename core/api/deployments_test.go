@@ -172,7 +172,7 @@ func TestDeployQueuesOnePerPlaceAndSaysWhatItSkipped(t *testing.T) {
 		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, "queued for 1 target") || !strings.Contains(body, "switched off and skipped") {
+	if !strings.Contains(body, "queued for 1 target") || !strings.Contains(body, "switched off") {
 		t.Fatalf("the response should account for both targets: %s", body)
 	}
 

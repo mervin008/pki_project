@@ -180,6 +180,18 @@ func (e *Executor) Deploy(ctx context.Context, job *store.DeploymentJob) (string
 		})
 	}
 
+	// The other half of the loop. Deployment's success is a claim that bytes
+	// were accepted; the verifier's is evidence from an actual handshake. Now
+	// that CertPilot installs the certificate itself rather than waiting for a
+	// person to, the check that proves it landed can be brought forward from
+	// the half hour a renewal schedules — but only once every place this
+	// certificate belongs is holding it, because a partial rollout verified
+	// early is a STALE nobody needed to see.
+	if Settled(ctx, e.store, cert.ID) {
+		slog.Info("certificate deployed to every place it is bound",
+			"common_name", cert.CommonName)
+	}
+
 	slog.Info("certificate deployed", "job", job.ID, "common_name", cert.CommonName,
 		"target", target.Name, "detail", detail)
 	return detail, nil
