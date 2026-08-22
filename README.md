@@ -22,7 +22,7 @@ than by whether a socket has errored, and a dead feed visibly degrades the
 page instead of leaving the last good numbers on it.
 
 > **Status: early development.** The core, the gateway plugin architecture, the
-> ACME and self-signed gateways, and the host agent work end to end. Deployment
+> ACME, Vault and self-signed gateways, and the host agent work end to end. Deployment
 > to cloud load balancers, network discovery at scale, and the PQC posture
 > reporting are not built yet. The [feature table](#what-works-today) below is
 > accurate; anything not listed there does not exist. Do not run this in
@@ -61,16 +61,17 @@ writing a plugin rather than patching the platform.
                     │  REST API · PKI engine   │
                     │  Renewal · Policy        │
                     │  Plugin manager          │
-                    └──┬──────────────────┬────┘
-                       │  mutual TLS      │
-              ┌────────▼──────┐   ┌───────▼────────┐
-              │ ACME gateway  │   │ Self-signed    │
-              │ RFC 8555      │   │ gateway (dev)  │
-              └───────────────┘   └────────────────┘
-                       │
-              Let's Encrypt, ZeroSSL,
-              BuyPass, Google Trust
-              Services, step-ca
+                    └────────────┬─────────────┘
+                                 │ mutual TLS
+        ┌────────────────────────┼────────────────────────┐
+┌───────▼────────┐      ┌────────▼───────┐      ┌─────────▼──────┐
+│ ACME gateway   │      │ Vault gateway  │      │ Self-signed    │
+│ RFC 8555       │      │ PKI engine     │      │ gateway (dev)  │
+└────────────────┘      └────────────────┘      └────────────────┘
+        │                        │
+Let's Encrypt, ZeroSSL,   HashiCorp Vault: issue,
+BuyPass, Google Trust,    revoke, and the mount's
+step-ca                   own issuers
 ```
 
 The core-to-gateway channel carries certificate signing requests, private keys,
@@ -88,6 +89,8 @@ explicitly.
 | External Account Binding | ✅ | Required by ZeroSSL, Google Trust Services, SSL.com |
 | ACME revocation | ✅ | Real revocation; already-revoked is treated as success |
 | Renewal information (RFC 9773) | ✅ | Renews inside the CA's suggested window, at a random instant within it. A window pulled forward — what a CA does during a mass revocation — is a CRITICAL alert carrying the CA's own explanation |
+| Vault PKI issuance | ✅ | Issue, renew, revoke and status against a Vault PKI mount, with token, AppRole or Kubernetes auth. Signs CSRs by preference, so a key generated on the host stays there. Verified against a real Vault, not only a stub |
+| Vault issuer visibility | ✅ | The only gateway that answers `GetCAInfo`: the mount's issuers, their expiry and their CRL. Vault **refuses** to sign a certificate that would outlive its issuer, so the day an issuing CA comes within one certificate lifetime of expiry, every renewal through it fails at once — this is said at configuration time instead |
 | Self-signed gateway | ✅ | Development and testing |
 | Secrets encrypted at rest | ✅ | AES-256-GCM envelope encryption, context-bound, rotatable |
 | Mutual TLS, core ↔ gateway | ✅ | Required by default; `make dev-certs` to get started |
@@ -115,7 +118,8 @@ explicitly.
 | Deployment to servers | ✅ | Durable, retried, audited deployment to a signed webhook, a host running the agent, AWS ACM, Azure Key Vault and F5 BIG-IP. **A renewal deploys itself**, and a failing target halts the rest of the rollout rather than letting a bad certificate march through the estate. Key Vault and F5 are written to their published APIs and unit-tested; neither has been run against a real vault or appliance |
 | Host agent | ✅ | One binary that enrols, inventories, **requests certificates with keys it generates locally and never sends** — CertPilot cannot produce them and does not claim to — then installs them where the server actually reads them and reloads it. Bounded by grants an operator writes in advance |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
-| Vault, GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
+| Vault issuers in the CA inventory | ❌ | The gateway reports them; the core does not yet record them as CA authorities, so they are not monitored or alerted on alongside everything else |
+| GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
 
 ## Quick start
 
@@ -271,6 +275,78 @@ curl -X POST localhost:8080/api/v1/ca-accounts -H 'Content-Type: application/jso
 
 The gateway validates this configuration before it is stored, so a wrong token
 surfaces immediately rather than during a renewal at 3am.
+
+### Against your own Vault
+
+Most organisations running private PKI already have one. The gateway holds no
+credential of its own — each CA account carries the AppRole or Kubernetes
+identity it issues under, so the process is authorised to sign nothing until an
+account gives it an identity.
+
+```bash
+make run-gateway-vault
+```
+
+```bash
+curl -X POST localhost:8080/api/v1/ca-accounts -H 'Content-Type: application/json' -d '{
+  "name": "vault-issuing",
+  "provider_type": "vault",
+  "gateway_addr": "localhost:9093",
+  "server_name": "localhost",
+  "config": {
+    "address": "https://vault.internal:8200",
+    "mount": "pki-int",
+    "role": "web",
+    "issuer_ref": "issuing-2026",
+    "auth_method": "approle",
+    "role_id": "...",
+    "secret_id": "..."
+  }
+}'
+```
+
+What comes back is the point:
+
+```json
+{
+  "warnings": [
+    "role \"web\" issues EC keys of 256 bits regardless of what a request asks for",
+    "role \"web\" caps validity at 90 days; a longer request is shortened to it",
+    "the issuing CA \"Corp Issuing CA G2\" expires on 2026-09-12, in 20 days.
+     Vault refuses to sign a certificate that would outlive its issuer, so
+     issuance through this account starts failing before that date — as soon as
+     a requested validity reaches past it — and every certificate it has
+     already signed expires with it"
+  ]
+}
+```
+
+That last one is the reason this gateway exists in the shape it does. **Vault
+does not shorten a certificate that would outlive its issuer. It refuses to
+sign it** — with a message about a `notAfter` date that says nothing about the
+CA. So there is no gradual degradation: on the first day an issuing CA comes
+within one certificate lifetime of its own expiry, every renewal through it
+fails together, and the error sends people to look at the role.
+
+CertPilot says it at account creation, and translates the refusal if it ever
+arrives anyway.
+
+A few other things worth knowing:
+
+- **CSRs are signed by preference.** When the request carries one — everything
+  from the host agent does — the key was generated on the machine that will
+  serve the certificate, and no private key exists here to return. Vault only
+  generates a key when nobody supplied a CSR.
+- **A Vault role uses the names in the CSR**, not the ones in the request
+  (`use_csr_common_name` and `use_csr_sans` default on). Asking for a name the
+  CSR does not carry is refused rather than issued short, because the
+  alternative is a certificate recorded as covering a name it does not.
+- **Revocation is real** — the serial reaches the mount's CRL. A role with
+  `no_store` can still be revoked, because CertPilot sends the certificate
+  rather than its serial; what it cannot do is report status before that.
+- **Token, AppRole and Kubernetes** auth, with the token cached and renewed
+  rather than a fresh login per issuance. A static token gets a warning: it
+  cannot outlive its maximum TTL, and when it expires everything stops at once.
 
 ### Finding what nobody told you about
 

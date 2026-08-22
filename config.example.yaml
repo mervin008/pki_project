@@ -73,6 +73,14 @@ plugins:
       type: "acme"
       server_name: "localhost"
 
+    # The Vault gateway holds no credential of its own. Each CA account carries
+    # the AppRole or Kubernetes identity it issues under, so this process is
+    # authorised to sign nothing until an account gives it an identity.
+    - name: "vault"
+      addr: "localhost:9093"
+      type: "vault"
+      server_name: "localhost"
+
 # CA health monitoring, in minutes.
 pki:
   ca_health_check_interval: 360

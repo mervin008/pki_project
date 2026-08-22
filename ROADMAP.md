@@ -1300,9 +1300,34 @@ name nothing will ever implement.
 
 ### Phase 7 — More CAs
 
-HashiCorp Vault PKI first — it is what most organisations running private PKI
-already have. Then Microsoft AD CS, AWS Private CA, Google Cloud CAS, EJBCA,
-DigiCert, Sectigo.
+**HashiCorp Vault PKI ✅** — issue, renew, revoke and status against a PKI
+mount, with token, AppRole or Kubernetes auth; CSRs signed by preference so a
+key generated on a host stays there; tokens cached and renewed rather than one
+login per issuance. Verified against a real Vault, not only against a stub — a
+distinction that earned its keep, because the first live run found that
+`sys/health` is not wrapped in Vault's data envelope and every real Vault was
+therefore being reported as uninitialized.
+
+Vault is also the first CA that will describe itself, and that turns out to
+matter more than the issuance:
+
+> Vault does not shorten a certificate that would outlive its issuer. It
+> **refuses to sign it**.
+
+So the day an issuing CA comes within one certificate lifetime of its own
+expiry, every renewal through it fails at once, with a message about a
+`notAfter` date that says nothing about the cause. The gateway reports the
+mount's issuers and their expiry through `GetCAInfo`, says it at account
+creation, and translates the refusal if it arrives anyway.
+
+Still to do here: **the core does not yet record what `GetCAInfo` returns.** The
+RPC has existed since the first proto and nothing has ever called it. Until it
+does, a Vault issuer is visible when an account is validated and is not in the
+CA inventory the monitor, the alerts and the wall display are built on — which
+is the whole reason to know about it.
+
+Then Microsoft AD CS, AWS Private CA, Google Cloud CAS, EJBCA, DigiCert,
+Sectigo.
 
 One gateway that genuinely works beats five stubs.
 

@@ -326,6 +326,12 @@ func (h *DiscoveryHandler) Import(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	environment, err := normalizeEnvironment(input.Environment)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	input.Environment = environment
 
 	var result *store.DiscoveryResult
 	certPEM := strings.TrimSpace(input.CertificatePEM)

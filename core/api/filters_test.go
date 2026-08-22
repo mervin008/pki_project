@@ -375,3 +375,40 @@ func TestEmptyListsSerializeAsArraysNotNull(t *testing.T) {
 		}
 	}
 }
+
+// TestAnUnknownEnvironmentIsRefusedBeforeIssuance covers a check the schema has
+// enforced since migration 001 and nothing checked before asking the CA.
+//
+// The order was the wrong way round: the certificate was signed, the row was
+// refused by a check constraint, and the operator got a raw SQLSTATE — while a
+// real certificate existed at the CA that CertPilot had no record of, counted
+// against the account's rate limit, and would never be renewed or revoked
+// because nothing knew it was there.
+func TestAnUnknownEnvironmentIsRefusedBeforeIssuance(t *testing.T) {
+	accepted := map[string]string{
+		"production":  "production",
+		"staging":     "staging",
+		"development": "development",
+		"Production":  "production",
+		"  STAGING  ": "staging",
+		"":            "",
+	}
+	for input, want := range accepted {
+		got, err := normalizeEnvironment(input)
+		if err != nil {
+			t.Errorf("normalizeEnvironment(%q) = %v, want it accepted", input, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("normalizeEnvironment(%q) = %q, want %q", input, got, want)
+		}
+	}
+
+	// "prod" and "lab" are the two an operator actually types, and both would
+	// have reached the CA before failing.
+	for _, input := range []string{"lab", "prod", "uat", "qa", "Production!"} {
+		if _, err := normalizeEnvironment(input); err == nil {
+			t.Errorf("normalizeEnvironment(%q) was accepted; the database would refuse the row after the CA had signed", input)
+		}
+	}
+}

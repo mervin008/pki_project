@@ -1,5 +1,5 @@
 .PHONY: test-store all build build-core build-agent build-gateways test test-frontend test-coverage lint proto proto-lint \
-        dev dev-certs generate-kek run-core run-gateway-selfsigned run-gateway-acme run-frontend \
+        dev dev-certs generate-kek run-core run-gateway-selfsigned run-gateway-acme run-gateway-vault run-frontend \
         clean help
 
 # ── Variables ────────────────────────────────────────────
@@ -11,11 +11,12 @@ STATE := .certpilot/state
 
 # Each component is its own Go module, so tooling has to iterate rather than
 # rely on a single ./... from the repository root.
-MODULES := pkg core gateways/selfsigned gateways/acme agent
+MODULES := pkg core gateways/selfsigned gateways/acme gateways/vault agent
 
 CORE_BIN          := $(BIN)/certpilot-core
 GW_SELFSIGNED_BIN := $(BIN)/gateway-selfsigned
 GW_ACME_BIN       := $(BIN)/gateway-acme
+GW_VAULT_BIN      := $(BIN)/gateway-vault
 AGENT_BIN         := $(BIN)/certpilot-agent
 
 # ── Build ────────────────────────────────────────────────
@@ -29,13 +30,16 @@ build-core:
 build-agent:
 	$(GO) build -o $(AGENT_BIN) ./agent/cmd/
 
-build-gateways: build-gateway-selfsigned build-gateway-acme
+build-gateways: build-gateway-selfsigned build-gateway-acme build-gateway-vault
 
 build-gateway-selfsigned:
 	$(GO) build -o $(GW_SELFSIGNED_BIN) ./gateways/selfsigned/cmd/
 
 build-gateway-acme:
 	$(GO) build -o $(GW_ACME_BIN) ./gateways/acme/cmd/
+
+build-gateway-vault:
+	$(GO) build -o $(GW_VAULT_BIN) ./gateways/vault/cmd/
 
 # ── Proto ────────────────────────────────────────────────
 proto:
@@ -89,6 +93,17 @@ run-gateway-acme:
 		--port=9092 \
 		--directory=letsencrypt-staging \
 		--state-dir=$(STATE)/acme \
+		--tls-cert=$(PKI)/gateway.pem \
+		--tls-key=$(PKI)/gateway-key.pem \
+		--tls-ca=$(PKI)/ca.pem
+
+## The Vault gateway takes no credential of its own. Each CA account carries
+## the AppRole or Kubernetes identity it issues under, so nothing here is
+## authorised to sign anything.
+run-gateway-vault:
+	$(GO) run ./gateways/vault/cmd/ \
+		--port=9093 \
+		--address=$(VAULT_ADDR) \
 		--tls-cert=$(PKI)/gateway.pem \
 		--tls-key=$(PKI)/gateway-key.pem \
 		--tls-ca=$(PKI)/ca.pem
@@ -183,6 +198,7 @@ help:
 	@echo "  make run-core                CertPilot Core        :8080"
 	@echo "  make run-gateway-selfsigned  Self-signed gateway   :9091"
 	@echo "  make run-gateway-acme        ACME gateway          :9092"
+	@echo "  make run-gateway-vault       Vault PKI gateway     :9093"
 	@echo "  make run-frontend            Vue frontend          :3000"
 	@echo ""
 	@echo "Check"

@@ -113,6 +113,13 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		return
 	}
 
+	environment, err := normalizeEnvironment(input.Environment)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	input.Environment = environment
+
 	if input.KeyType == "" {
 		input.KeyType = "RSA"
 	}

@@ -157,7 +157,7 @@ Then the entrypoint. `pkg/grpckit` handles mTLS, health, and keepalives:
 
 ```go
 func main() {
-    port := flag.Int("port", 9093, "gRPC server port")
+    port := flag.Int("port", 9094, "gRPC server port")
     tlsCert := flag.String("tls-cert", "", "this gateway's TLS certificate")
     tlsKey := flag.String("tls-key", "", "this gateway's TLS private key")
     tlsCA := flag.String("tls-ca", "", "CA bundle used to verify the core")
@@ -208,7 +208,7 @@ curl -X POST localhost:8080/api/v1/ca-accounts \
   -H 'Content-Type: application/json' -d '{
     "name": "my-custom-ca",
     "provider_type": "custom",
-    "gateway_addr": "localhost:9093",
+    "gateway_addr": "localhost:9094",
     "server_name": "localhost",
     "config": {"endpoint": "https://ca.internal", "api_token": "..."}
   }'
@@ -243,14 +243,18 @@ core rather than just failing:
 - That `GetCapabilities` lists only what is actually implemented
 
 [`gateways/selfsigned`](../gateways/selfsigned) is the smallest complete
-example. [`gateways/acme`](../gateways/acme) is the realistic one: challenge
-solvers, persistent account state, External Account Binding, and RFC 9773
-renewal information.
+example. [`gateways/acme`](../gateways/acme) is the realistic public-CA one:
+challenge solvers, persistent account state, External Account Binding, and RFC
+9773 renewal information. [`gateways/vault`](../gateways/vault) is the private-CA
+one, and the only gateway that implements `GetCAInfo` — worth reading for how it
+translates a CA's own refusals into sentences that name the cause, and for the
+live test suite that runs against a real Vault rather than a stub.
 
 ## Wanted gateways
 
-In rough order of demand: HashiCorp Vault PKI, Microsoft AD CS, AWS Private CA,
-Google Cloud CAS, EJBCA, DigiCert, Sectigo, Entrust, and step-ca.
+In rough order of demand: Microsoft AD CS, AWS Private CA, Google Cloud CAS,
+EJBCA, DigiCert, Sectigo, Entrust, and step-ca. HashiCorp Vault PKI is
+[built](../gateways/vault).
 
 The private-CA gateways are also where post-quantum issuance is possible today —
 AWS Private CA has had ML-DSA generally available since November 2025, while
