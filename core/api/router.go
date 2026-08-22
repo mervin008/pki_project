@@ -88,6 +88,10 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 
 		signed := agentGroup.Group("", middleware.AgentAuth(deps.Store))
 		signed.POST("/heartbeat", agentHandler.Heartbeat)
+		// What is on the host. Certificates as PEM plus the facts only a
+		// process on the machine can see; no field a private key could arrive
+		// in.
+		signed.POST("/inventory", agentHandler.Inventory)
 	}
 
 	v1 := engine.Group("/api/v1")
@@ -250,6 +254,12 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// Enrolment tokens are admin throughout, including the list. The hash
 		// is useless on its own, but a list of live tokens is a map of which
 		// doors are currently open.
+		// The fourth place certificates hide: a file on a disk, behind two
+		// firewalls, that no scan, no transparency log, and no cloud API will
+		// ever mention. Reading is open to any authenticated user — it carries
+		// paths and permissions, never key material.
+		v1.GET("/agent-certificates", agentHandler.ListCertificates)
+
 		v1.GET("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.ListEnrolTokens)
 		v1.POST("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.CreateEnrolToken)
 		v1.DELETE("/agent-enrol-tokens/:id", middleware.RequireRole(middleware.RoleAdmin), agentHandler.RevokeEnrolToken)

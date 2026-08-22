@@ -75,8 +75,29 @@ const (
 	// certificates on it, still has them expiring, and now has nothing
 	// maintaining them — while looking exactly like a healthy host on any
 	// screen that counts enrolled agents.
-	TopicAgentStale    = "agent.stale"
-	TopicGatewayStatus = "gateway.status"
+	TopicAgentStale = "agent.stale"
+	// TopicAgentKeyExposed carries the finding no remote observer can make.
+	//
+	// A private key at mode 0644 means every account on that host holds the key
+	// to that certificate, and rotating the certificate does not undo it — the
+	// certificate has to be reissued. Nothing watching from the network can ever
+	// see this; it takes one stat call from a process on the machine.
+	TopicAgentKeyExposed = "agent.key_exposed"
+	// TopicAgentKeyMismatch carries a certificate whose key does not belong to
+	// it.
+	//
+	// Its own topic rather than a variant of the one above, because they are
+	// different problems with different owners. An exposed key is a security
+	// incident that needs the certificate reissued; a mismatched pair is a
+	// service that will not come back after its next restart. A message saying
+	// "one of these two things" makes the reader go and look, which is the work
+	// an alert exists to save.
+	TopicAgentKeyMismatch = "agent.key_mismatch"
+	// TopicAgentUnmanaged carries a certificate found on a host that CertPilot
+	// did not issue and is not tracking — the fourth place they hide, after
+	// served, issued, and stored in a cloud.
+	TopicAgentUnmanaged = "agent.unmanaged"
+	TopicGatewayStatus  = "gateway.status"
 	// TopicDiscoveryUnmanaged carries the one finding a discovery scan exists
 	// to produce: an endpoint serving a certificate this system has never seen.
 	// Published so it reaches the channels a team already configured, rather
@@ -163,6 +184,9 @@ func AllTopics() []string {
 		TopicCertExpiring,
 		TopicAgentEnrolled,
 		TopicAgentStale,
+		TopicAgentKeyExposed,
+		TopicAgentKeyMismatch,
+		TopicAgentUnmanaged,
 		TopicGatewayStatus,
 		TopicDiscoveryUnmanaged,
 		TopicDiscoveryChanged,

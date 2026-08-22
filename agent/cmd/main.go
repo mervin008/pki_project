@@ -18,10 +18,12 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/certpilot/certpilot/agent"
+	"github.com/certpilot/certpilot/pkg/agentapi"
 )
 
 func main() {
@@ -43,6 +45,8 @@ func main() {
 		err = runAgent(ctx, os.Args[2:])
 	case "status":
 		err = runStatus(os.Args[2:])
+	case "scan":
+		err = runScan(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -65,6 +69,7 @@ func usage() {
 
   certpilot-agent enrol  --server=URL --token=TOKEN [--name=NAME] [--interval=5m]
   certpilot-agent run    [--state-dir=DIR]
+  certpilot-agent scan   [--path=DIR ...]      what this host would report
   certpilot-agent status [--state-dir=DIR]
 
 Enrolment generates this host's identity key locally. The private half is never
@@ -82,16 +87,19 @@ func runEnrol(ctx context.Context, args []string) error {
 	name := fs.String("name", "", "what to call this host in CertPilot (defaults to its hostname)")
 	stateDir := fs.String("state-dir", agent.DefaultStateDir(), "where to keep this agent's identity")
 	interval := fs.Duration("interval", 5*time.Minute, "how often this agent will report")
+	var paths stringList
+	fs.Var(&paths, "path", "a directory to scan for certificates (repeatable; defaults are used if unset)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	result, err := agent.Enrol(ctx, agent.EnrolOptions{
-		Server:   *server,
-		Token:    *token,
-		Name:     *name,
-		StateDir: *stateDir,
-		Interval: *interval,
+		Server:    *server,
+		Token:     *token,
+		Name:      *name,
+		StateDir:  *stateDir,
+		Interval:  *interval,
+		ScanPaths: paths,
 	})
 	if err != nil {
 		return err
@@ -111,7 +119,7 @@ func runEnrol(ctx context.Context, args []string) error {
 func runAgent(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	stateDir := fs.String("state-dir", agent.DefaultStateDir(), "where this agent's identity is kept")
-	once := fs.Bool("once", false, "report a single heartbeat and exit")
+	once := fs.Bool("once", false, "report once — heartbeat and inventory — then exit")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -123,10 +131,19 @@ func runAgent(ctx context.Context, args []string) error {
 
 	runner := agent.NewRunner(agent.NewClient(state.Server, state.AgentID, key), state)
 	if *once {
+		// Heartbeat *and* inventory. "Report once" has to mean everything this
+		// agent would report, or an estate running it from a systemd timer
+		// rather than as a daemon — which plenty will — would tell CertPilot it
+		// is alive and never tell it what is on the host.
 		if _, err := runner.Heartbeat(ctx); err != nil {
 			return err
 		}
-		fmt.Println("reported")
+		report, err := runner.ReportInventory(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("reported: %d certificate file(s) from %d file(s) scanned\n",
+			len(report.Certificates), report.FilesSeen)
 		return nil
 	}
 	return runner.Run(ctx)
@@ -149,4 +166,73 @@ func runStatus(args []string) error {
 	}
 	fmt.Println(string(body))
 	return nil
+}
+
+// stringList collects a repeatable flag.
+type stringList []string
+
+func (s *stringList) String() string     { return strings.Join(*s, ",") }
+func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
+
+// runScan prints what this host would report, and sends nothing.
+//
+// A dry run first is the right posture for something that walks a production
+// filesystem: whoever is about to install this on four hundred machines should
+// be able to see the output of one before any of it leaves the host.
+func runScan(args []string) error {
+	fs := flag.NewFlagSet("scan", flag.ExitOnError)
+	var paths stringList
+	fs.Var(&paths, "path", "a directory to scan (repeatable; defaults are used if unset)")
+	asJSON := fs.Bool("json", false, "print the report exactly as it would be sent")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	report := agent.Scan(paths)
+	if *asJSON {
+		body, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(body))
+		return nil
+	}
+
+	fmt.Printf("Scanned %d files under %s\n", report.FilesSeen, strings.Join(report.Paths, ", "))
+	fmt.Printf("Found %d certificate file(s)\n\n", len(report.Certificates))
+	for _, found := range report.Certificates {
+		fmt.Printf("  %s\n", found.Path)
+		fmt.Printf("    %s  mode %s  owner %s  fingerprint %s…\n",
+			found.Kind, found.Mode, found.Owner, found.Fingerprint[:16])
+		switch {
+		case found.PrivateKeyInSameFile:
+			fmt.Printf("    private key: in this file, mode %s%s\n", found.PrivateKeyMode, matchNote(found))
+		case found.PrivateKeyPath != "":
+			fmt.Printf("    private key: %s, mode %s%s\n", found.PrivateKeyPath, found.PrivateKeyMode, matchNote(found))
+		case found.Kind == agentapi.KindLeaf:
+			fmt.Printf("    private key: none found beside it — this host cannot serve this certificate\n")
+		}
+		if len(found.ReferencedBy) > 0 {
+			fmt.Printf("    referenced by: %s\n", strings.Join(found.ReferencedBy, ", "))
+		}
+		fmt.Println()
+	}
+	for _, e := range report.Errors {
+		fmt.Printf("  could not read: %s\n", e)
+	}
+	if report.Truncated {
+		fmt.Println("  (the scan hit its own limits; this list is incomplete)")
+	}
+	// Said out loud, because it is the thing somebody about to roll this out
+	// wants to be sure of.
+	fmt.Println("Nothing was sent. Private keys are never read into a report — only")
+	fmt.Println("whether one is there, whether it matches, and what its permissions are.")
+	return nil
+}
+
+func matchNote(found agent.Discovered) string {
+	if found.PrivateKeyMatches {
+		return ""
+	}
+	return "  ** does not match this certificate **"
 }

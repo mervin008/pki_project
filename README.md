@@ -110,7 +110,7 @@ explicitly.
 | Post-renewal verification | ✅ | Re-probes the endpoints discovery has seen serving a certificate and reports when a renewal never reached them — the green-dashboard-over-an-expiring-estate failure, caught |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ⚠️ | Durable, retried, audited deployment to a generic signed webhook — enough for anything you can put an HTTP receiver in front of. Kubernetes, ACM, Key Vault and F5 are next; deployment is triggered by hand, not yet by renewal |
-| Host agent | ⚠️ | One binary that enrols with a key it generates locally and never sends. Signed requests, one-use enrolment tokens, revocation that stops a running agent, and an alert when a host goes quiet. It does not yet inventory or install anything |
+| Host agent | ⚠️ | One binary that enrols with a key it generates locally and never sends, then inventories the certificate files on its host — including the two things no remote observer can see: whether the private key is readable by other accounts, and whether it matches. It does not yet request or install certificates |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
 | Vault, GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
 
@@ -742,6 +742,71 @@ maintained; they expire on their own schedule with nothing scheduled to
 replace them.
 ```
 
+### The fourth place certificates hide
+
+A scan finds what is served. Certificate Transparency finds what was issued. A
+cloud sync finds what a provider is holding. None of them finds the certificate
+in `/etc/nginx/ssl` on a host behind two firewalls, issued by an internal CA, on
+a port nobody scanned.
+
+Try it before you install anything — the scan prints and sends nothing:
+
+```bash
+certpilot-agent scan --path=/etc/nginx --path=/etc/haproxy
+```
+```
+  /etc/haproxy/lb.pem
+    leaf  mode 0644  owner 0:0  fingerprint e96d993062523a83…
+    private key: in this file, mode 0644
+
+  /etc/nginx/ssl/mixedup.crt
+    leaf  mode 0644  owner 0:0  fingerprint fcbf542bf5cf64ea…
+    private key: /etc/nginx/ssl/mixedup.key, mode 0600  ** does not match this certificate **
+
+Nothing was sent. Private keys are never read into a report — only
+whether one is there, whether it matches, and what its permissions are.
+```
+
+Finding the files is not the point. **Two of these are things no remote observer
+can ever see**, and they are the reason to run something on the host at all:
+
+```
+CRITICAL — Private key readable on web-01
+
+2 certificate files on web-01 have a private key that other accounts on that
+host can read. Every account that can is holding that key: reissuing is the
+fix, and renewing is not — nor is changing the file mode after the fact.
+```
+
+```
+CRITICAL — Certificate and key do not match on web-01
+
+2 certificate files on web-01 have private keys that do not belong to them.
+Whatever is serving them is running on material it loaded earlier; the next
+restart will fail, and it will look like it came from nowhere.
+```
+
+Separate alerts, because they are separate problems with different owners.
+
+`?finding=private_key_readable` is a query nothing else in this system can
+answer. And `?finding=superseded` is the one that closes a loop:
+
+```
+CRITICAL — This file holds the certificate that shop.example.com was renewed
+away from. CertPilot has the new one; this host still has the old one on disk.
+It is named in /etc/nginx/nginx.conf, so whatever reads that configuration is
+serving the certificate this replaced.
+```
+
+That is post-renewal verification's conclusion from a third direction — and
+unlike the verifier, it needs no scan to have ever reached the host.
+
+Certificates travel as PEM and are parsed by the core, not the agent. That split
+is deliberate: the agent runs on machines nobody upgrades for years, and parsing
+logic on five hundred of them is parsing logic you cannot fix. A host's
+`ca-certificates` bundle is recorded as one row saying it holds 143 roots, not
+as 143 findings about a package nobody edited.
+
 ## Security model
 
 Read this before deploying anything.
@@ -923,8 +988,9 @@ complete: a streaming dashboard and wall display, network / CT / cloud
 discovery, and renewal as a durable queue with ARI and post-renewal
 verification. Deployment has begun — a certificate can now be installed
 somewhere, durably and with an attempt log — and the agent has an identity built
-on a key it generated and never sent. What remains of that phase is the agent
-learning to inventory a host, request certificates for it, and install them.
+on a key it generated and never sent, plus an inventory of the certificate files
+on its host. What remains of that phase is the agent requesting certificates and
+installing them.
 
 ## License
 

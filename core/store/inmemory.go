@@ -51,6 +51,7 @@ type MemoryStore struct {
 	deploymentJobs []*DeploymentJob
 	agents         map[string]*Agent
 	enrolTokens    map[string]*AgentEnrolToken
+	agentCerts     []*AgentCertificate
 }
 
 // clone returns a shallow copy of a stored record.
@@ -2923,4 +2924,145 @@ func (m *MemoryStore) RevokeAgentEnrolToken(ctx context.Context, id string, revo
 	now := time.Now()
 	t.RevokedAt, t.RevokedBy, t.UpdatedAt = &now, revokedBy, now
 	return nil
+}
+
+// ── What is on the hosts ────────────────────────────────────
+
+func (m *MemoryStore) UpsertAgentCertificates(ctx context.Context, certs []*AgentCertificate) ([]*AgentCertificate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	created := []*AgentCertificate{}
+
+	for _, c := range certs {
+		var existing *AgentCertificate
+		for _, stored := range m.agentCerts {
+			if stored.AgentID == c.AgentID && stored.Path == c.Path {
+				existing = stored
+				break
+			}
+		}
+		if existing != nil {
+			first, created0 := existing.FirstSeenAt, existing.CreatedAt
+			id := existing.ID
+			*existing = *clone(c)
+			existing.ID, existing.FirstSeenAt, existing.CreatedAt = id, first, created0
+			existing.LastSeenAt = now
+			// A file that came back is not removed any more.
+			existing.RemovedAt = nil
+			*c = *clone(existing)
+			continue
+		}
+
+		stored := clone(c)
+		if stored.ID == "" {
+			stored.ID = uuid.New().String()
+		}
+		stored.FirstSeenAt, stored.LastSeenAt, stored.CreatedAt = now, now, now
+		m.agentCerts = append(m.agentCerts, stored)
+		*c = *clone(stored)
+		created = append(created, c)
+	}
+	return created, nil
+}
+
+func (m *MemoryStore) MarkAgentCertificatesRemoved(ctx context.Context, agentID string,
+	seenPaths []string, at time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	seen := make(map[string]bool, len(seenPaths))
+	for _, p := range seenPaths {
+		seen[p] = true
+	}
+
+	removed := 0
+	when := at
+	for _, c := range m.agentCerts {
+		if c.AgentID != agentID || c.RemovedAt != nil || seen[c.Path] {
+			continue
+		}
+		c.RemovedAt = &when
+		removed++
+	}
+	return removed, nil
+}
+
+func (m *MemoryStore) ListAgentCertificates(ctx context.Context, filter AgentCertificateFilter) ([]*AgentCertificate, int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	matched := make([]*AgentCertificate, 0)
+	for _, c := range m.agentCerts {
+		if filter.AgentID != "" && c.AgentID != filter.AgentID {
+			continue
+		}
+		if filter.ManagementState != "" && c.ManagementState != filter.ManagementState {
+			continue
+		}
+		if filter.Kind != "" && c.Kind != filter.Kind {
+			continue
+		}
+		if !filter.IncludeRemoved && c.RemovedAt != nil {
+			continue
+		}
+		if filter.Finding != "" && !hasFinding(c.Findings, filter.Finding) {
+			continue
+		}
+		copied := clone(c)
+		if agent, ok := m.agents[c.AgentID]; ok {
+			copied.AgentName = agent.Name
+		}
+		matched = append(matched, copied)
+	}
+
+	sort.Slice(matched, func(i, j int) bool {
+		li, lj := matched[i].NotAfter, matched[j].NotAfter
+		switch {
+		case li == nil && lj == nil:
+			return matched[i].Path < matched[j].Path
+		case li == nil:
+			return false
+		case lj == nil:
+			return true
+		case !li.Equal(*lj):
+			return li.Before(*lj)
+		}
+		return matched[i].Path < matched[j].Path
+	})
+
+	total := int64(len(matched))
+	return paginate(matched, filter.Limit, filter.Offset), total, nil
+}
+
+func (m *MemoryStore) MarkAgentInventoried(ctx context.Context, id string, summary AgentInventorySummary) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	agent, ok := m.agents[id]
+	if !ok {
+		return fmt.Errorf("agent %s not found", id)
+	}
+	when := summary.ScannedAt
+	agent.LastInventoryAt = &when
+	agent.CertificatesSeen = summary.Seen
+	agent.UnmanagedSeen = summary.Unmanaged
+	agent.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryStore) GetCertificateBySupersededFingerprint(ctx context.Context, fingerprint string) (*Certificate, error) {
+	if fingerprint == "" {
+		return nil, nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, cert := range m.certificates {
+		if cert.PreviousFingerprint == fingerprint {
+			return clone(cert), nil
+		}
+	}
+	return nil, nil
 }

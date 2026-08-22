@@ -305,3 +305,32 @@ func TestTheTokenIsShownOnceAndThenOnlyItsHashIsKept(t *testing.T) {
 		t.Fatalf("the token record should be listed: %s", body)
 	}
 }
+
+// TestTheFleetInventorySummaryAgrees.
+//
+// Assembling English agreement from fragments produces "2 certificate files
+// has", which is exactly what this shipped doing and what the first live run
+// read back.
+func TestTheFleetInventorySummaryAgrees(t *testing.T) {
+	cases := []struct {
+		total  int64
+		counts map[string]int64
+		want   []string
+	}{
+		{0, nil, []string{"No host has reported"}},
+		{7, map[string]int64{"private_key_readable": 2, "unmanaged": 6},
+			[]string{"2 certificate files have private keys", "6 certificate files are not managed"}},
+		{3, map[string]int64{"private_key_readable": 1, "unmanaged": 1},
+			[]string{"1 certificate file has a private key", "1 certificate file is not managed"}},
+		{4, map[string]int64{}, []string{"nothing to report about any of them"}},
+	}
+
+	for _, tc := range cases {
+		got := summarizeHostCertificates(tc.total, tc.counts)
+		for _, want := range tc.want {
+			if !strings.Contains(got, want) {
+				t.Fatalf("expected %q in %q", want, got)
+			}
+		}
+	}
+}

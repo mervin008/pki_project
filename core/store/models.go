@@ -1307,6 +1307,14 @@ type Agent struct {
 	HeartbeatIntervalSeconds int        `json:"heartbeat_interval_seconds"`
 	StaleAlertedAt           *time.Time `json:"stale_alerted_at,omitempty"`
 
+	// LastInventoryAt is when this host last managed to report what is on it.
+	// Distinct from LastSeenAt for the reason every "last synced" column in this
+	// schema is: a host that has not been scanned since March must not read as a
+	// host with nothing on it.
+	LastInventoryAt  *time.Time `json:"last_inventory_at,omitempty"`
+	CertificatesSeen int        `json:"certificates_seen"`
+	UnmanagedSeen    int        `json:"unmanaged_seen"`
+
 	RevokedAt *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy *string    `json:"revoked_by,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
@@ -1408,4 +1416,84 @@ type AgentHeartbeat struct {
 	IntervalSeconds int
 	SeenAt          time.Time
 	SeenIP          string
+}
+
+// AgentCertificate is one certificate file found on one host.
+//
+// The fourth place certificates hide, after served, issued, and stored in a
+// cloud: a file on a disk. And the only one where the observer is running on
+// the machine, which is what makes the two fields nobody else can produce
+// possible — the private key's permissions, and whether it matches.
+//
+// There is no private key here, and no field one could travel in.
+type AgentCertificate struct {
+	ID      string `json:"id"`
+	AgentID string `json:"agent_id"`
+	Path    string `json:"path"`
+
+	// Kind is leaf, ca, or bundle. A trust store is recorded as one row that
+	// says so rather than as a hundred findings about roots the distribution
+	// manages.
+	Kind             string `json:"kind"`
+	CertificateCount int    `json:"certificate_count"`
+
+	CommonName        string     `json:"common_name,omitempty"`
+	SubjectDN         string     `json:"subject_dn,omitempty"`
+	IssuerDN          string     `json:"issuer_dn,omitempty"`
+	SerialNumber      string     `json:"serial_number,omitempty"`
+	SANs              []string   `json:"sans,omitempty"`
+	NotBefore         *time.Time `json:"not_before,omitempty"`
+	NotAfter          *time.Time `json:"not_after,omitempty"`
+	KeyType           string     `json:"key_type,omitempty"`
+	KeySize           int        `json:"key_size,omitempty"`
+	FingerprintSHA256 string     `json:"fingerprint_sha256,omitempty"`
+	CertificatePEM    string     `json:"certificate_pem,omitempty"`
+
+	// What only a process on the host can see.
+	FileMode   string     `json:"file_mode,omitempty"`
+	FileOwner  string     `json:"file_owner,omitempty"`
+	ModifiedAt *time.Time `json:"modified_at,omitempty"`
+
+	PrivateKeyPath       string `json:"private_key_path,omitempty"`
+	PrivateKeyMode       string `json:"private_key_mode,omitempty"`
+	PrivateKeyInSameFile bool   `json:"private_key_in_same_file"`
+	PrivateKeyMatches    bool   `json:"private_key_matches"`
+
+	// ReferencedBy is which server configurations name this file. Found by text
+	// search, so an empty list means "not matched", not "nothing uses this".
+	ReferencedBy []string `json:"referenced_by,omitempty"`
+
+	ManagementState      string  `json:"management_state"`
+	MatchedCertificateID *string `json:"matched_certificate_id,omitempty"`
+
+	Findings []Finding `json:"findings"`
+
+	// AgentName is joined in for listings that span hosts, so a page of
+	// findings does not need one lookup per row to say where they are.
+	AgentName string `json:"agent_name,omitempty"`
+
+	FirstSeenAt time.Time  `json:"first_seen_at"`
+	LastSeenAt  time.Time  `json:"last_seen_at"`
+	RemovedAt   *time.Time `json:"removed_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+}
+
+// AgentCertificateFilter narrows a listing.
+type AgentCertificateFilter struct {
+	AgentID         string
+	ManagementState string
+	Kind            string
+	// Finding matches rows carrying a finding with this code.
+	Finding string
+	// IncludeRemoved brings back files a later scan no longer found.
+	IncludeRemoved bool
+	Limit          int
+	Offset         int
+}
+
+// AgentInventorySummary is what one scan of one host amounted to.
+type AgentInventorySummary struct {
+	ScannedAt time.Time
+	Seen      int
+	Unmanaged int
 }

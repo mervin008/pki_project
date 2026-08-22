@@ -48,6 +48,9 @@ type State struct {
 	KeyID                    string    `json:"key_id"`
 	HeartbeatIntervalSeconds int       `json:"heartbeat_interval_seconds"`
 	EnrolledAt               time.Time `json:"enrolled_at"`
+	// ScanPaths is where this host keeps certificates, if it is anywhere
+	// unusual. Empty means the defaults, which is what almost every host wants.
+	ScanPaths []string `json:"scan_paths,omitempty"`
 }
 
 // DefaultStateDir is where the agent keeps its key and its identity.

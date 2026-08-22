@@ -360,6 +360,30 @@ type Store interface {
 	// the alert fires once rather than on every sweep.
 	MarkAgentStaleAlerted(ctx context.Context, id string, at time.Time) error
 
+	// ── What is on the hosts ────────────────────────────────
+
+	// UpsertAgentCertificates writes what one host scan found, keyed on the
+	// path it was found at. Returns only the entries that were new to this
+	// agent, because an alert is built from those — a scan every six hours
+	// re-reporting the same forty files is how a channel gets muted.
+	UpsertAgentCertificates(ctx context.Context, certs []*AgentCertificate) ([]*AgentCertificate, error)
+	// MarkAgentCertificatesRemoved flags the files a scan that succeeded did
+	// not find any more. Called only after a scan that answered: marking
+	// everything removed because an agent failed would report a host being
+	// wiped.
+	MarkAgentCertificatesRemoved(ctx context.Context, agentID string, seenPaths []string, at time.Time) (int, error)
+	ListAgentCertificates(ctx context.Context, filter AgentCertificateFilter) ([]*AgentCertificate, int64, error)
+	// MarkAgentInventoried records that a host reported, and how much it had.
+	MarkAgentInventoried(ctx context.Context, id string, summary AgentInventorySummary) error
+	// GetCertificateBySupersededFingerprint finds the managed certificate that
+	// a given fingerprint used to be — the one a renewal replaced.
+	//
+	// This is what turns a file on a disk into the sharpest thing an inventory
+	// can say: not "here is a certificate you do not manage" but "here is the
+	// certificate you renewed last week, still sitting on this host". Returns
+	// nil when nothing matches, which is the ordinary case.
+	GetCertificateBySupersededFingerprint(ctx context.Context, fingerprint string) (*Certificate, error)
+
 	ListAgentEnrolTokens(ctx context.Context) ([]*AgentEnrolToken, error)
 	CreateAgentEnrolToken(ctx context.Context, t *AgentEnrolToken) error
 	// GetAgentEnrolTokenByHash resolves a presented token. It returns the record

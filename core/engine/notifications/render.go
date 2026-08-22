@@ -208,6 +208,70 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "Key", Value: fallback(str(payload, "key_id"), "—")},
 		}
 
+	case events.TopicAgentKeyExposed:
+		host := fallback(str(payload, "agent"), "a host")
+		count := int(num(payload, "count"))
+		alert.Title = fmt.Sprintf("Private key readable on %s", host)
+		// The one finding in this system that no remote observer could ever
+		// have made, and the one where rotating the certificate does not fix
+		// it. Said in those terms, because the instinct on reading "key
+		// exposure" is to renew, and renewing leaves the exposure exactly
+		// where it was.
+		subject, verb := "A certificate file", "has"
+		if count > 1 {
+			subject, verb = fmt.Sprintf("%d certificate files", count), "have"
+		}
+		alert.Summary = fmt.Sprintf(
+			"%s on %s %s a private key that other accounts on that host can read. Every account that can is holding that key: reissuing is the fix, and renewing is not — nor is changing the file mode after the fact.",
+			subject, host, verb)
+		alert.Fields = []Field{
+			{Label: "Host", Value: host},
+			{Label: "Hostname", Value: fallback(str(payload, "hostname"), "—")},
+			{Label: "Files", Value: fallback(listText(payload, "paths"), "—")},
+			{Label: "Detail", Value: fallback(str(payload, "detail"), "—")},
+		}
+
+	case events.TopicAgentKeyMismatch:
+		host := fallback(str(payload, "agent"), "a host")
+		count := int(num(payload, "count"))
+		alert.Title = fmt.Sprintf("Certificate and key do not match on %s", host)
+		// Not a security problem, and not urgent in the way an expiry is. It is
+		// an outage waiting for an unrelated restart — which is why it reads as
+		// a prediction rather than an observation.
+		if count > 1 {
+			alert.Summary = fmt.Sprintf(
+				"%d certificate files on %s have private keys that do not belong to them. Whatever is serving them is running on material it loaded earlier; the next restart will fail, and it will look like it came from nowhere.",
+				count, host)
+		} else {
+			alert.Summary = fmt.Sprintf(
+				"A certificate file on %s has a private key that does not belong to it. Whatever is serving it is running on material it loaded earlier; the next restart will fail, and it will look like it came from nowhere.",
+				host)
+		}
+		alert.Fields = []Field{
+			{Label: "Host", Value: host},
+			{Label: "Hostname", Value: fallback(str(payload, "hostname"), "—")},
+			{Label: "Files", Value: fallback(listText(payload, "paths"), "—")},
+		}
+
+	case events.TopicAgentUnmanaged:
+		host := fallback(str(payload, "agent"), "a host")
+		count := int(num(payload, "count"))
+		alert.Title = fmt.Sprintf("Certificates on %s that CertPilot did not issue", host)
+		if count > 1 {
+			alert.Summary = fmt.Sprintf(
+				"%d certificate files on %s were not issued by CertPilot and are not being tracked. Nothing is scheduled to replace them.",
+				count, host)
+		} else {
+			alert.Summary = fmt.Sprintf(
+				"A certificate file on %s was not issued by CertPilot and is not being tracked. Nothing is scheduled to replace it.",
+				host)
+		}
+		alert.Fields = []Field{
+			{Label: "Host", Value: host},
+			{Label: "Names", Value: fallback(listText(payload, "names"), "—")},
+			{Label: "Files", Value: fallback(listText(payload, "paths"), "—")},
+		}
+
 	case events.TopicCertExpiring:
 		cn := str(payload, "common_name")
 		alert.Title = fmt.Sprintf("Certificate expiring: %s", fallback(cn, "unnamed"))

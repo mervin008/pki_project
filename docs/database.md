@@ -86,8 +86,9 @@ make migrate
   applied  016_renewal_verification.sql
   applied  017_deployment.sql
   applied  018_agents.sql
+  applied  019_agent_inventory.sql
 
-Applied 18 migration(s).
+Applied 19 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so

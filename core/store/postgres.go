@@ -3371,7 +3371,8 @@ const agentColumns = `id, name, coalesce(hostname, ''), coalesce(platform, ''), 
 		public_key, key_id, status, coalesce(labels, '{}'::jsonb),
 		enrol_token_id, enrolled_at, coalesce(enrolled_from, ''),
 		last_seen_at, coalesce(last_seen_ip, ''), coalesce(heartbeat_interval_seconds, 300),
-		stale_alerted_at, revoked_at, revoked_by, created_at, updated_at`
+		stale_alerted_at, last_inventory_at, coalesce(certificates_seen, 0), coalesce(unmanaged_seen, 0),
+		revoked_at, revoked_by, created_at, updated_at`
 
 func scanAgent(row pgx.Row) (*Agent, error) {
 	a := &Agent{}
@@ -3380,7 +3381,8 @@ func scanAgent(row pgx.Row) (*Agent, error) {
 		&a.PublicKey, &a.KeyID, &a.Status, &labelsJSON,
 		&a.EnrolTokenID, &a.EnrolledAt, &a.EnrolledFrom,
 		&a.LastSeenAt, &a.LastSeenIP, &a.HeartbeatIntervalSeconds,
-		&a.StaleAlertedAt, &a.RevokedAt, &a.RevokedBy, &a.CreatedAt, &a.UpdatedAt)
+		&a.StaleAlertedAt, &a.LastInventoryAt, &a.CertificatesSeen, &a.UnmanagedSeen,
+		&a.RevokedAt, &a.RevokedBy, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -3671,4 +3673,245 @@ func (s *PostgresStore) RevokeAgentEnrolToken(ctx context.Context, id string, re
 		return fmt.Errorf("enrolment token %s is already revoked", id)
 	}
 	return nil
+}
+
+// ── What is on the hosts ────────────────────────────────────
+
+const agentCertificateColumns = `ac.id, ac.agent_id, ac.path, ac.kind, coalesce(ac.certificate_count, 1),
+		coalesce(ac.common_name, ''), coalesce(ac.subject_dn, ''), coalesce(ac.issuer_dn, ''),
+		coalesce(ac.serial_number, ''), coalesce(ac.sans, '[]'::jsonb),
+		ac.not_before, ac.not_after, coalesce(ac.key_type, ''), coalesce(ac.key_size, 0),
+		coalesce(ac.fingerprint_sha256, ''), coalesce(ac.certificate_pem, ''),
+		coalesce(ac.file_mode, ''), coalesce(ac.file_owner, ''), ac.modified_at,
+		coalesce(ac.private_key_path, ''), coalesce(ac.private_key_mode, ''),
+		coalesce(ac.private_key_in_same_file, false), coalesce(ac.private_key_matches, false),
+		coalesce(ac.referenced_by, '[]'::jsonb),
+		ac.management_state, ac.matched_certificate_id, coalesce(ac.findings, '[]'::jsonb),
+		ac.first_seen_at, ac.last_seen_at, ac.removed_at, ac.created_at,
+		coalesce(a.name, '')`
+
+func scanAgentCertificate(row pgx.Row) (*AgentCertificate, error) {
+	c := &AgentCertificate{}
+	var sansJSON, refsJSON, findingsJSON []byte
+	err := row.Scan(&c.ID, &c.AgentID, &c.Path, &c.Kind, &c.CertificateCount,
+		&c.CommonName, &c.SubjectDN, &c.IssuerDN,
+		&c.SerialNumber, &sansJSON,
+		&c.NotBefore, &c.NotAfter, &c.KeyType, &c.KeySize,
+		&c.FingerprintSHA256, &c.CertificatePEM,
+		&c.FileMode, &c.FileOwner, &c.ModifiedAt,
+		&c.PrivateKeyPath, &c.PrivateKeyMode, &c.PrivateKeyInSameFile, &c.PrivateKeyMatches,
+		&refsJSON,
+		&c.ManagementState, &c.MatchedCertificateID, &findingsJSON,
+		&c.FirstSeenAt, &c.LastSeenAt, &c.RemovedAt, &c.CreatedAt,
+		&c.AgentName)
+	if err != nil {
+		return nil, err
+	}
+	for raw, out := range map[*[]byte]any{&sansJSON: &c.SANs, &refsJSON: &c.ReferencedBy, &findingsJSON: &c.Findings} {
+		if len(*raw) > 0 {
+			_ = json.Unmarshal(*raw, out)
+		}
+	}
+	if c.Findings == nil {
+		c.Findings = []Finding{}
+	}
+	return c, nil
+}
+
+// UpsertAgentCertificates writes one scan's results.
+//
+// xmax = 0 in the RETURNING clause is how an insert is told from an update in
+// an upsert: PostgreSQL leaves the row's delete-transaction id at zero on a
+// fresh insert. That distinction is the whole value of the return — an alert is
+// built from what is new, and re-reporting the same forty files every six hours
+// is how a channel gets muted.
+func (s *PostgresStore) UpsertAgentCertificates(ctx context.Context, certs []*AgentCertificate) ([]*AgentCertificate, error) {
+	created := []*AgentCertificate{}
+
+	for _, c := range certs {
+		sansJSON, err := json.Marshal(orEmptyStrings(c.SANs))
+		if err != nil {
+			return nil, err
+		}
+		refsJSON, err := json.Marshal(orEmptyStrings(c.ReferencedBy))
+		if err != nil {
+			return nil, err
+		}
+		findingsJSON, err := json.Marshal(orEmptyFindings(c.Findings))
+		if err != nil {
+			return nil, err
+		}
+
+		var isNew bool
+		err = s.pool.QueryRow(ctx, `
+			INSERT INTO public.agent_certificates
+				(agent_id, path, kind, certificate_count, common_name, subject_dn, issuer_dn,
+				 serial_number, sans, not_before, not_after, key_type, key_size,
+				 fingerprint_sha256, certificate_pem, file_mode, file_owner, modified_at,
+				 private_key_path, private_key_mode, private_key_in_same_file, private_key_matches,
+				 referenced_by, management_state, matched_certificate_id, findings, last_seen_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+			        $19, $20, $21, $22, $23, $24, $25, $26, now())
+			ON CONFLICT (agent_id, path) DO UPDATE SET
+				kind = excluded.kind,
+				certificate_count = excluded.certificate_count,
+				common_name = excluded.common_name,
+				subject_dn = excluded.subject_dn,
+				issuer_dn = excluded.issuer_dn,
+				serial_number = excluded.serial_number,
+				sans = excluded.sans,
+				not_before = excluded.not_before,
+				not_after = excluded.not_after,
+				key_type = excluded.key_type,
+				key_size = excluded.key_size,
+				fingerprint_sha256 = excluded.fingerprint_sha256,
+				certificate_pem = excluded.certificate_pem,
+				file_mode = excluded.file_mode,
+				file_owner = excluded.file_owner,
+				modified_at = excluded.modified_at,
+				private_key_path = excluded.private_key_path,
+				private_key_mode = excluded.private_key_mode,
+				private_key_in_same_file = excluded.private_key_in_same_file,
+				private_key_matches = excluded.private_key_matches,
+				referenced_by = excluded.referenced_by,
+				management_state = excluded.management_state,
+				matched_certificate_id = excluded.matched_certificate_id,
+				findings = excluded.findings,
+				last_seen_at = now(),
+				-- A file that came back is not removed any more.
+				removed_at = NULL
+			RETURNING id, first_seen_at, created_at, (xmax = 0)`,
+			c.AgentID, c.Path, c.Kind, c.CertificateCount, nullIfEmpty(c.CommonName),
+			nullIfEmpty(c.SubjectDN), nullIfEmpty(c.IssuerDN), nullIfEmpty(c.SerialNumber), sansJSON,
+			c.NotBefore, c.NotAfter, nullIfEmpty(c.KeyType), c.KeySize,
+			nullIfEmpty(c.FingerprintSHA256), nullIfEmpty(c.CertificatePEM),
+			nullIfEmpty(c.FileMode), nullIfEmpty(c.FileOwner), c.ModifiedAt,
+			nullIfEmpty(c.PrivateKeyPath), nullIfEmpty(c.PrivateKeyMode),
+			c.PrivateKeyInSameFile, c.PrivateKeyMatches,
+			refsJSON, c.ManagementState, c.MatchedCertificateID, findingsJSON,
+		).Scan(&c.ID, &c.FirstSeenAt, &c.CreatedAt, &isNew)
+		if err != nil {
+			return nil, err
+		}
+		if isNew {
+			created = append(created, c)
+		}
+	}
+	return created, nil
+}
+
+func (s *PostgresStore) MarkAgentCertificatesRemoved(ctx context.Context, agentID string,
+	seenPaths []string, at time.Time) (int, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.agent_certificates
+		SET removed_at = $3
+		WHERE agent_id = $1 AND removed_at IS NULL AND NOT (path = ANY($2))`,
+		agentID, seenPaths, at)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+func (s *PostgresStore) ListAgentCertificates(ctx context.Context, filter AgentCertificateFilter) ([]*AgentCertificate, int64, error) {
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(clause string, value any) {
+		args = append(args, value)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
+
+	if filter.AgentID != "" {
+		add("ac.agent_id = $%d", filter.AgentID)
+	}
+	if filter.ManagementState != "" {
+		add("ac.management_state = $%d", filter.ManagementState)
+	}
+	if filter.Kind != "" {
+		add("ac.kind = $%d", filter.Kind)
+	}
+	if filter.Finding != "" {
+		// jsonb containment, so the finding filter runs in the database and on
+		// an estate of thousands rather than in Go over everything.
+		args = append(args, fmt.Sprintf(`[{"code":%q}]`, filter.Finding))
+		where = append(where, fmt.Sprintf("ac.findings @> $%d::jsonb", len(args)))
+	}
+	if !filter.IncludeRemoved {
+		where = append(where, "ac.removed_at IS NULL")
+	}
+	clause := strings.Join(where, " AND ")
+
+	var total int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT count(*) FROM public.agent_certificates ac WHERE "+clause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	args = append(args, limit, filter.Offset)
+	query := "SELECT " + agentCertificateColumns + `
+		FROM public.agent_certificates ac
+		LEFT JOIN public.agents a ON a.id = ac.agent_id
+		WHERE ` + clause +
+		fmt.Sprintf(" ORDER BY ac.not_after ASC NULLS LAST, ac.path ASC LIMIT $%d OFFSET $%d",
+			len(args)-1, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]*AgentCertificate, 0)
+	for rows.Next() {
+		c, err := scanAgentCertificate(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, c)
+	}
+	return out, total, rows.Err()
+}
+
+func (s *PostgresStore) MarkAgentInventoried(ctx context.Context, id string, summary AgentInventorySummary) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE public.agents
+		SET last_inventory_at = $2, certificates_seen = $3, unmanaged_seen = $4, updated_at = now()
+		WHERE id = $1`, id, summary.ScannedAt, summary.Seen, summary.Unmanaged)
+	return err
+}
+
+func (s *PostgresStore) GetCertificateBySupersededFingerprint(ctx context.Context, fingerprint string) (*Certificate, error) {
+	if fingerprint == "" {
+		return nil, nil
+	}
+	var id string
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM public.certificates
+		 WHERE previous_fingerprint = $1
+		 ORDER BY updated_at DESC LIMIT 1`, fingerprint).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.GetCertificate(ctx, id)
+}
+
+func orEmptyStrings(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
+}
+
+func orEmptyFindings(v []Finding) []Finding {
+	if v == nil {
+		return []Finding{}
+	}
+	return v
 }

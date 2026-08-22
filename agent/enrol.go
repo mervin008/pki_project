@@ -15,11 +15,12 @@ import (
 
 // EnrolOptions is what a person supplies when joining a host to CertPilot.
 type EnrolOptions struct {
-	Server   string
-	Token    string
-	Name     string
-	StateDir string
-	Interval time.Duration
+	Server    string
+	Token     string
+	Name      string
+	StateDir  string
+	Interval  time.Duration
+	ScanPaths []string
 }
 
 // EnrolResult is what the core said.
@@ -125,6 +126,7 @@ func Enrol(ctx context.Context, opts EnrolOptions) (*EnrolResult, error) {
 		KeyID:                    result.KeyID,
 		HeartbeatIntervalSeconds: result.HeartbeatIntervalSeconds,
 		EnrolledAt:               time.Now(),
+		ScanPaths:                opts.ScanPaths,
 	}); err != nil {
 		return nil, fmt.Errorf(
 			"enrolled as %s, but the identity could not be saved — revoke that agent in CertPilot and try again: %w",

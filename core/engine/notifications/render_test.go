@@ -336,3 +336,39 @@ func TestAnEnrolmentReadsAsSomethingToCheck(t *testing.T) {
 		}
 	}
 }
+
+// TestTheTwoKeyProblemsAreToldApart.
+//
+// An exposed key is a security incident needing the certificate reissued; a
+// mismatched pair is a service that will not come back after its next restart.
+// This first shipped as one message saying "one of these two things", which
+// makes the reader go and look — the work an alert exists to save.
+func TestTheTwoKeyProblemsAreToldApart(t *testing.T) {
+	exposed := AlertFromEvent(events.Event{
+		Topic: events.TopicAgentKeyExposed, Severity: events.SeverityCritical,
+		Payload: map[string]any{"agent": "web-01", "count": float64(2)},
+	})
+	mismatch := AlertFromEvent(events.Event{
+		Topic: events.TopicAgentKeyMismatch, Severity: events.SeverityCritical,
+		Payload: map[string]any{"agent": "web-01", "count": float64(2)},
+	})
+
+	for _, alert := range []Alert{exposed, mismatch} {
+		if strings.Contains(alert.Summary, "no specific wording") {
+			t.Fatalf("fell through to the generic renderer: %q", alert.Summary)
+		}
+		// Plural agreement, which is where every one of these has gone wrong.
+		if strings.Contains(alert.Summary, "files") && strings.Contains(alert.Summary, " has ") {
+			t.Fatalf("plural subject with a singular verb: %q", alert.Summary)
+		}
+	}
+	if !strings.Contains(exposed.Summary, "reissuing") && !strings.Contains(exposed.Summary, "Reissuing") {
+		t.Fatalf("an exposed key needs the certificate reissued, not renewed: %q", exposed.Summary)
+	}
+	if !strings.Contains(mismatch.Summary, "next restart") {
+		t.Fatalf("a mismatch is an outage waiting for a restart: %q", mismatch.Summary)
+	}
+	if exposed.Title == mismatch.Title {
+		t.Fatal("the two problems must not read as the same alert")
+	}
+}

@@ -11,9 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/certpilot/certpilot/core/engine/fleet"
 	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/server/middleware"
 	"github.com/certpilot/certpilot/core/store"
+	"github.com/certpilot/certpilot/pkg/agentapi"
 	"github.com/certpilot/certpilot/pkg/agentauth"
 	"github.com/gin-gonic/gin"
 )
@@ -38,15 +40,17 @@ const (
 	maxHeartbeatSeconds     = 3600
 )
 
-// AgentHandler manages agents and the tokens that enrol them.
+// AgentHandler manages agents, the tokens that enrol them, and what they
+// report about the hosts they run on.
 type AgentHandler struct {
-	store  store.Store
-	broker *events.Broker
+	store     store.Store
+	broker    *events.Broker
+	inventory *fleet.Inventory
 }
 
 // NewAgentHandler creates the handler.
 func NewAgentHandler(s store.Store, broker *events.Broker) *AgentHandler {
-	return &AgentHandler{store: s, broker: broker}
+	return &AgentHandler{store: s, broker: broker, inventory: fleet.NewInventory(s, broker)}
 }
 
 // ── Management, for people ──────────────────────────────────
@@ -556,4 +560,156 @@ func (h *AgentHandler) audit(c *gin.Context, action, entityID, details string) {
 		ActorEmail: email,
 		Details:    details,
 	})
+}
+
+// ── What the hosts are holding ──────────────────────────────
+
+// Inventory handles POST /api/v1/agent/inventory.
+//
+// Signed with the agent's key, like everything after enrolment. The body is a
+// list of certificates as PEM plus the facts only a process on the host can
+// see — permissions, ownership, whether a matching key is beside it. There is
+// no field a private key could arrive in.
+func (h *AgentHandler) Inventory(c *gin.Context) {
+	agentID := c.GetString(middleware.ContextAgentID)
+
+	var report agentapi.InventoryReport
+	if err := c.ShouldBindJSON(&report); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	agent, err := h.store.GetAgent(c.Request.Context(), agentID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := h.inventory.Record(c.Request.Context(), agent, report)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	_ = h.store.CreateAuditLog(c.Request.Context(), &store.AuditLog{
+		Action:     "agent.inventory",
+		EntityType: "agent",
+		EntityID:   &agent.ID,
+		Details: fmt.Sprintf(`{"name":%q,"seen":%d,"new":%d,"unmanaged":%d,"removed":%d}`,
+			agent.Name, result.Seen, result.New, result.Unmanaged, result.Removed),
+	})
+
+	c.JSON(http.StatusOK, gin.H{"data": result, "server_time": time.Now().UTC().Format(time.RFC3339)})
+}
+
+// ListCertificates handles GET /api/v1/agent-certificates.
+//
+// Across the fleet by default, or one host with ?agent_id=. The filters that
+// matter are the finding codes: `?finding=private_key_readable` is the query
+// that produces the list nothing else in this system can produce.
+func (h *AgentHandler) ListCertificates(c *gin.Context) {
+	filter := store.AgentCertificateFilter{
+		AgentID:         c.Query("agent_id"),
+		ManagementState: strings.ToUpper(c.Query("state")),
+		Kind:            strings.ToLower(c.Query("kind")),
+		Finding:         c.Query("finding"),
+		IncludeRemoved:  c.Query("include_removed") == "true",
+		Limit:           100,
+	}
+	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 && v <= 500 {
+		filter.Limit = v
+	}
+	if v, err := strconv.Atoi(c.Query("offset")); err == nil && v >= 0 {
+		filter.Offset = v
+	}
+
+	certs, total, err := h.store.ListAgentCertificates(c.Request.Context(), filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Counted in the database rather than over the page, so a summary is about
+	// the estate and not about the first hundred rows of it.
+	counts := map[string]int64{}
+	for _, code := range []string{
+		fleet.FindingKeyReadable, fleet.FindingKeyMismatch,
+		fleet.FindingUnmanaged, fleet.FindingSuperseded, fleet.FindingExpired,
+	} {
+		scoped := filter
+		scoped.Finding, scoped.Limit = code, 1
+		if _, n, err := h.store.ListAgentCertificates(c.Request.Context(), scoped); err == nil {
+			counts[code] = n
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":     certs,
+		"total":    total,
+		"findings": counts,
+		"summary":  summarizeHostCertificates(total, counts),
+	})
+}
+
+// summarizeHostCertificates leads with the finding nothing else can make.
+//
+// Ordered by consequence rather than by count. An exposed private key is not
+// something rotating the certificate fixes — the certificate has to be
+// reissued — so it goes first however few there are, and an inventory number
+// goes last however large it is.
+func summarizeHostCertificates(total int64, counts map[string]int64) string {
+	if total == 0 {
+		return "No host has reported a certificate file yet."
+	}
+
+	parts := []string{}
+	clause := func(code, one, many string) {
+		if n := counts[code]; n > 0 {
+			parts = append(parts, filesText(n)+" "+pick(n, one, many))
+		}
+	}
+	clause(fleet.FindingKeyReadable,
+		"has a private key other accounts on its host can read",
+		"have private keys other accounts on their hosts can read")
+	clause(fleet.FindingKeyMismatch,
+		"has a key that does not match it, so the next restart of whatever serves it will fail",
+		"have keys that do not match them, so the next restart of whatever serves them will fail")
+	clause(fleet.FindingSuperseded,
+		"still holds a certificate a renewal already replaced",
+		"still hold certificates a renewal already replaced")
+	clause(fleet.FindingExpired, "has expired", "have expired")
+	clause(fleet.FindingUnmanaged,
+		"is not managed by CertPilot", "are not managed by CertPilot")
+
+	if len(parts) == 0 {
+		return fmt.Sprintf("%s across the fleet, and nothing to report about any of them.", filesText(total))
+	}
+	return fmt.Sprintf("%s across the fleet. %s.", filesText(total),
+		capitalise(strings.Join(parts, "; ")))
+}
+
+func filesText(n int64) string {
+	if n == 1 {
+		return "1 certificate file"
+	}
+	return fmt.Sprintf("%d certificate files", n)
+}
+
+// pick agrees the verb with the count.
+//
+// Written out rather than assembled, because every attempt to build English
+// agreement from fragments produces "2 certificate files has", which is what
+// this shipped doing and what a live run read back.
+func pick(n int64, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+func capitalise(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }

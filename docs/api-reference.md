@@ -1504,6 +1504,64 @@ already knows.
 `agent.stale` fires once, and again only if the agent comes back and goes away
 a second time.
 
+### What is on the hosts
+
+```
+POST /api/v1/agent/inventory        An agent reports its host   (signed)
+GET  /api/v1/agent-certificates     What the fleet is holding   (any)
+```
+
+The fourth place certificates hide, after served, issued, and stored in a cloud:
+a file on a disk that no scan, no transparency log, and no cloud API will ever
+mention.
+
+The agent sends certificates as **PEM, unparsed**, plus the facts only a process
+on the host can produce. Parsing centrally is deliberate — the agent runs on
+machines nobody upgrades for years, and parsing logic on five hundred of them
+cannot be fixed. **There is no field a private key could travel in**: the agent
+parses one only far enough to derive its public half and compare.
+
+```json
+GET /api/v1/agent-certificates
+{ "total": 7,
+  "findings": { "private_key_readable": 2, "private_key_mismatch": 1, "unmanaged": 6 },
+  "summary": "7 certificate files across the fleet. 2 certificate files have private keys other accounts on their hosts can read; 1 certificate file has a key that does not match it, so the next restart of whatever serves it will fail; 6 certificate files are not managed by CertPilot." }
+```
+
+Filters: `?agent_id=`, `?state=MANAGED|UNMANAGED`, `?kind=leaf|ca|bundle`,
+`?finding=<code>`, `?include_removed=true`. The finding filter runs as jsonb
+containment in the database, so it works on an estate of thousands.
+
+| Finding | What it means |
+|:---|:---|
+| `private_key_readable` | Other accounts on that host can read the key. **Reissue** — renewing does not undo it, and neither does changing the mode afterwards |
+| `private_key_mismatch` | The key beside the certificate does not belong to it. The next restart of whatever serves it will fail |
+| `superseded` | This file holds a certificate a renewal already replaced |
+| `private_key_missing` | A leaf with no key beside it, so this host cannot serve it. Usually a copy left by a migration |
+| `unmanaged` | CertPilot did not issue it and is not tracking it |
+| `expired` / `expiring_soon` | Raised to CRITICAL when a server configuration names the file |
+| `unreferenced` | No configuration on the host was found naming it. Only claimed on hosts where the heuristic matched something else |
+
+`private_key_readable` is the one nothing else in this system can produce. A
+network scan sees what an endpoint presents; it cannot see that the key behind
+it is mode 0644.
+
+`kind` keeps trust stores from drowning the rest: a host's `ca-certificates`
+file is one row saying it holds 143 roots, not 143 findings about a package
+nobody edited. Findings apply to `leaf` and `ca`, never `bundle`.
+
+A certificate is classified as `ca` only if it is a CA **and carries no DNS or
+IP names**. OpenSSL's `req -x509` sets `basicConstraints CA:TRUE` by default, so
+most self-signed certificates on an internal estate claim to be authorities
+while plainly serving a hostname; trusting that claim made almost everything on
+such a host skip the leaf findings.
+
+Two topics, not one: `agent.key_exposed` is a security incident needing the
+certificate reissued, `agent.key_mismatch` is an outage waiting for an unrelated
+restart. They have different owners, and a message saying "one of these two
+things" makes the reader go and look — which is the work an alert exists to
+save.
+
 ## Ownership and acknowledgement
 
 ```

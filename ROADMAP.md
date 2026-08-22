@@ -682,7 +682,7 @@ do something about it.
 |:---|:---|:---|
 | 1 | Deployment as a durable job, and the first target | ✅ |
 | 4a | The agent: enrolment, and an identity the core cannot impersonate | ✅ |
-| 4b | The agent inventories the certificate stores on its own host | |
+| 4b | The agent inventories the certificate stores on its own host | ✅ |
 | 4c | Local key generation and CSR submission | |
 | 4d | Install and reload, as a deployment target | |
 | 2 | The deployers that need no agent: ACM, Azure Key Vault, F5 | deferred |
@@ -858,12 +858,75 @@ PostgreSQL with a bound parameter, because an untyped `$1` in `$1 - <interval>`
 is inferred as an *interval* — the fourth defect in this project that the
 in-memory store cannot express and only a real database run has ever found.
 
-**Still to come:** the agent inventorying local certificate stores (filesystem,
-Java keystore, Windows store, nginx/Apache/HAProxy, IIS), generating keys
-locally and submitting CSRs, and installing renewals with a reload hook — at
-which point it becomes a deployment target like any other, and the loopback
-exception in step 1's webhook rules stops being an exception and becomes the
-normal case.
+**Step 4b** is the fourth place certificates hide.
+
+Migration 011 called cloud stores the third, after what is served and what was
+issued. This is the one none of the other three can reach: **a file on a disk**,
+on a host behind two firewalls, issued by an internal CA, on a port nobody
+scanned. That is where a great deal of an enterprise's TLS actually lives.
+
+But finding files is not the reason this step matters. A process running *on*
+the host can see two things no remote observer ever will, and both outrank most
+of what the rest of this system reports:
+
+**The private key's permissions.** `server.key` at mode 0644 means every account
+on that machine holds the key to that certificate. No scanner, no transparency
+log, and no cloud API can report that — it takes one `stat` from a process on
+the host. And the message has to say what the fix is, because the instinct on
+reading "key exposure" is to renew, and **renewing leaves the exposure exactly
+where it was**: the certificate has to be reissued.
+
+**Whether the key matches the certificate.** A mismatched pair is a service that
+will not come back after its next restart, sitting quietly until something
+unrelated restarts it — a deploy, a kernel update, an outage at three in the
+morning. It gets its own topic rather than sharing the one above, because they
+are different problems with different owners.
+
+The agent sends certificates as **PEM, unparsed**. Parsing centrally is a
+deliberate split: this binary runs on machines nobody upgrades for years, and
+parsing logic living on five hundred of them is parsing logic that cannot be
+fixed. What the agent does compute is the part that needs the host — file modes,
+ownership, whether a key is beside the certificate and whether it belongs to it.
+It parses a key only far enough to derive its public half and compare, and
+**there is no field in the report a private key could travel in.**
+
+Two pieces of noise control decide whether any of this gets read. A host's
+`ca-certificates` bundle holds well over a hundred roots the distribution
+manages and nobody here is responsible for; it is recorded as one row that says
+so. And "no configuration names this file" is only claimed on hosts where the
+reference heuristic matched something — otherwise it is a finding about the
+heuristic rather than about the host.
+
+The connective finding is `superseded`: this file holds the certificate a
+renewal already replaced. That is post-renewal verification's conclusion
+arriving from a third direction — and unlike the verifier, it needs no scan to
+have ever reached the host.
+
+Verified live against a host built to look like a real one: seven certificate
+files including an exposed key, a combined HAProxy cert-and-key at 0644, a
+mismatched pair, an expiring certificate nginx is configured to serve, a
+certificate with no key at all, and a thirty-root trust bundle collapsed to one
+row. Then a managed certificate was issued onto that host and renewed without
+touching it, and the next scan said: *"This file holds the certificate that
+shop.example.com was renewed away from … It is named in nginx.conf, so whatever
+reads that configuration is serving the certificate this replaced."*
+
+Running it caught four things. Every self-signed certificate came back
+classified as a CA, because OpenSSL's `req -x509` sets `basicConstraints
+CA:TRUE` by default — so on an internal estate, which is mostly self-signed,
+almost everything would have skipped the findings that only apply to leaves. The
+fix is to stop trusting what a certificate claims about itself and ask whether
+it identifies a host: a genuine root has no DNS names. `--once` heartbeated
+without inventorying, which quietly ruled out running the agent from a systemd
+timer rather than as a daemon. The fleet summary said *"2 certificate files
+has"*. And the key alert lumped exposure and mismatch into one message saying
+"one of these two things", which makes the reader go and look — the work an
+alert exists to save.
+
+**Still to come:** generating keys locally and submitting CSRs, then installing
+renewals with a reload hook — at which point the agent becomes a deployment
+target like any other, and the loopback exception in step 1's webhook rules
+stops being an exception and becomes the normal case.
 
 ### Phase 7 — More CAs
 
@@ -924,6 +987,13 @@ Tracked honestly rather than quietly:
   than one waiting for somebody to say yes
 - Agents have no rotation story. An identity key lives as long as the agent
   does; replacing it means revoking and re-enrolling the host
+- Host inventory covers PEM and DER files only. Java keystores, the Windows
+  certificate store, and PKCS#12 bundles are not read, so a JVM estate's
+  certificates are invisible to it
+- Which configurations name a certificate file is found by text search, not by
+  parsing. nginx `include`, Apache variables, and generated configuration will
+  be missed — deliberately erring towards reporting a file as unreferenced,
+  which invites a look, rather than silently marking it in use
 - The OCSP responder check is an HTTP GET, not an RFC 6960 request, and reports
   responders as healthy that are not
 - `migrations/001_initial_schema.sql` references `auth.users` and `auth.jwt()`
