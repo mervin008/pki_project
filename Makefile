@@ -167,6 +167,18 @@ lint:
 		(cd $$m && $(GO) vet ./...) || exit 1; \
 	done
 	@gofmt -l $(MODULES) | grep . && echo "gofmt needed on the files above" && exit 1 || true
+	@## staticcheck when it is installed, because it catches a class go vet does
+	@## not: dead assignments, impossible conditions, and code nothing reaches.
+	@## Not a hard requirement, so a clone can be linted without installing it.
+	@##   go install honnef.co/go/tools/cmd/staticcheck@latest
+	@if command -v staticcheck >/dev/null 2>&1; then \
+		for m in $(MODULES); do \
+			echo "==> staticcheck $$m"; \
+			(cd $$m && staticcheck ./...) || exit 1; \
+		done; \
+	else \
+		echo "staticcheck not installed; skipping (go install honnef.co/go/tools/cmd/staticcheck@latest)"; \
+	fi
 
 tidy:
 	@for m in $(MODULES); do (cd $$m && $(GO) mod tidy); done

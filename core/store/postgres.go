@@ -491,6 +491,12 @@ func (s *PostgresStore) ListCAAuthorities(ctx context.Context, filter CAFilter) 
 		// much as untypable, and it fails at bind time on every call.
 		where = append(where, fmt.Sprintf("not_after <= now() + make_interval(days => $%d)", argIdx))
 		args = append(args, filter.ExpiringWithinDays)
+		// Nothing reads argIdx after this, and it is incremented anyway. The
+		// next filter added below will use it, and a filter added without it
+		// would bind its value to a parameter another clause already claimed —
+		// which is not a compile error, not a runtime error, and returns the
+		// wrong rows.
+		//lint:ignore SA4006 deliberate: see above
 		argIdx++
 	}
 	if filter.ExcludeExpired {

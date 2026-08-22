@@ -3,13 +3,14 @@
 This walks through running CertPilot locally and issuing a certificate — first
 from the self-signed gateway, then from a real ACME CA.
 
-See the [README](../README.md) for what is and is not built yet. In short: the
-core, the gateway architecture, ACME issuance, and the security layer work.
-Deployment, the host agent, and large-scale discovery do not.
+See the [README](../README.md) for what is and is not built. In short: the
+core, the gateway architecture, ACME and Vault issuance, deployment, the host
+agent, discovery and posture reporting all work end to end. There is no
+revocation endpoint.
 
 ## Prerequisites
 
-- Go 1.22+
+- Go 1.26+
 - Node.js 20+ (frontend only)
 - [buf](https://buf.build) (only if you edit `.proto` files)
 
@@ -261,9 +262,19 @@ configured. Wildcards require `dns-01`.
 
 ## Next
 
-- [API reference](api-reference.md)
-- [Writing a gateway](writing-a-gateway.md)
-- [Roadmap](../ROADMAP.md)
+Once this works, the things worth doing next:
+
+| | |
+|:---|:---|
+| Issue from your own Vault | [gateways/vault.md](gateways/vault.md) |
+| Put a certificate on a server automatically | [deployment.md](deployment.md) |
+| Run the agent, so keys never leave the host | [agent.md](agent.md) |
+| Find certificates nobody told you about | [discovery.md](discovery.md) |
+| Put it on a wall display | [monitoring.md](monitoring.md#wall-displays) |
+| Run it for real | [operations.md](operations.md) |
+
+[docs/README.md](README.md) is the full index. When something goes wrong,
+[troubleshooting.md](troubleshooting.md) is organised by symptom.
 
 
 ## Running against plain PostgreSQL

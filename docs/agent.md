@@ -1,0 +1,300 @@
+# The host agent
+
+One binary that runs on the machines where certificates are actually served.
+
+Its reason for existing is one sentence:
+
+> **The agent generates its own private keys and never sends them anywhere.**
+> CertPilot cannot produce them and does not claim to.
+
+Everything else here follows from that.
+
+- [What it does](#what-it-does)
+- [Enrolment](#enrolment)
+- [Grants](#grants)
+- [Requesting a certificate](#requesting-a-certificate)
+- [Installing where the server reads](#installing-where-the-server-reads)
+- [Inventory](#inventory)
+- [Running it](#running-it)
+- [What can go wrong](#what-can-go-wrong)
+
+---
+
+## What it does
+
+Four things, on a cycle:
+
+| | |
+|:---|:---|
+| **Heartbeat** | Reports that this host is alive, and what it holds |
+| **Renew** | Replaces certificates it holds that are due, generating a new key each time |
+| **Install** | Writes certificates where the local server reads them, and reloads it |
+| **Inventory** | Reports the certificate files it finds on disk, including ones nobody told CertPilot about |
+
+It is not a gateway. It speaks HTTPS to `/api/v1/agent/*`, not gRPC, and it is
+authenticated by an Ed25519 signature rather than by a client certificate.
+
+---
+
+## Enrolment
+
+```bash
+certpilot-agent enrol \
+  --server https://certpilot.internal:8080 \
+  --token <enrolment token> \
+  --name web-01
+```
+
+An operator issues the token first:
+
+```bash
+curl -X POST localhost:8080/api/v1/agent-enrol-tokens \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "web tier", "labels": {"tier": "web", "env": "production"}, "max_uses": 20}'
+```
+
+What happens, in order:
+
+1. The agent **generates an Ed25519 keypair on the host**, before anything is
+   sent.
+2. It sends the public half, its hostname and its platform. There is no field
+   in the request for the private half — not as a precaution but as the shape
+   of the thing.
+3. The core records the agent, attaches the token's **labels**, and returns an
+   agent ID.
+4. The agent writes its identity to `--state-dir` at `0600`.
+
+Every subsequent request is signed:
+
+```
+certpilot-agent-v1
+<METHOD>
+<PATH>
+<unix-seconds>
+<hex sha256 of body>
+```
+
+Five-minute tolerance. Headers `X-CertPilot-Agent`, `X-CertPilot-Timestamp`,
+`X-CertPilot-Signature`.
+
+**Labels come from the token, not from the agent.** A host cannot label itself
+into somebody else's grant — which is the whole point of putting the labels on
+the token an operator issued.
+
+**Re-enrolling is refused** when an identity already exists. Doing it silently
+would leave the old agent's record on the core with a key nothing holds any
+more, and nobody would notice until that host stopped renewing.
+
+### State directory
+
+| Running as | Default |
+|:---|:---|
+| root | `/var/lib/certpilot-agent` |
+| anyone else | `$HOME/.certpilot-agent` |
+
+Override with `--state-dir` or `CERTPILOT_AGENT_STATE`. Under `/var/lib` for a
+system service because that is where a service's state belongs, and because it
+does not then get backed up to somebody's home directory by accident.
+
+---
+
+## Grants
+
+An agent cannot ask for whatever it likes. An operator writes a grant first,
+and the grant is checked on every request.
+
+```bash
+curl -X POST localhost:8080/api/v1/agent-grants -H 'Content-Type: application/json' -d '{
+  "name": "web tier certificates",
+  "label_selector": {"tier": "web"},
+  "names": ["*.web.example.com", "api.example.com"],
+  "ca_account_id": "<id>",
+  "allowed_key_types": ["ECDSA"],
+  "min_key_size": 256,
+  "validity_days": 90,
+  "renew_before_days": 30
+}'
+```
+
+| Field | |
+|:---|:---|
+| `agent_id` | Targets one host |
+| `label_selector` | Targets every agent carrying these labels. Either this or `agent_id` |
+| `names` | Exact hostnames, or single-level wildcards |
+| `ca_account_id` | **Part of the grant, not chosen by the agent.** An agent that could pick its own issuer could pick the cheapest, the least logged, or the one with the widest trust |
+| `allowed_key_types`, `min_key_size` | What the host may generate |
+| `validity_days` | How long the certificate is asked for |
+| `renew_before_days` | Becomes `renew_after` in the response — **the core decides when**, not the host |
+
+That last row matters more than it looks. A fleet that picked its own renewal
+moment is a fleet that can decide to renew hourly, and four hundred hosts doing
+that is a denial of service against your CA.
+
+A refused request is recorded and raises `agent.request_refused`. An agent
+asking for a name it has no grant for is a signal, not a nuisance.
+
+---
+
+## Requesting a certificate
+
+```bash
+certpilot-agent request --name web-01.example.com --key-type ECDSA
+```
+
+```
+1. generate a key                       on this host
+2. build a CSR                          names only — no extensions
+3. POST /api/v1/agent/certificates      the CSR, and the install path
+4. core checks the grant                names, key type, size, CA account
+5. core asks the gateway to sign        the CSR travels; the key does not
+6. write key (0600), cert, chain, meta  together, after the core answers
+```
+
+Step 6's ordering is deliberate: the key is written first at `0600`. If
+anything fails after that, the host has a key it cannot use, which is inert.
+The other order leaves a certificate whose key never landed — which looks like
+a working deployment until something restarts.
+
+The CSR carries **names only**. No basic constraints, no key usage, no
+requested extensions: a CSR is a request, the CA builds its own template, and
+anything else would at best be ignored and at worst honoured by a CA that
+should not have.
+
+### Renewal
+
+The agent renews its own certificates, because it is the only thing that can —
+rotating means generating a new key, and the core does not have one and must
+not. The core's renewal sweep skips agent-held certificates for exactly that
+reason.
+
+When to renew comes from `renew_after` in the grant's response.
+
+---
+
+## Installing where the server reads
+
+Getting a certificate is not the point. Putting it where nginx, HAProxy or
+Postgres actually reads it, and reloading, is the point.
+
+`/etc/certpilot/installs.json`:
+
+```json
+{
+  "destinations": [
+    {
+      "name": "nginx",
+      "certificate": "web-01.example.com",
+      "cert_path": "/etc/nginx/tls/web-01.pem",
+      "key_path": "/etc/nginx/tls/web-01-key.pem",
+      "chain_path": "/etc/nginx/tls/chain.pem",
+      "cert_mode": "0644",
+      "key_mode": "0600",
+      "owner": "root",
+      "group": "root",
+      "check": ["/usr/sbin/nginx", "-t"],
+      "reload": ["/bin/systemctl", "reload", "nginx"]
+    }
+  ]
+}
+```
+
+```bash
+certpilot-agent install            # writes what has changed, checks, reloads
+certpilot-agent install --force    # rewrite and reload even when unchanged
+certpilot-agent install --offline  # do the local work, report nothing
+```
+
+The sequence per destination:
+
+```
+capture what is there  →  write atomically  →  run check  →  run reload
+                                   │
+                                   └── check fails → restore the previous bytes
+```
+
+**Atomic writes.** A temp file in the same directory, `chmod` before `rename`,
+`Sync()` before `rename`. A server reading a half-written certificate is a
+server that has stopped serving TLS.
+
+**The check runs before the reload.** If `nginx -t` fails, the previous
+contents come back and the reload never happens. A bad certificate that fails a
+config check leaves the server exactly as it was.
+
+**No shell.** `check` and `reload` are argv arrays executed directly, with a
+bare `PATH=/usr/sbin:/usr/bin:/sbin:/bin`. There is no string to inject into.
+
+**A combined file** — one path holding certificate and key, which HAProxy wants
+— is refused if `cert_mode` would make it world-readable. The key is in that
+file.
+
+### Why `--offline` exists
+
+Putting a certificate this machine already holds where its own server reads it
+needs permission from nobody. `--offline` works with a revoked credential or an
+unreachable core, because the alternative — a host that cannot fix its own TLS
+because the control plane is down — is the wrong dependency to create.
+
+---
+
+## Inventory
+
+```bash
+certpilot-agent scan --json
+```
+
+Walks the default paths (or `--path`, repeatable), parses every certificate it
+finds, and reports fingerprint, subject, expiry and **whether a private key sits
+beside it and how readable that key is**.
+
+The last part is the interesting one. `agent.key_exposed` fires when a private
+key on a host is group- or world-readable. That is a finding no amount of
+certificate management produces, and it is usually somebody's `cp` from three
+years ago.
+
+Reported certificates the core does not recognise raise `agent.unmanaged` —
+the same verdict as a network scan, from the inside.
+
+---
+
+## Running it
+
+```bash
+certpilot-agent run                # the loop: heartbeat, renew, install, inventory
+certpilot-agent run --once         # one cycle, then exit — for cron or a unit timer
+certpilot-agent status             # what this host holds and when it last reported
+```
+
+As a systemd unit:
+
+```ini
+[Unit]
+Description=CertPilot agent
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/certpilot-agent run
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+It runs as root when it has to write into `/etc/nginx` and reload a service.
+Where it does not, run it as a user that owns the certificate directory.
+
+---
+
+## What can go wrong
+
+| Symptom | Cause |
+|:---|:---|
+| `enrol` refuses | An identity already exists in the state directory. Remove it deliberately, or use another `--state-dir` |
+| Requests rejected with a signature error | Clock skew beyond five minutes. Check NTP |
+| `agent.request_refused` in the activity feed | The host asked for a name no grant covers. Check `label_selector` and `names` |
+| A certificate renews but the server serves the old one | The install destination is not where the server actually reads. `certpilot-agent install --force` and read the check output |
+| `agent.stale` | The host stopped reporting. Its certificates will expire silently — this alert is the only warning |
+| `agent.key_exposed` | A private key on that host is group- or world-readable |
+
+See [troubleshooting.md](troubleshooting.md) for the rest.

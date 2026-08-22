@@ -294,9 +294,7 @@ func Build(toolVersion string, certs []CertificateInput, endpoints []EndpointInp
 		}
 	}
 
-	for _, c := range sortedComponents(algorithms) {
-		bom.Components = append(bom.Components, c)
-	}
+	bom.Components = append(bom.Components, sortedComponents(algorithms)...)
 	bom.SerialNumber = serialFor(bom)
 	return bom
 }

@@ -130,7 +130,7 @@ func (s *slackNotifier) payload(alert Alert) map[string]any {
 				"type": "plain_text",
 				// Slack truncates a header at 150 characters and rejects the
 				// message outright above it, so this is cut rather than risked.
-				"text":  truncate(fmt.Sprintf("%s", alert.Title), 148),
+				"text":  truncate(alert.Title, 148),
 				"emoji": true,
 			},
 		},
