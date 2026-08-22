@@ -109,11 +109,17 @@ test:
 ## This adds the implementation that has produced every defect the unit tests
 ## could not express: constraints, column lists, NULL, and type inference.
 ##
+## Either of these gives it a server:
+##
 ##   docker compose -f deploy/plain-postgres/docker-compose.yml up -d
 ##   make test-store
 ##
-## Override the server with `make test-store DB=postgres://...`. It creates and
-## drops databases, so point it at something throwaway.
+##   brew services start postgresql@17
+##   make test-store DB="postgres://$$(whoami)@127.0.0.1:5432/postgres?sslmode=disable"
+##
+## It creates and drops a database per test, so point it at something
+## throwaway. The harness refuses the obvious production hostnames, which is a
+## guard rather than a control.
 TEST_DB ?= postgres://postgres:conformance@127.0.0.1:55432/postgres?sslmode=disable
 
 test-store:
