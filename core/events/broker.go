@@ -61,7 +61,22 @@ const (
 	// somebody in the organisation operates.
 	TopicCertDeployFailed = "cert.deploy_failed"
 	TopicCertExpiring     = "cert.expiring"
-	TopicGatewayStatus    = "gateway.status"
+	// TopicAgentEnrolled carries a new host joining the fleet.
+	//
+	// Worth an event even though it is routine, because the abnormal case looks
+	// identical until somebody reads it: an agent enrolling from an address
+	// nobody recognises, with a token issued for a different rollout, is the
+	// shape of a stolen bootstrap credential being used.
+	TopicAgentEnrolled = "agent.enrolled"
+	// TopicAgentStale carries a host whose agent has stopped reporting.
+	//
+	// Named as the consequence rather than the observation. "Agent offline" is
+	// a fact about a process; the fact that matters is that a machine still has
+	// certificates on it, still has them expiring, and now has nothing
+	// maintaining them — while looking exactly like a healthy host on any
+	// screen that counts enrolled agents.
+	TopicAgentStale    = "agent.stale"
+	TopicGatewayStatus = "gateway.status"
 	// TopicDiscoveryUnmanaged carries the one finding a discovery scan exists
 	// to produce: an endpoint serving a certificate this system has never seen.
 	// Published so it reaches the channels a team already configured, rather
@@ -146,6 +161,8 @@ func AllTopics() []string {
 		TopicCertDeployed,
 		TopicCertDeployFailed,
 		TopicCertExpiring,
+		TopicAgentEnrolled,
+		TopicAgentStale,
 		TopicGatewayStatus,
 		TopicDiscoveryUnmanaged,
 		TopicDiscoveryChanged,

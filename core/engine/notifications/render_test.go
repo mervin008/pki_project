@@ -281,3 +281,58 @@ func TestDiscoveryChangeAlertOnlySaysWhatHappened(t *testing.T) {
 		t.Errorf("the alert does not name the endpoints that changed: %+v", onlyChanged.Fields)
 	}
 }
+
+// TestAQuietAgentReadsAsAConsequence.
+//
+// The fleet monitor's whole value is in the wording: an alert that says "agent
+// offline" describes a process, and one that says what it means for the host is
+// the reason somebody gets out of bed. This shipped without a case here at all,
+// and the first real alert arrived as "CertPilot has no specific wording for it
+// yet" followed by a dump of the payload.
+func TestAQuietAgentReadsAsAConsequence(t *testing.T) {
+	alert := AlertFromEvent(events.Event{
+		Topic:    events.TopicAgentStale,
+		Severity: events.SeverityWarning,
+		EntityID: "agent-1",
+		Payload: map[string]any{
+			"name":        "web-01",
+			"hostname":    "web-01.internal",
+			"last_seen":   "2026-08-22T01:57:58+02:00",
+			"missing_for": "5 minutes",
+			"promised":    "30s",
+		},
+	})
+
+	if !strings.Contains(alert.Title, "web-01") {
+		t.Fatalf("the title should name the host: %q", alert.Title)
+	}
+	if strings.Contains(alert.Summary, "no specific wording") {
+		t.Fatalf("this topic fell through to the generic renderer: %q", alert.Summary)
+	}
+	for _, want := range []string{"5 minutes", "no longer being maintained", "expire"} {
+		if !strings.Contains(alert.Summary, want) {
+			t.Fatalf("the summary should mention %q, got: %q", want, alert.Summary)
+		}
+	}
+}
+
+// TestAnEnrolmentReadsAsSomethingToCheck rather than a congratulation. The
+// abnormal case is identical to the routine one until somebody reads it.
+func TestAnEnrolmentReadsAsSomethingToCheck(t *testing.T) {
+	alert := AlertFromEvent(events.Event{
+		Topic:    events.TopicAgentEnrolled,
+		Severity: events.SeverityInfo,
+		EntityID: "agent-1",
+		Payload: map[string]any{
+			"name": "web-01", "from": "10.4.2.9", "token": "june rollout", "key_id": "abc123",
+		},
+	})
+	if strings.Contains(alert.Summary, "no specific wording") {
+		t.Fatalf("this topic fell through to the generic renderer: %q", alert.Summary)
+	}
+	for _, want := range []string{"10.4.2.9", "june rollout"} {
+		if !strings.Contains(alert.Summary, want) {
+			t.Fatalf("the summary should mention %q, got: %q", want, alert.Summary)
+		}
+	}
+}

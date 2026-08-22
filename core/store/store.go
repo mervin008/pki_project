@@ -331,6 +331,50 @@ type Store interface {
 	// business connecting to in order to check a renewal reached them.
 	GetEndpointsServingCertificate(ctx context.Context, certificateID, fingerprint string) ([]string, error)
 
+	// ── Agents ──────────────────────────────────────────────
+	//
+	// The most security-critical records in the schema: an agent credential
+	// will be able to ask for a certificate for a hostname and install it. What
+	// is stored is a public key the agent generated on its own host, so this
+	// database holds nothing that could impersonate one.
+
+	ListAgents(ctx context.Context, filter AgentFilter) ([]*Agent, int64, error)
+	GetAgent(ctx context.Context, id string) (*Agent, error)
+	CreateAgent(ctx context.Context, a *Agent) error
+	RevokeAgent(ctx context.Context, id string, revokedBy *string) error
+	DeleteAgent(ctx context.Context, id string) error
+	// RecordAgentHeartbeat writes what an agent last reported about itself.
+	//
+	// Narrow rather than a full-row write: heartbeats arrive continuously and
+	// concurrently with whoever is renaming or revoking an agent, and a full
+	// update would let a revoked agent's own heartbeat write its status back.
+	RecordAgentHeartbeat(ctx context.Context, id string, hb AgentHeartbeat) error
+	// GetStaleAgents returns the agents that have stopped reporting.
+	//
+	// Measured against each agent's own promised interval. A host whose agent
+	// died three weeks ago still has certificates on it, still has them
+	// expiring, and now has nothing maintaining them — and on a screen that only
+	// lists what is enrolled it looks exactly like a healthy one.
+	GetStaleAgents(ctx context.Context, now time.Time, limit int) ([]*Agent, error)
+	// MarkAgentStaleAlerted records that an agent has been reported missing, so
+	// the alert fires once rather than on every sweep.
+	MarkAgentStaleAlerted(ctx context.Context, id string, at time.Time) error
+
+	ListAgentEnrolTokens(ctx context.Context) ([]*AgentEnrolToken, error)
+	CreateAgentEnrolToken(ctx context.Context, t *AgentEnrolToken) error
+	// GetAgentEnrolTokenByHash resolves a presented token. It returns the record
+	// whatever its lifecycle state, so "revoked" is distinguishable from "never
+	// existed" in the log while both stay a flat refusal on the wire.
+	GetAgentEnrolTokenByHash(ctx context.Context, tokenHash string) (*AgentEnrolToken, error)
+	// ConsumeAgentEnrolToken increments the use count, and only if there is a
+	// use left.
+	//
+	// Conditional in the database rather than checked and then written: two
+	// hosts booting from the same image enrol in the same second, and a
+	// read-then-write would let a one-use token enrol both.
+	ConsumeAgentEnrolToken(ctx context.Context, id string, now time.Time) (bool, error)
+	RevokeAgentEnrolToken(ctx context.Context, id string, revokedBy *string) error
+
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)

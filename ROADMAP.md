@@ -681,9 +681,28 @@ do something about it.
 | Step | | |
 |:---|:---|:---|
 | 1 | Deployment as a durable job, and the first target | ✅ |
-| 2 | The deployers that need no agent: Kubernetes, ACM, Azure Key Vault, F5 | |
-| 3 | Deploy on renewal, and the loop that proves it landed | |
-| 4 | The agent: enrolment, local key generation, install and reload | |
+| 4a | The agent: enrolment, and an identity the core cannot impersonate | ✅ |
+| 4b | The agent inventories the certificate stores on its own host | |
+| 4c | Local key generation and CSR submission | |
+| 4d | Install and reload, as a deployment target | |
+| 2 | The deployers that need no agent: ACM, Azure Key Vault, F5 | deferred |
+| 3 | Deploy on renewal, and the loop that proves it landed | deferred |
+
+**Steps 2 and 3 are deliberately out of order.** Kubernetes was going to be the
+first agentless deployer and it should not be: clusters that manage certificates
+already run cert-manager, and this roadmap's own out-of-scope list says
+integrate with it rather than replace it. Writing a second thing that fights
+cert-manager for ownership of a `kubernetes.io/tls` secret would have been worse
+than writing nothing.
+
+That leaves ACM, Key Vault and F5 — all real, none of them the reason anybody
+adopts an agent-based CLM, and all of them reachable from the core in the same
+shape as the webhook deployer that already works. The agent is the part that is
+architecturally different, so it goes first.
+
+Step 3 waits because it should: automatic deployment on renewal is the feature
+that turns a mistake into a fleet-wide one, and it is worth having behind more
+than one working deployer before it is switched on.
 
 One sentence governs the phase, and it is not the same sentence that governed
 phase 4:
@@ -767,15 +786,84 @@ certificate"** — true, reassuring, and precisely the half-told story this
 product exists to stop other tools telling. What a place holds and whether the
 last attempt to change it worked are two facts, and both belong in the sentence.
 
-**Still to come in this phase:** the deployers that reach real infrastructure
-without an agent, then the agent itself — one binary that enrols over mTLS,
-inventories certificate stores (filesystem, Java keystore, Windows store,
-nginx/Apache/HAProxy, IIS), **generates keys locally so private keys never
-traverse the network**, submits CSRs, installs renewals, and runs a reload hook.
+**Step 4a** gives the agent an identity, and the shape of that identity is the
+whole argument for the agent existing at all.
 
-Local key generation is what makes this architecturally safer than the
-incumbents rather than merely cheaper — and it is the answer to the rule above
-about plaintext and loopback, rather than an exception to it.
+The agent generates an Ed25519 keypair on the host during enrolment and sends
+only the public half. Every request afterwards is signed with the private one,
+which never leaves the machine. **The core stores nothing that can impersonate
+an agent** — a database that leaks yields public keys. That is the same property
+local key generation gives the certificates in 4c, arriving one step early, on
+the agent's own credential.
+
+It is not mTLS, and that is a decision rather than an omission. The core is
+routinely deployed behind a reverse proxy — the shipped compose stack puts nginx
+in front of it — and client-certificate authentication terminates *at the proxy*.
+What reaches the application is a header, and a header is forged by anything that
+can reach the core directly. An application-layer signature is checked by the
+process that acts on the request, so it survives every proxy, ingress and mesh
+in between.
+
+What the scheme covers is stated exactly: method, path, timestamp, and a hash of
+the body. So a heartbeat's signature cannot be lifted onto a route that does
+something, and nothing in the body can be altered in flight. What it does **not**
+prevent is an identical request replayed inside the five-minute window — and
+there is no nonce, deliberately. A nonce would have to be checked against
+something every replica shares, and one checked in a single replica's memory is
+decoration: it implies a property that does not hold across a deployment of two.
+**Decoration in a security mechanism is worse than its absence, because people
+rely on it.**
+
+Three smaller decisions that matter more than they look:
+
+**Enrolment is a different credential from operation.** A one-use, one-hour
+token bootstraps a host that has never spoken to CertPilot, and is exchanged for
+the agent's own key. A long-lived shared enrolment token pasted into a
+configuration-management template is a credential in a git repository, and it is
+how this kind of system is usually broken. The token is spent by a conditional
+`UPDATE`, not by a read followed by a write, because two hosts from the same
+image enrol in the same second.
+
+**The signature is checked before the agent's status.** Checking status first
+would make a revoked agent distinguishable from an unknown one to anybody who
+can guess an id — a fleet-enumeration oracle. Checking it second means the only
+caller ever told *"you have been revoked"* is the one holding the private key,
+which is exactly who needs to hear it: the agent reads that 403 and stops,
+instead of knocking every few minutes for as long as the host stays up.
+
+**An agent that goes quiet is a problem, not an absence.** This is where this
+system's own principle is easiest to violate, because the absence of a heartbeat
+is literally nothing happening. A host whose agent died three weeks ago still
+has certificates on it, still has them expiring, and now has nothing maintaining
+them — and it looks exactly like a healthy host on any screen that counts
+enrolled agents. So the fleet monitor reports it, once, measured against what
+that agent itself promised rather than one global number.
+
+Verified live: enrolled a host, watched the key stay on disk at `0600` in a
+`0700` directory while only the public half crossed the wire; the spent token
+was refused; a hostile client holding the key had a swapped body, a signature
+minted for another route, and timestamps an hour either side all refused with
+one uniform sentence while the log named which check failed; revoking a
+*running* agent made it stop by itself; and a host that went quiet produced one
+WARNING naming the consequence rather than the observation.
+
+Running it caught three things the tests did not. The fleet list said *"1 agent,
+all reporting"* about an agent that had never reported once — a sentence built
+from the stale count claiming something the stale count cannot know. The
+revocation path returned a flat 401 from the middleware, so the agent could not
+tell a withdrawn credential from a misconfiguration and would have retried
+forever; fixing it is what produced the check-signature-then-status ordering
+above. And the staleness query worked with a literal `now()` and failed against
+PostgreSQL with a bound parameter, because an untyped `$1` in `$1 - <interval>`
+is inferred as an *interval* — the fourth defect in this project that the
+in-memory store cannot express and only a real database run has ever found.
+
+**Still to come:** the agent inventorying local certificate stores (filesystem,
+Java keystore, Windows store, nginx/Apache/HAProxy, IIS), generating keys
+locally and submitting CSRs, and installing renewals with a reload hook — at
+which point it becomes a deployment target like any other, and the loopback
+exception in step 1's webhook rules stops being an exception and becomes the
+normal case.
 
 ### Phase 7 — More CAs
 
@@ -828,6 +916,14 @@ Tracked honestly rather than quietly:
 - Deployment is not staged. A certificate bound to forty targets goes to all
   forty as fast as the workers drain the queue; there is no canary, no ordering,
   and no pause between the first target and the rest
+- Agent request signatures are bounded against replay by a five-minute window
+  and nothing else. Stated rather than papered over: see phase 6 step 4a on why
+  there is no nonce
+- An enrolled agent is trusted from the moment it presents a valid token. There
+  is no approval queue, so a leaked enrolment token yields a live agent rather
+  than one waiting for somebody to say yes
+- Agents have no rotation story. An identity key lives as long as the agent
+  does; replacing it means revoking and re-enrolling the host
 - The OCSP responder check is an HTTP GET, not an RFC 6960 request, and reports
   responders as healthy that are not
 - `migrations/001_initial_schema.sql` references `auth.users` and `auth.jwt()`

@@ -1,4 +1,4 @@
-.PHONY: all build build-core build-gateways test test-frontend test-coverage lint proto proto-lint \
+.PHONY: all build build-core build-agent build-gateways test test-frontend test-coverage lint proto proto-lint \
         dev dev-certs generate-kek run-core run-gateway-selfsigned run-gateway-acme run-frontend \
         clean help
 
@@ -11,19 +11,23 @@ STATE := .certpilot/state
 
 # Each component is its own Go module, so tooling has to iterate rather than
 # rely on a single ./... from the repository root.
-MODULES := pkg core gateways/selfsigned gateways/acme
+MODULES := pkg core gateways/selfsigned gateways/acme agent
 
 CORE_BIN          := $(BIN)/certpilot-core
 GW_SELFSIGNED_BIN := $(BIN)/gateway-selfsigned
 GW_ACME_BIN       := $(BIN)/gateway-acme
+AGENT_BIN         := $(BIN)/certpilot-agent
 
 # ── Build ────────────────────────────────────────────────
 all: proto build
 
-build: build-core build-gateways
+build: build-core build-gateways build-agent
 
 build-core:
 	$(GO) build -o $(CORE_BIN) ./core/cmd/
+
+build-agent:
+	$(GO) build -o $(AGENT_BIN) ./agent/cmd/
 
 build-gateways: build-gateway-selfsigned build-gateway-acme
 

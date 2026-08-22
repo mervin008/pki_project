@@ -1262,3 +1262,150 @@ type DeploymentJobFilter struct {
 	Limit         int
 	Offset        int
 }
+
+// ── Agents ──────────────────────────────────────────────────
+
+// Agent lifecycle states.
+const (
+	AgentActive  = "ACTIVE"
+	AgentRevoked = "REVOKED"
+)
+
+// Agent is one host running the CertPilot agent.
+//
+// The credential is a public key. The agent generated the pair on its own host
+// during enrolment and has never sent the private half anywhere, so this record
+// — and the whole database it sits in — holds nothing that could impersonate
+// it. That is the same argument that makes local key generation the point of
+// the agent at all; the identity key is simply the first key CertPilot never
+// sees.
+type Agent struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Hostname string `json:"hostname,omitempty"`
+	Platform string `json:"platform,omitempty"`
+	Version  string `json:"version,omitempty"`
+
+	// PublicKey is PEM. Returned by the API on purpose: an operator comparing
+	// it against what the agent printed on the host is how "is the thing
+	// enrolled under this name the machine I ran the command on" gets answered.
+	PublicKey string `json:"public_key"`
+	KeyID     string `json:"key_id"`
+
+	Status string            `json:"status"`
+	Labels map[string]string `json:"labels,omitempty"`
+
+	EnrolTokenID *string   `json:"enrol_token_id,omitempty"`
+	EnrolledAt   time.Time `json:"enrolled_at"`
+	EnrolledFrom string    `json:"enrolled_from,omitempty"`
+
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+	LastSeenIP string     `json:"last_seen_ip,omitempty"`
+	// HeartbeatIntervalSeconds is what this agent said it would report at.
+	// Staleness is measured against that rather than one global number that is
+	// wrong for every agent configured differently.
+	HeartbeatIntervalSeconds int        `json:"heartbeat_interval_seconds"`
+	StaleAlertedAt           *time.Time `json:"stale_alerted_at,omitempty"`
+
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy *string    `json:"revoked_by,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+}
+
+// MissingFor reports how long past its promised reporting interval this agent
+// is. Zero or negative means it is reporting as expected.
+//
+// The grace factor is the point. An agent that promised to report every five
+// minutes and last spoke six minutes ago is not missing — it is a restarted
+// service, a slow network, or a host that was busy. Three intervals is late
+// enough that something is actually wrong and short enough to matter.
+func (a *Agent) MissingFor(now time.Time) time.Duration {
+	if a == nil || a.Status != AgentActive {
+		return 0
+	}
+	interval := time.Duration(a.HeartbeatIntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	// An agent that enrolled and never reported is measured from enrolment, so
+	// one that failed on its very first heartbeat is as visible as one that
+	// stopped after a year.
+	last := a.EnrolledAt
+	if a.LastSeenAt != nil && a.LastSeenAt.After(last) {
+		last = *a.LastSeenAt
+	}
+	return now.Sub(last.Add(AgentStaleAfter * interval))
+}
+
+// AgentStaleAfter is how many promised intervals an agent may miss before it is
+// treated as gone.
+const AgentStaleAfter = 3
+
+// AgentFilter narrows a listing.
+type AgentFilter struct {
+	Status string
+	// StaleOnly returns the agents that have stopped reporting — the ones that
+	// mean a host is no longer being maintained.
+	StaleOnly bool
+	Limit     int
+	Offset    int
+}
+
+// AgentEnrolToken is a credential handed to a machine that has never spoken to
+// CertPilot.
+//
+// Deliberately not the same credential the agent uses afterwards. A bootstrap
+// secret and an operating secret have different blast radii, and a long-lived
+// shared enrolment token pasted into a configuration management template is a
+// credential in a git repository.
+type AgentEnrolToken struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	TokenHash string    `json:"-"`
+	ExpiresAt time.Time `json:"expires_at"`
+
+	MaxUses int `json:"max_uses"`
+	Uses    int `json:"uses"`
+
+	Labels map[string]string `json:"labels,omitempty"`
+
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy *string    `json:"revoked_by,omitempty"`
+	CreatedBy *string    `json:"created_by,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+}
+
+// Usable reports whether this token may still enrol an agent, and why not when
+// it may not.
+//
+// One function rather than three checks at the call site, because "expired",
+// "revoked", and "used up" are three ways for the same request to be refused
+// and the caller has to get all three right every time it asks.
+func (t *AgentEnrolToken) Usable(now time.Time) (bool, string) {
+	switch {
+	case t == nil:
+		return false, "no such enrolment token"
+	case t.RevokedAt != nil:
+		return false, "this enrolment token was revoked"
+	case !t.ExpiresAt.After(now):
+		return false, "this enrolment token expired"
+	case t.Uses >= t.MaxUses:
+		return false, "this enrolment token has already been used the number of times it allows"
+	}
+	return true, ""
+}
+
+// AgentHeartbeat is what an agent reports about itself.
+type AgentHeartbeat struct {
+	Version  string
+	Platform string
+	Hostname string
+	// IntervalSeconds is what the agent says it will report at next. Taken from
+	// the agent rather than configured centrally, because the agent is the only
+	// thing that knows what it was actually told to do.
+	IntervalSeconds int
+	SeenAt          time.Time
+	SeenIP          string
+}

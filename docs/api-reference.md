@@ -1351,6 +1351,159 @@ Deleting a *target* says the same thing more loudly, because the bindings
 cascade with it and the certificates carry on renewing perfectly happily while
 reaching nothing.
 
+## Agents
+
+Two APIs, kept completely apart.
+
+```
+# For people (OIDC bearer token, as everywhere else in this document)
+GET    /api/v1/agents                        The fleet                   (any)
+GET    /api/v1/agents/:id                    One host                    (any)
+POST   /api/v1/agents/:id/revoke             Withdraw its credential     (admin)
+DELETE /api/v1/agents/:id                    Forget it, once revoked     (admin)
+GET    /api/v1/agent-enrol-tokens            Which doors are open        (admin)
+POST   /api/v1/agent-enrol-tokens            Mint one                    (admin)
+DELETE /api/v1/agent-enrol-tokens/:id        Revoke it                   (admin)
+
+# For agents (signed with the agent's own key)
+POST   /api/v1/agent/enrol                   Join                        (enrolment token)
+POST   /api/v1/agent/heartbeat               Report                      (signed)
+```
+
+The separation is the point. `AgentAuth` is mounted only on `/api/v1/agent/*`
+and nowhere else; the OIDC authenticator and the display-token middleware are
+not mounted there at all. An agent credential cannot read the estate, and a
+person's bearer token cannot speak as a host.
+
+### How an agent proves who it is
+
+The agent generates an Ed25519 keypair on its own host during enrolment and
+sends only the public half. There is no field in any request for a private key.
+The core therefore stores nothing that can impersonate an agent — a database
+that leaks yields public keys.
+
+**Not mTLS**, and that is a decision. The core is routinely deployed behind a
+reverse proxy; client-certificate authentication terminates at the proxy and
+reaches the application as a header, which anything that can reach the core
+directly can forge. An application-layer signature is verified by the process
+that acts on the request, so it survives every proxy, ingress, and mesh in
+between. TLS is still expected on the wire — this authenticates, it does not
+encrypt.
+
+Three headers:
+
+```
+X-CertPilot-Agent:     <agent id>
+X-CertPilot-Timestamp: <unix seconds>
+X-CertPilot-Signature: <base64 Ed25519 signature>
+```
+
+over exactly these bytes:
+
+```
+certpilot-agent-v1 \n
+POST               \n
+/api/v1/agent/heartbeat \n
+1774137600         \n
+<hex sha256 of the request body>
+```
+
+The scheme name is *inside* the signed bytes, so a verifier that one day
+supports two cannot be talked into checking a v2 signature with v1 rules. The
+path is inside them, so a heartbeat's signature cannot be lifted onto a route
+that does something. An empty body is hashed rather than skipped, so "no body"
+and "an empty body" are not interchangeable.
+
+**What this does not prevent:** an identical request replayed inside the
+five-minute tolerance. There is no nonce, deliberately — a nonce would have to
+be checked against something every replica shares, and one checked in a single
+replica's memory implies a property that does not hold across a deployment of
+two. Decoration in a security mechanism is worse than its absence.
+
+The reference implementation is [`pkg/agentauth`](../pkg/agentauth), and
+`SigningString` is written out as its own exported function precisely so an
+agent in another language can reproduce it byte for byte.
+
+### Enrolment
+
+```json
+POST /api/v1/agent-enrol-tokens
+{ "name": "june rollout", "expires_in_minutes": 60, "max_uses": 1,
+  "labels": {"env": "production"} }
+```
+```json
+201 Created
+{ "token": "cpe_…",
+  "message": "This token is shown once and cannot be recovered. It enrols one agent and expires at 2026-08-22T02:19:55Z." }
+```
+
+One use and one hour by default, capped at a week. An enrolment token only has
+to survive a provisioning run; one that outlives the rollout is a live
+credential in whatever template it was pasted into. It is spent by a conditional
+`UPDATE` rather than a read followed by a write, because two hosts booting from
+the same image enrol in the same second — and a one-use token that enrols both
+is not one-use.
+
+A malformed public key is rejected *before* the token is spent, so a typo in a
+provisioning script does not leave the operator holding a burnt token.
+
+```json
+POST /api/v1/agent/enrol
+{ "token": "cpe_…", "public_key": "-----BEGIN PUBLIC KEY-----\n…",
+  "name": "web-01", "hostname": "web-01", "platform": "linux/amd64",
+  "version": "0.1.0", "heartbeat_interval_seconds": 300 }
+```
+
+Labels come from the *token*, not the request, so an agent cannot label itself
+into a group somebody else's policy is written against.
+
+### Revocation, and who gets told
+
+```
+POST /api/v1/agents/{id}/revoke
+{ "message": "web-01 can no longer speak to CertPilot. Whatever certificates are on that host stay where they are and stop being maintained." }
+```
+
+A revoked agent's next signed request gets **403 with the reason**. Every other
+refusal — unknown agent, bad signature, stale clock, missing headers — is a flat
+`401` with one uniform sentence, and which check failed goes to the log.
+
+The ordering is load-bearing: **the signature is verified before the agent's
+status is looked at.** Checking status first would let anyone who can guess an
+id distinguish a revoked agent from an unknown one, which is a fleet-enumeration
+oracle. Checking it second means the only caller ever told "you have been
+revoked" is the one holding the private key — which is the agent, and precisely
+who needs to know, because otherwise it retries a withdrawn credential every few
+minutes for as long as the host stays up.
+
+Deleting an agent is refused while it is active: removing the row does not
+withdraw the credential, and doing it first destroys every record that the agent
+existed.
+
+### The fleet, and hosts that go quiet
+
+```json
+GET /api/v1/agents
+{ "total": 42, "stale": 1,
+  "summary": "42 agents, and 1 has stopped reporting. That host still has certificates on it and nothing is maintaining them." }
+```
+
+The number that matters is not how many agents are enrolled. A host whose agent
+died three weeks ago still has certificates on it, still has them expiring, and
+now has nothing maintaining them — and it looks exactly like a healthy host on a
+list that counts rows.
+
+Staleness is measured against **what each agent itself promised**, not one
+global number that is wrong for every agent configured differently, and an agent
+is late after three missed intervals — a restarted service or a busy host misses
+one or two. An agent that enrolled and never reported is measured from
+enrolment, so one that failed on its very first heartbeat is as visible as one
+that stopped after a year. A revoked agent is not reported as missing: somebody
+already knows.
+
+`agent.stale` fires once, and again only if the agent comes back and goes away
+a second time.
+
 ## Ownership and acknowledgement
 
 ```

@@ -13,6 +13,7 @@ import (
 	"github.com/certpilot/certpilot/core/engine/ctlog"
 	"github.com/certpilot/certpilot/core/engine/deploy"
 	"github.com/certpilot/certpilot/core/engine/discovery"
+	"github.com/certpilot/certpilot/core/engine/fleet"
 	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
 	"github.com/certpilot/certpilot/core/engine/policy"
@@ -44,6 +45,7 @@ type Server struct {
 	ctMonitor    *ctlog.Monitor
 	cloudEngine  *cloudsync.Engine
 	deployQueue  *deploy.Queue
+	fleetMonitor *fleet.Monitor
 	cfg          *config.CoreConfig
 }
 
@@ -153,6 +155,10 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	// leases and an attempt log for exactly the reasons renewal is.
 	deployExec := deploy.NewExecutor(st, keyring, broker)
 	deployQueue := deploy.NewQueue(st, deployExec, broker)
+	// And the hosts that are supposed to be maintaining themselves. An agent
+	// that stopped reporting looks exactly like a healthy one on a list that
+	// counts enrolled agents, which is why something has to go and look.
+	fleetMonitor := fleet.NewMonitor(st, broker)
 
 	// The dispatcher is an ordinary broker subscriber. That is the point: it
 	// makes outbound HTTP and SMTP calls, and a wedged destination can only cost
@@ -219,6 +225,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		ctMonitor:    ctMonitor,
 		cloudEngine:  cloudEngine,
 		deployQueue:  deployQueue,
+		fleetMonitor: fleetMonitor,
 		cfg:          cfg,
 	}, nil
 }
@@ -280,6 +287,7 @@ func (s *Server) Start() error {
 	s.ctMonitor.Start()
 	s.cloudEngine.Start()
 	s.deployQueue.Start()
+	s.fleetMonitor.Start()
 
 	// After the producers, so nothing is published before there is anything
 	// subscribed to deliver it.
@@ -309,6 +317,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// one it has no time to finish leaves a lease to expire before another
 	// replica can take it.
 	s.deployQueue.Stop()
+	s.fleetMonitor.Stop()
 	// A range scan can run for minutes. Left alone it would hold the grace
 	// period open and then be killed mid-write anyway; cancelled, it records
 	// what it found and stops.

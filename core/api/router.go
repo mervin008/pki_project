@@ -66,9 +66,29 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	displayHandler := NewDisplayTokenHandler(deps.Store)
 	notifHandler := NewNotificationHandler(deps.Store, deps.Keyring, deps.Dispatcher)
 	ackHandler := NewAcknowledgementHandler(deps.Store)
+	agentHandler := NewAgentHandler(deps.Store, deps.Broker)
 	ctHandler := NewCTHandler(deps.Store, deps.CTMonitor)
 	cloudHandler := NewCloudHandler(deps.Store, deps.CloudEngine, deps.Keyring)
 	deployHandler := NewDeploymentHandler(deps.Store, deps.Keyring)
+
+	// ── The agent API ──
+	//
+	// A separate group with its own authentication, mounted before the human
+	// API and sharing none of its middleware. That separation is the point: an
+	// agent credential must not be usable to read the estate, and a person's
+	// bearer token must not be usable to speak as a host. Neither the OIDC
+	// authenticator nor the display-token middleware runs here, and AgentAuth
+	// runs nowhere else.
+	agentGroup := engine.Group("/api/v1/agent")
+	{
+		// Enrolment is the one agent call that is not signed, because the agent
+		// has no identity yet — this is the request that gives it one. It is
+		// authenticated by a one-use enrolment token instead.
+		agentGroup.POST("/enrol", agentHandler.Enrol)
+
+		signed := agentGroup.Group("", middleware.AgentAuth(deps.Store))
+		signed.POST("/heartbeat", agentHandler.Heartbeat)
+	}
 
 	v1 := engine.Group("/api/v1")
 	// Display tokens are resolved first, and only take effect when no
@@ -216,6 +236,23 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.GET("/deployments", deployHandler.ListJobs)
 		v1.GET("/deployments/:id", deployHandler.GetJob)
 		v1.DELETE("/deployments/:id", middleware.RequireRole(middleware.RoleAdmin), deployHandler.CancelJob)
+
+		// ── Agents ──
+		// The fleet, for people. Reading is open to any authenticated user: an
+		// agent row carries a public key and a last-seen time, and who is
+		// watching the estate is not a secret.
+		v1.GET("/agents", agentHandler.ListAgents)
+		v1.GET("/agents/:id", agentHandler.GetAgent)
+		// Revoking is admin: it withdraws a credential that can act on a host.
+		v1.POST("/agents/:id/revoke", middleware.RequireRole(middleware.RoleAdmin), agentHandler.RevokeAgent)
+		v1.DELETE("/agents/:id", middleware.RequireRole(middleware.RoleAdmin), agentHandler.DeleteAgent)
+
+		// Enrolment tokens are admin throughout, including the list. The hash
+		// is useless on its own, but a list of live tokens is a map of which
+		// doors are currently open.
+		v1.GET("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.ListEnrolTokens)
+		v1.POST("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.CreateEnrolToken)
+		v1.DELETE("/agent-enrol-tokens/:id", middleware.RequireRole(middleware.RoleAdmin), agentHandler.RevokeEnrolToken)
 
 		// ── Display Tokens ──
 		// Admin-only throughout: minting a credential that authenticates to

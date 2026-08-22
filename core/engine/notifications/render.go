@@ -172,6 +172,42 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "Last error", Value: fallback(str(payload, "error"), "—")},
 		}
 
+	case events.TopicAgentStale:
+		name := fallback(str(payload, "name"), "a host")
+		alert.Title = fmt.Sprintf("Agent has gone quiet: %s", name)
+		// Named as the consequence, not the observation. "Agent offline" is a
+		// fact about a process; what somebody has to act on is that a machine
+		// still has certificates on it, still has them expiring, and now has
+		// nothing maintaining them — while looking exactly like a healthy host
+		// on any screen that counts enrolled agents.
+		alert.Summary = fmt.Sprintf(
+			"%s has not reported for %s, having promised every %s. Whatever certificates are on that host are still being served and are no longer being maintained; they expire on their own schedule with nothing scheduled to replace them.",
+			name, fallback(str(payload, "missing_for"), "some time"),
+			fallback(str(payload, "promised"), "its configured interval"))
+		alert.Fields = []Field{
+			{Label: "Agent", Value: name},
+			{Label: "Hostname", Value: fallback(str(payload, "hostname"), "—")},
+			{Label: "Last reported", Value: fallback(str(payload, "last_seen"), "—")},
+			{Label: "Last seen from", Value: fallback(str(payload, "last_seen_ip"), "—")},
+		}
+
+	case events.TopicAgentEnrolled:
+		name := fallback(str(payload, "name"), "a host")
+		alert.Title = fmt.Sprintf("Agent enrolled: %s", name)
+		// Routine, and worth saying anyway. The abnormal case is identical
+		// until somebody reads it: an agent joining from an address nobody
+		// recognises, on a token issued for a different rollout, is what a
+		// stolen bootstrap credential looks like.
+		alert.Summary = fmt.Sprintf("%s joined from %s using the enrolment token %q.",
+			name, fallback(str(payload, "from"), "an unknown address"),
+			fallback(str(payload, "token"), "unknown"))
+		alert.Fields = []Field{
+			{Label: "Agent", Value: name},
+			{Label: "Platform", Value: fallback(str(payload, "platform"), "—")},
+			{Label: "Enrolled from", Value: fallback(str(payload, "from"), "—")},
+			{Label: "Key", Value: fallback(str(payload, "key_id"), "—")},
+		}
+
 	case events.TopicCertExpiring:
 		cn := str(payload, "common_name")
 		alert.Title = fmt.Sprintf("Certificate expiring: %s", fallback(cn, "unnamed"))

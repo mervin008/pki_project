@@ -3364,3 +3364,311 @@ func (s *PostgresStore) CancelDeploymentJob(ctx context.Context, id string) erro
 	}
 	return nil
 }
+
+// ── Agents ──────────────────────────────────────────────────
+
+const agentColumns = `id, name, coalesce(hostname, ''), coalesce(platform, ''), coalesce(version, ''),
+		public_key, key_id, status, coalesce(labels, '{}'::jsonb),
+		enrol_token_id, enrolled_at, coalesce(enrolled_from, ''),
+		last_seen_at, coalesce(last_seen_ip, ''), coalesce(heartbeat_interval_seconds, 300),
+		stale_alerted_at, revoked_at, revoked_by, created_at, updated_at`
+
+func scanAgent(row pgx.Row) (*Agent, error) {
+	a := &Agent{}
+	var labelsJSON []byte
+	err := row.Scan(&a.ID, &a.Name, &a.Hostname, &a.Platform, &a.Version,
+		&a.PublicKey, &a.KeyID, &a.Status, &labelsJSON,
+		&a.EnrolTokenID, &a.EnrolledAt, &a.EnrolledFrom,
+		&a.LastSeenAt, &a.LastSeenIP, &a.HeartbeatIntervalSeconds,
+		&a.StaleAlertedAt, &a.RevokedAt, &a.RevokedBy, &a.CreatedAt, &a.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if len(labelsJSON) > 0 {
+		_ = json.Unmarshal(labelsJSON, &a.Labels)
+	}
+	return a, nil
+}
+
+func (s *PostgresStore) ListAgents(ctx context.Context, filter AgentFilter) ([]*Agent, int64, error) {
+	where := []string{"1=1"}
+	args := []any{}
+	if filter.Status != "" {
+		args = append(args, filter.Status)
+		where = append(where, fmt.Sprintf("status = $%d", len(args)))
+	}
+	if filter.StaleOnly {
+		// The same arithmetic GetStaleAgents uses, so a list filtered to the
+		// stale ones and an alert about them can never disagree.
+		where = append(where, agentStalePredicate("now()"))
+	}
+	clause := strings.Join(where, " AND ")
+
+	var total int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT count(*) FROM public.agents WHERE "+clause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	args = append(args, limit, filter.Offset)
+	// Quiet agents first. The question a PKI team asks a list of agents is
+	// which hosts have stopped being maintained, and sorting by name buries
+	// that in the middle.
+	query := "SELECT " + agentColumns + " FROM public.agents WHERE " + clause +
+		fmt.Sprintf(" ORDER BY last_seen_at ASC NULLS FIRST, name ASC LIMIT $%d OFFSET $%d",
+			len(args)-1, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]*Agent, 0)
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, a)
+	}
+	return out, total, rows.Err()
+}
+
+// agentStalePredicate is the one definition of "this agent has stopped
+// reporting", in SQL, parameterised only by what "now" is.
+//
+// Written once because it appears in two queries, and two copies of a staleness
+// rule is how a dashboard ends up disagreeing with the alert that woke somebody
+// up.
+//
+// The cast on `now` is not decoration. With a bare `$1` here, PostgreSQL has to
+// infer the parameter's type from its context — and the only context is
+// `$1 - <interval>`, which resolves perfectly happily as interval arithmetic.
+// The parameter came out as an interval, the whole right-hand side became an
+// interval, and the comparison failed at runtime with "operator does not exist:
+// timestamp with time zone < interval". The identical predicate with a literal
+// `now()` worked, which is why this survived until it was run.
+//
+// make_interval rather than multiplying an interval literal, for the same
+// reason: no precedence to reason about, and no chance of the next reader
+// having to.
+func agentStalePredicate(now string) string {
+	return fmt.Sprintf(`status = 'ACTIVE'
+		AND coalesce(last_seen_at, enrolled_at)
+		    < (%s)::timestamptz - make_interval(secs => heartbeat_interval_seconds * %d)`,
+		now, AgentStaleAfter)
+}
+
+func (s *PostgresStore) GetAgent(ctx context.Context, id string) (*Agent, error) {
+	a, err := scanAgent(s.pool.QueryRow(ctx,
+		"SELECT "+agentColumns+" FROM public.agents WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("agent %s not found", id)
+	}
+	return a, err
+}
+
+func (s *PostgresStore) CreateAgent(ctx context.Context, a *Agent) error {
+	labels := a.Labels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labelsJSON, err := json.Marshal(labels)
+	if err != nil {
+		return err
+	}
+	return s.pool.QueryRow(ctx, `
+		INSERT INTO public.agents
+			(name, hostname, platform, version, public_key, key_id, status, labels,
+			 enrol_token_id, enrolled_from, heartbeat_interval_seconds)
+		VALUES ($1, $2, $3, $4, $5, $6, 'ACTIVE', $7, $8, $9, $10)
+		RETURNING id, enrolled_at, created_at, updated_at`,
+		a.Name, nullIfEmpty(a.Hostname), nullIfEmpty(a.Platform), nullIfEmpty(a.Version),
+		a.PublicKey, a.KeyID, labelsJSON, a.EnrolTokenID, nullIfEmpty(a.EnrolledFrom),
+		a.HeartbeatIntervalSeconds,
+	).Scan(&a.ID, &a.EnrolledAt, &a.CreatedAt, &a.UpdatedAt)
+}
+
+func (s *PostgresStore) RevokeAgent(ctx context.Context, id string, revokedBy *string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.agents
+		SET status = 'REVOKED', revoked_at = now(), revoked_by = $2, updated_at = now()
+		WHERE id = $1 AND status <> 'REVOKED'`, id, revokedBy)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("agent %s is not active", id)
+	}
+	return nil
+}
+
+func (s *PostgresStore) DeleteAgent(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, "DELETE FROM public.agents WHERE id = $1", id)
+	return err
+}
+
+// RecordAgentHeartbeat writes what an agent last reported.
+//
+// Scoped to active agents. A revoked agent whose process has not noticed yet
+// keeps calling, and letting those calls move last_seen_at would make a
+// credential somebody deliberately withdrew look like a healthy host.
+func (s *PostgresStore) RecordAgentHeartbeat(ctx context.Context, id string, hb AgentHeartbeat) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.agents
+		SET last_seen_at = $2,
+		    last_seen_ip = $3,
+		    version = coalesce(nullif($4, ''), version),
+		    platform = coalesce(nullif($5, ''), platform),
+		    hostname = coalesce(nullif($6, ''), hostname),
+		    heartbeat_interval_seconds = case when $7 > 0 then $7 else heartbeat_interval_seconds end,
+		    -- Cleared on contact, so an agent that comes back is alerted on
+		    -- again if it goes away a second time.
+		    stale_alerted_at = NULL,
+		    updated_at = now()
+		WHERE id = $1 AND status = 'ACTIVE'`,
+		id, hb.SeenAt, nullIfEmpty(hb.SeenIP), hb.Version, hb.Platform, hb.Hostname, hb.IntervalSeconds)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("agent %s is not active", id)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetStaleAgents(ctx context.Context, now time.Time, limit int) ([]*Agent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+agentColumns+" FROM public.agents WHERE "+agentStalePredicate("$1")+`
+		 AND stale_alerted_at IS NULL
+		 ORDER BY coalesce(last_seen_at, enrolled_at) ASC
+		 LIMIT $2`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []*Agent{}
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) MarkAgentStaleAlerted(ctx context.Context, id string, at time.Time) error {
+	_, err := s.pool.Exec(ctx,
+		"UPDATE public.agents SET stale_alerted_at = $2, updated_at = now() WHERE id = $1", id, at)
+	return err
+}
+
+// ── Agent enrolment tokens ──────────────────────────────────
+
+const agentEnrolTokenColumns = `id, name, token_hash, expires_at,
+		coalesce(max_uses, 1), coalesce(uses, 0), coalesce(labels, '{}'::jsonb),
+		revoked_at, revoked_by, created_by, created_at, updated_at`
+
+func scanAgentEnrolToken(row pgx.Row) (*AgentEnrolToken, error) {
+	t := &AgentEnrolToken{}
+	var labelsJSON []byte
+	err := row.Scan(&t.ID, &t.Name, &t.TokenHash, &t.ExpiresAt,
+		&t.MaxUses, &t.Uses, &labelsJSON,
+		&t.RevokedAt, &t.RevokedBy, &t.CreatedBy, &t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if len(labelsJSON) > 0 {
+		_ = json.Unmarshal(labelsJSON, &t.Labels)
+	}
+	return t, nil
+}
+
+func (s *PostgresStore) ListAgentEnrolTokens(ctx context.Context) ([]*AgentEnrolToken, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+agentEnrolTokenColumns+" FROM public.agent_enrol_tokens ORDER BY created_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []*AgentEnrolToken{}
+	for rows.Next() {
+		t, err := scanAgentEnrolToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) CreateAgentEnrolToken(ctx context.Context, t *AgentEnrolToken) error {
+	labels := t.Labels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labelsJSON, err := json.Marshal(labels)
+	if err != nil {
+		return err
+	}
+	return s.pool.QueryRow(ctx, `
+		INSERT INTO public.agent_enrol_tokens (name, token_hash, expires_at, max_uses, labels, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, created_at, updated_at`,
+		t.Name, t.TokenHash, t.ExpiresAt, t.MaxUses, labelsJSON, t.CreatedBy,
+	).Scan(&t.ID, &t.CreatedAt, &t.UpdatedAt)
+}
+
+func (s *PostgresStore) GetAgentEnrolTokenByHash(ctx context.Context, tokenHash string) (*AgentEnrolToken, error) {
+	t, err := scanAgentEnrolToken(s.pool.QueryRow(ctx,
+		"SELECT "+agentEnrolTokenColumns+" FROM public.agent_enrol_tokens WHERE token_hash = $1", tokenHash))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return t, err
+}
+
+// ConsumeAgentEnrolToken spends one use, and only if there is one left.
+//
+// The check is in the WHERE clause rather than in Go. Two hosts booting from
+// the same image enrol in the same second; a read-then-write would let a
+// one-use token enrol both, which is precisely the property a one-use token
+// exists to have.
+func (s *PostgresStore) ConsumeAgentEnrolToken(ctx context.Context, id string, now time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.agent_enrol_tokens
+		SET uses = uses + 1, updated_at = now()
+		WHERE id = $1
+		  AND revoked_at IS NULL
+		  AND expires_at > $2
+		  AND uses < max_uses`, id, now)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (s *PostgresStore) RevokeAgentEnrolToken(ctx context.Context, id string, revokedBy *string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.agent_enrol_tokens
+		SET revoked_at = now(), revoked_by = $2, updated_at = now()
+		WHERE id = $1 AND revoked_at IS NULL`, id, revokedBy)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("enrolment token %s is already revoked", id)
+	}
+	return nil
+}

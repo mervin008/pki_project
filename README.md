@@ -110,7 +110,7 @@ explicitly.
 | Post-renewal verification | ✅ | Re-probes the endpoints discovery has seen serving a certificate and reports when a renewal never reached them — the green-dashboard-over-an-expiring-estate failure, caught |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ⚠️ | Durable, retried, audited deployment to a generic signed webhook — enough for anything you can put an HTTP receiver in front of. Kubernetes, ACM, Key Vault and F5 are next; deployment is triggered by hand, not yet by renewal |
-| Host agent | ❌ | Not started |
+| Host agent | ⚠️ | One binary that enrols with a key it generates locally and never sends. Signed requests, one-use enrolment tokens, revocation that stops a running agent, and an alert when a host goes quiet. It does not yet inventory or install anything |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
 | Vault, GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
 
@@ -682,6 +682,66 @@ GET /api/v1/deployment-targets
 { "count": 6, "carrying_private_key": 1 }
 ```
 
+### The agent, and the key CertPilot never sees
+
+Everything above deploys to something already reachable, holding a credential
+somebody configured. The machines where certificates actually live are the
+opposite case — nothing can reach inwards, and the private key should never have
+travelled to them at all.
+
+```bash
+# On the core: a token that enrols one host and expires in an hour.
+curl -X POST localhost:8080/api/v1/agent-enrol-tokens -d '{"name":"june rollout"}'
+
+# On the host:
+certpilot-agent enrol --server=https://certpilot.internal:8080 --token=cpe_…
+```
+```
+Enrolled as "web-01"
+  agent id : afb5480c-ea1c-4caa-bd3a-2c773c7ba98a
+  key id   : 086663469618eba2
+  identity : /var/lib/certpilot-agent (private key never leaves this host)
+```
+
+The agent generates an Ed25519 keypair during enrolment and sends only the
+public half. Every request afterwards is signed with the private one. **The core
+stores nothing that can impersonate an agent** — a database that leaks yields
+public keys, which is not true of a bearer token, and bearer tokens on five
+hundred hosts are the thing this is meant to replace.
+
+Not mTLS, deliberately. The core is routinely deployed behind a reverse proxy,
+where client-certificate authentication terminates *at the proxy* and arrives as
+a header — forgeable by anything that can reach the core directly. An
+application-layer signature is checked by the process that acts on the request.
+
+The signature covers method, path, timestamp, and a hash of the body, so a
+heartbeat's signature cannot be lifted onto a route that does something. It does
+not prevent an identical request replayed inside the five-minute window, and
+there is no nonce: one checked in a single replica's memory would imply a
+property that does not hold across two. **Decoration in a security mechanism is
+worse than its absence.**
+
+Revoke an agent and the running process stops by itself:
+
+```
+ERROR this agent's credential has been revoked; stopping
+```
+
+It is told because it proved it holds the key. An unsigned caller guessing agent
+ids gets the same flat 401 whether the agent is revoked, active, or imaginary —
+the status check runs *after* the signature for exactly that reason.
+
+And a host that stops reporting is news, not silence:
+
+```
+WARNING — Agent has gone quiet: web-01
+
+web-01 has not reported for 40 minutes, having promised every 5m0s. Whatever
+certificates are on that host are still being served and are no longer being
+maintained; they expire on their own schedule with nothing scheduled to
+replace them.
+```
+
 ## Security model
 
 Read this before deploying anything.
@@ -862,9 +922,9 @@ See [ROADMAP.md](ROADMAP.md). Monitoring, discovery, and the renewal engine are
 complete: a streaming dashboard and wall display, network / CT / cloud
 discovery, and renewal as a durable queue with ARI and post-renewal
 verification. Deployment has begun — a certificate can now be installed
-somewhere, durably and with an attempt log — and the rest of that phase is the
-deployers that reach real infrastructure, then the agent that generates keys
-locally so private keys never traverse the network.
+somewhere, durably and with an attempt log — and the agent has an identity built
+on a key it generated and never sent. What remains of that phase is the agent
+learning to inventory a host, request certificates for it, and install them.
 
 ## License
 

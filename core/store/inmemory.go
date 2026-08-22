@@ -49,6 +49,8 @@ type MemoryStore struct {
 	// Where certificates go, and the queue that puts them there.
 	deployments    map[string]*CertificateDeployment
 	deploymentJobs []*DeploymentJob
+	agents         map[string]*Agent
+	enrolTokens    map[string]*AgentEnrolToken
 }
 
 // clone returns a shallow copy of a stored record.
@@ -249,6 +251,10 @@ func NewMemoryStore() *MemoryStore {
 		// seeded one would have a fresh install pushing certificates somewhere
 		// nobody configured.
 		deployments: make(map[string]*CertificateDeployment),
+		// Empty for the same reason display tokens are: a seeded credential is
+		// a credential somebody forgets to remove.
+		agents:      make(map[string]*Agent),
+		enrolTokens: make(map[string]*AgentEnrolToken),
 	}
 }
 
@@ -2675,4 +2681,246 @@ func (m *MemoryStore) CancelDeploymentJob(ctx context.Context, id string) error 
 		return nil
 	}
 	return fmt.Errorf("deployment job %s is not outstanding", id)
+}
+
+// ── Agents ──────────────────────────────────────────────────
+
+func (m *MemoryStore) ListAgents(ctx context.Context, filter AgentFilter) ([]*Agent, int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	now := time.Now()
+	matched := make([]*Agent, 0, len(m.agents))
+	for _, a := range m.agents {
+		if filter.Status != "" && a.Status != filter.Status {
+			continue
+		}
+		if filter.StaleOnly && a.MissingFor(now) <= 0 {
+			continue
+		}
+		matched = append(matched, clone(a))
+	}
+
+	// Quiet agents first, matching the Postgres ORDER BY: the question a team
+	// asks a list of agents is which hosts have stopped being maintained.
+	sort.Slice(matched, func(i, j int) bool {
+		li, lj := matched[i].LastSeenAt, matched[j].LastSeenAt
+		switch {
+		case li == nil && lj == nil:
+			return matched[i].Name < matched[j].Name
+		case li == nil:
+			return true
+		case lj == nil:
+			return false
+		case !li.Equal(*lj):
+			return li.Before(*lj)
+		}
+		return matched[i].Name < matched[j].Name
+	})
+
+	total := int64(len(matched))
+	return paginate(matched, filter.Limit, filter.Offset), total, nil
+}
+
+func (m *MemoryStore) GetAgent(ctx context.Context, id string) (*Agent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	a, ok := m.agents[id]
+	if !ok {
+		return nil, fmt.Errorf("agent %s not found", id)
+	}
+	return clone(a), nil
+}
+
+func (m *MemoryStore) CreateAgent(ctx context.Context, a *Agent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	stored := clone(a)
+	if stored.ID == "" {
+		stored.ID = uuid.New().String()
+	}
+	if stored.Status == "" {
+		stored.Status = AgentActive
+	}
+	if stored.HeartbeatIntervalSeconds <= 0 {
+		stored.HeartbeatIntervalSeconds = 300
+	}
+	now := time.Now()
+	if stored.EnrolledAt.IsZero() {
+		stored.EnrolledAt = now
+	}
+	stored.CreatedAt, stored.UpdatedAt = now, now
+
+	m.agents[stored.ID] = stored
+	*a = *clone(stored)
+	return nil
+}
+
+func (m *MemoryStore) RevokeAgent(ctx context.Context, id string, revokedBy *string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	a, ok := m.agents[id]
+	if !ok || a.Status == AgentRevoked {
+		return fmt.Errorf("agent %s is not active", id)
+	}
+	now := time.Now()
+	a.Status = AgentRevoked
+	a.RevokedAt, a.RevokedBy, a.UpdatedAt = &now, revokedBy, now
+	return nil
+}
+
+func (m *MemoryStore) DeleteAgent(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.agents, id)
+	return nil
+}
+
+func (m *MemoryStore) RecordAgentHeartbeat(ctx context.Context, id string, hb AgentHeartbeat) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	a, ok := m.agents[id]
+	if !ok || a.Status != AgentActive {
+		// A revoked agent whose process has not noticed yet keeps calling.
+		// Letting those calls land would make a credential somebody withdrew
+		// look like a healthy host.
+		return fmt.Errorf("agent %s is not active", id)
+	}
+
+	seen := hb.SeenAt
+	a.LastSeenAt = &seen
+	a.LastSeenIP = hb.SeenIP
+	if hb.Version != "" {
+		a.Version = hb.Version
+	}
+	if hb.Platform != "" {
+		a.Platform = hb.Platform
+	}
+	if hb.Hostname != "" {
+		a.Hostname = hb.Hostname
+	}
+	if hb.IntervalSeconds > 0 {
+		a.HeartbeatIntervalSeconds = hb.IntervalSeconds
+	}
+	// Cleared on contact, so an agent that comes back is alerted on again if it
+	// goes away a second time.
+	a.StaleAlertedAt = nil
+	a.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryStore) GetStaleAgents(ctx context.Context, now time.Time, limit int) ([]*Agent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 50
+	}
+	out := []*Agent{}
+	for _, a := range m.agents {
+		if a.StaleAlertedAt != nil || a.MissingFor(now) <= 0 {
+			continue
+		}
+		out = append(out, clone(a))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].MissingFor(now) > out[j].MissingFor(now)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *MemoryStore) MarkAgentStaleAlerted(ctx context.Context, id string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	a, ok := m.agents[id]
+	if !ok {
+		return fmt.Errorf("agent %s not found", id)
+	}
+	when := at
+	a.StaleAlertedAt = &when
+	a.UpdatedAt = time.Now()
+	return nil
+}
+
+// ── Agent enrolment tokens ──────────────────────────────────
+
+func (m *MemoryStore) ListAgentEnrolTokens(ctx context.Context) ([]*AgentEnrolToken, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*AgentEnrolToken, 0, len(m.enrolTokens))
+	for _, t := range m.enrolTokens {
+		out = append(out, clone(t))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *MemoryStore) CreateAgentEnrolToken(ctx context.Context, t *AgentEnrolToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	stored := clone(t)
+	if stored.ID == "" {
+		stored.ID = uuid.New().String()
+	}
+	if stored.MaxUses <= 0 {
+		stored.MaxUses = 1
+	}
+	now := time.Now()
+	stored.CreatedAt, stored.UpdatedAt = now, now
+	m.enrolTokens[stored.ID] = stored
+	*t = *clone(stored)
+	return nil
+}
+
+func (m *MemoryStore) GetAgentEnrolTokenByHash(ctx context.Context, tokenHash string) (*AgentEnrolToken, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, t := range m.enrolTokens {
+		if t.TokenHash == tokenHash {
+			return clone(t), nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *MemoryStore) ConsumeAgentEnrolToken(ctx context.Context, id string, now time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	t, ok := m.enrolTokens[id]
+	if !ok {
+		return false, nil
+	}
+	// Checked and spent under the same lock, which is the in-memory stand-in
+	// for doing it in one UPDATE: two hosts from the same image enrol in the
+	// same second, and a one-use token must only enrol one of them.
+	if usable, _ := t.Usable(now); !usable {
+		return false, nil
+	}
+	t.Uses++
+	t.UpdatedAt = time.Now()
+	return true, nil
+}
+
+func (m *MemoryStore) RevokeAgentEnrolToken(ctx context.Context, id string, revokedBy *string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	t, ok := m.enrolTokens[id]
+	if !ok || t.RevokedAt != nil {
+		return fmt.Errorf("enrolment token %s is already revoked", id)
+	}
+	now := time.Now()
+	t.RevokedAt, t.RevokedBy, t.UpdatedAt = &now, revokedBy, now
+	return nil
 }

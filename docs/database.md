@@ -85,8 +85,9 @@ make migrate
   applied  015_renewal_information.sql
   applied  016_renewal_verification.sql
   applied  017_deployment.sql
+  applied  018_agents.sql
 
-Applied 17 migration(s).
+Applied 18 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so
@@ -299,6 +300,33 @@ the second takes the next row rather than blocking or duplicating. The second
 A leader would have given one replica all the work and a failover window during
 which no certificate renews at all. These two lines give N equal workers and no
 window.
+
+### Migration 018 and a parameter PostgreSQL typed as an interval
+
+The agent staleness predicate is one expression used by two queries — the fleet
+list and the alert sweep — written once so a dashboard cannot disagree with the
+message that woke somebody up. The list interpolates `now()`; the sweep binds
+the instant as `$1`.
+
+The version with `now()` worked. The version with `$1` failed at runtime:
+
+```
+ERROR: operator does not exist: timestamp with time zone < interval (SQLSTATE 42883)
+```
+
+PostgreSQL infers a bound parameter's type from its context, and the only
+context here was `$1 - <interval>` — which resolves perfectly happily as
+interval arithmetic. The parameter came out as an `interval`, the whole
+right-hand side became an `interval`, and the comparison had nothing to do with
+timestamps at all. Fixed with an explicit `(…)::timestamptz` and by switching to
+`make_interval(secs => …)`, which removes the precedence question entirely.
+
+Every test passed throughout: the in-memory store computes staleness in Go.
+That is the fourth defect in this project that only a real database run has
+found, after migration 012's check constraint, migration 016's dropped column
+list, and the deployment binding summary. The pattern is consistent enough to be
+a rule — **the in-memory store cannot express what the database enforces**, and
+a container-backed suite remains the fix.
 
 ### Migration 017 and an index that had to differ from the one above it
 
