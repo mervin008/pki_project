@@ -17,6 +17,7 @@ import (
 	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
 	"github.com/certpilot/certpilot/core/engine/policy"
+	"github.com/certpilot/certpilot/core/engine/posture"
 	"github.com/certpilot/certpilot/core/engine/renewal"
 	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/pluginmgr"
@@ -45,6 +46,7 @@ type Server struct {
 	ctMonitor    *ctlog.Monitor
 	cloudEngine  *cloudsync.Engine
 	deployQueue  *deploy.Queue
+	assessor     *posture.Assessor
 	fleetMonitor *fleet.Monitor
 	cfg          *config.CoreConfig
 }
@@ -155,6 +157,10 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	// leases and an attempt log for exactly the reasons renewal is.
 	deployExec := deploy.NewExecutor(st, keyring, broker)
 	deployQueue := deploy.NewQueue(st, deployExec, broker)
+	// Cryptographic posture. A sweep rather than a hook at issuance: there are
+	// six ways a certificate arrives in this system and a hook on each would be
+	// six places to forget.
+	assessor := posture.NewAssessor(st)
 	// And the hosts that are supposed to be maintaining themselves. An agent
 	// that stopped reporting looks exactly like a healthy one on a list that
 	// counts enrolled agents, which is why something has to go and look.
@@ -226,6 +232,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		ctMonitor:    ctMonitor,
 		cloudEngine:  cloudEngine,
 		deployQueue:  deployQueue,
+		assessor:     assessor,
 		fleetMonitor: fleetMonitor,
 		cfg:          cfg,
 	}, nil
@@ -288,6 +295,7 @@ func (s *Server) Start() error {
 	s.ctMonitor.Start()
 	s.cloudEngine.Start()
 	s.deployQueue.Start()
+	s.assessor.Start()
 	s.fleetMonitor.Start()
 
 	// After the producers, so nothing is published before there is anything
@@ -318,6 +326,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// one it has no time to finish leaves a lease to expire before another
 	// replica can take it.
 	s.deployQueue.Stop()
+	s.assessor.Stop()
 	s.fleetMonitor.Stop()
 	// A range scan can run for minutes. Left alone it would hold the grace
 	// period open and then be killed mid-write anyway; cancelled, it records

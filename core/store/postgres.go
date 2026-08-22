@@ -93,12 +93,16 @@ const certificateColumns = `id, fingerprint_sha256, common_name,
 		coalesce(verification_state, ''), verify_after, last_verified_at,
 		coalesce(verification_attempts, 0), coalesce(verification_detail, ''),
 		coalesce(previous_fingerprint, ''),
-		coalesce(key_custody, 'EXTERNAL'), key_holder_agent_id`
+		coalesce(key_custody, 'EXTERNAL'), key_holder_agent_id,
+		coalesce(signature_algorithm, ''), coalesce(public_key_algorithm, ''),
+		coalesce(posture_verdict, ''), coalesce(posture_summary, ''),
+		coalesce(posture_requirements, '[]'::jsonb),
+		quantum_readiness_score, quantum_assessed_at`
 
 // scanCertificate reads one row of certificateColumns.
 func scanCertificate(row pgx.Row) (*Certificate, error) {
 	cert := &Certificate{}
-	var sansJSON, tagsJSON []byte
+	var sansJSON, tagsJSON, postureJSON []byte
 	err := row.Scan(
 		&cert.ID, &cert.FingerprintSHA256, &cert.CommonName, &sansJSON, &cert.SerialNumber, &cert.IssuerDN,
 		&cert.NotBefore, &cert.NotAfter, &cert.DaysRemaining, &cert.KeyType, &cert.KeySize, &cert.Status,
@@ -110,6 +114,9 @@ func scanCertificate(row pgx.Row) (*Certificate, error) {
 		&cert.VerificationState, &cert.VerifyAfter, &cert.LastVerifiedAt,
 		&cert.VerificationAttempts, &cert.VerificationDetail, &cert.PreviousFingerprint,
 		&cert.KeyCustody, &cert.KeyHolderAgentID,
+		&cert.SignatureAlgorithm, &cert.PublicKeyAlgorithm,
+		&cert.PostureVerdict, &cert.PostureSummary, &postureJSON,
+		&cert.QuantumReadinessScore, &cert.QuantumAssessedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -120,6 +127,7 @@ func scanCertificate(row pgx.Row) (*Certificate, error) {
 	if len(tagsJSON) > 0 {
 		_ = json.Unmarshal(tagsJSON, &cert.Tags)
 	}
+	cert.PostureRequirements = postureJSON
 	return cert, nil
 }
 
@@ -4488,4 +4496,205 @@ func (s *PostgresStore) PruneAgentBindings(ctx context.Context, targetID string,
 		return 0, err
 	}
 	return int(tag.RowsAffected()), nil
+}
+
+// ── Cryptographic posture ───────────────────────────────────
+
+const endpointTLSPostureColumns = `id, host, port, certificate_id, scan_id,
+		coalesce(tls_version, ''), coalesce(cipher_suite, ''), coalesce(key_exchange_group, ''),
+		coalesce(hybrid_key_exchange, false), coalesce(offered_hybrid, false),
+		supports_tls13, coalesce(alpn, ''),
+		coalesce(verdict, ''), coalesce(summary, ''), coalesce(requirements, '[]'::jsonb),
+		observed_at`
+
+func scanEndpointTLSPosture(row pgx.Row) (*EndpointTLSPosture, error) {
+	p := &EndpointTLSPosture{}
+	var requirements []byte
+	err := row.Scan(&p.ID, &p.Host, &p.Port, &p.CertificateID, &p.ScanID,
+		&p.TLSVersion, &p.CipherSuite, &p.KeyExchangeGroup,
+		&p.HybridKeyExchange, &p.OfferedHybrid,
+		&p.SupportsTLS13, &p.ALPN,
+		&p.Verdict, &p.Summary, &requirements,
+		&p.ObservedAt)
+	if err != nil {
+		return nil, err
+	}
+	p.Requirements = requirements
+	return p, nil
+}
+
+func (s *PostgresStore) UpsertEndpointTLSPosture(ctx context.Context, p *EndpointTLSPosture) error {
+	requirements := p.Requirements
+	if len(requirements) == 0 {
+		requirements = []byte("[]")
+	}
+	observed := p.ObservedAt
+	if observed.IsZero() {
+		observed = time.Now()
+	}
+
+	return s.pool.QueryRow(ctx, `
+		INSERT INTO public.endpoint_tls_posture
+			(host, port, certificate_id, scan_id, tls_version, cipher_suite, key_exchange_group,
+			 hybrid_key_exchange, offered_hybrid, supports_tls13, alpn,
+			 verdict, summary, requirements, observed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15)
+		ON CONFLICT (host, port) DO UPDATE SET
+			certificate_id = excluded.certificate_id,
+			scan_id = excluded.scan_id,
+			tls_version = excluded.tls_version,
+			cipher_suite = excluded.cipher_suite,
+			key_exchange_group = excluded.key_exchange_group,
+			hybrid_key_exchange = excluded.hybrid_key_exchange,
+			offered_hybrid = excluded.offered_hybrid,
+			supports_tls13 = excluded.supports_tls13,
+			alpn = excluded.alpn,
+			verdict = excluded.verdict,
+			summary = excluded.summary,
+			requirements = excluded.requirements,
+			observed_at = excluded.observed_at
+		RETURNING id`,
+		p.Host, p.Port, p.CertificateID, p.ScanID,
+		nullIfEmpty(p.TLSVersion), nullIfEmpty(p.CipherSuite), nullIfEmpty(p.KeyExchangeGroup),
+		p.HybridKeyExchange, p.OfferedHybrid, p.SupportsTLS13, nullIfEmpty(p.ALPN),
+		nullIfEmpty(p.Verdict), nullIfEmpty(p.Summary), requirements, observed,
+	).Scan(&p.ID)
+}
+
+func (s *PostgresStore) ListEndpointTLSPosture(ctx context.Context,
+	filter EndpointTLSPostureFilter) ([]*EndpointTLSPosture, int64, error) {
+
+	where := []string{"1=1"}
+	args := []any{}
+	add := func(clause string, value any) {
+		args = append(args, value)
+		where = append(where, fmt.Sprintf(clause, len(args)))
+	}
+	if filter.Host != "" {
+		add("host = $%d", filter.Host)
+	}
+	if filter.Verdict != "" {
+		add("verdict = $%d", strings.ToUpper(filter.Verdict))
+	}
+	if filter.ExposedOnly {
+		// The endpoints losing something today. Scoped to handshakes where a
+		// hybrid group was actually offered, or the list would include
+		// observations that say nothing about the server.
+		where = append(where, "offered_hybrid AND NOT hybrid_key_exchange")
+	}
+	clause := strings.Join(where, " AND ")
+
+	var total int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT count(*) FROM public.endpoint_tls_posture WHERE "+clause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	limit, offset := filter.Limit, filter.Offset
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	args = append(args, limit, offset)
+	rows, err := s.pool.Query(ctx, "SELECT "+endpointTLSPostureColumns+`
+		FROM public.endpoint_tls_posture WHERE `+clause+fmt.Sprintf(`
+		ORDER BY hybrid_key_exchange ASC, host ASC, port ASC
+		LIMIT $%d OFFSET $%d`, len(args)-1, len(args)), args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := []*EndpointTLSPosture{}
+	for rows.Next() {
+		p, err := scanEndpointTLSPosture(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, p)
+	}
+	return out, total, rows.Err()
+}
+
+func (s *PostgresStore) CountTLSPostureByVerdict(ctx context.Context) (map[string]int64, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT coalesce(verdict, 'UNKNOWN'), count(*)
+		FROM public.endpoint_tls_posture
+		GROUP BY 1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]int64{}
+	for rows.Next() {
+		var verdict string
+		var count int64
+		if err := rows.Scan(&verdict, &count); err != nil {
+			return nil, err
+		}
+		out[verdict] = count
+	}
+	return out, rows.Err()
+}
+
+// ListCertificatesForAssessment returns what the posture sweep has left to do.
+//
+// "Never assessed, or assessed before the row last changed" rather than a fixed
+// interval. A certificate's algorithms do not drift; they change when it is
+// renewed, and re-reading the whole inventory on a timer would be work that
+// finds nothing on every pass but the first.
+func (s *PostgresStore) ListCertificatesForAssessment(ctx context.Context, limit int) ([]*Certificate, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	rows, err := s.pool.Query(ctx, "SELECT "+certificateColumns+`
+		FROM public.certificates
+		WHERE certificate_pem IS NOT NULL AND certificate_pem <> ''
+		  AND (quantum_assessed_at IS NULL OR quantum_assessed_at < updated_at)
+		ORDER BY updated_at DESC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []*Certificate{}
+	for rows.Next() {
+		cert, err := scanCertificate(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cert)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) UpdateCertificatePosture(ctx context.Context, id string,
+	update CertificatePostureUpdate) error {
+
+	requirements := update.Requirements
+	if len(requirements) == 0 {
+		requirements = []byte("[]")
+	}
+	assessedAt := update.AssessedAt
+	if assessedAt.IsZero() {
+		assessedAt = time.Now()
+	}
+
+	// updated_at is deliberately not touched. The sweep claims work by
+	// comparing quantum_assessed_at against it, and bumping updated_at here
+	// would make every assessment immediately due for another one.
+	_, err := s.pool.Exec(ctx, `
+		UPDATE public.certificates
+		SET posture_verdict = $2,
+		    posture_summary = $3,
+		    posture_requirements = $4::jsonb,
+		    quantum_readiness_score = $5,
+		    signature_algorithm = coalesce(nullif($6, ''), signature_algorithm),
+		    public_key_algorithm = coalesce(nullif($7, ''), public_key_algorithm),
+		    quantum_assessed_at = $8
+		WHERE id = $1`,
+		id, nullIfEmpty(update.Verdict), nullIfEmpty(update.Summary), requirements,
+		update.Score, update.SignatureAlgorithm, update.PublicKeyAlgorithm, assessedAt)
+	return err
 }

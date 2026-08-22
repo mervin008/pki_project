@@ -1306,7 +1306,7 @@ DigiCert, Sectigo.
 
 One gateway that genuinely works beats five stubs.
 
-### Phase 8 — Cryptographic posture
+### Phase 8 — Cryptographic posture ✅ (issuance deferred)
 
 Deliberately **not** "issue ML-DSA certificates". For public TLS that is not yet
 possible: the CA/Browser Forum has not updated the Baseline Requirements, and in
@@ -1326,7 +1326,94 @@ changes:
 - **ML-DSA and composite issuance in the private-CA gateways**, where it is
   legal and usable now
 
-[Migration 002](migrations/002_crypto_agility.sql) already lays the schema.
+[Migration 002](migrations/002_crypto_agility.sql) laid this schema in the first
+week of the project. Nothing wrote to it for twenty-three migrations. Migration
+025 is the one that fills it.
+
+**One distinction governs the whole phase, and most reporting on this subject
+has it backwards:**
+
+> A classical **signature** is a problem in the 2030s. A classical **key
+> exchange** is a problem this afternoon.
+
+Nobody forges a handshake that already happened. An RSA-signed certificate
+expiring in ninety days is not a quantum risk — it will be replaced many times
+before a relevant quantum computer exists. But traffic protected by a classical
+key exchange can be recorded today and decrypted whenever that machine arrives,
+and the fix is already shipping in every current browser.
+
+So a report that leads with "your certificates use RSA" has ordered the work by
+which fact was easier to collect. This one leads with the handshake:
+
+```
+3 of 6 scanned endpoints do not negotiate a post-quantum key exchange. Traffic
+to them can be recorded today and decrypted whenever a quantum computer arrives
+— and unlike certificate algorithms, that is a cost being paid now rather than a
+deadline in the 2030s.
+```
+
+That sentence needs a real connection to a real server, which is why this lives
+in the scanner rather than in the inventory. An inventory knows what a
+certificate is signed with; only a handshake knows what a server chooses.
+
+**`offered_hybrid` is the load-bearing column and looks like the least important
+one.** "This endpoint did not negotiate a post-quantum group" is a finding about
+the server only if CertPilot offered one — otherwise the identical row is a
+finding about CertPilot. Go enables X25519MLKEM768 by default and that default
+could change in a release, so the scanner now states its curve preferences
+explicitly and records what it offered against every observation. A finding
+whose meaning depends on the observer is not a finding until the observer is on
+the record.
+
+Three more distinctions the assessment refuses to collapse:
+
+- **TLS 1.2 cannot be fixed by enabling a group.** There is no hybrid key
+  exchange below TLS 1.3, so those endpoints need a protocol upgrade — a much
+  bigger job that reads identically to the smaller one unless the message says
+  so.
+- **SHA-256 is a shortfall, not a break.** Grover halves the effective preimage
+  resistance, so it offers 128 bits where CNSA 2.0 asks for 192. Lumping it in
+  with SHA-1 would be false and would teach the reader to ignore the category.
+- **Something broken today outranks something broken in 2035.** A certificate
+  signed with SHA-1 is forgeable now by anyone with a modest budget, and burying
+  that under a paragraph about quantum computing would be this product's
+  founding complaint committed by this product. Those get their own verdict and
+  their own line in the summary.
+
+The score is stated as what it is: **the percentage of applicable CNSA 2.0
+requirements met, not a risk score.** A certificate scoring zero is the normal
+and correct state of nearly every certificate in production today, and
+presenting that as an alarm is how a report gets muted. What it is for is
+measuring movement — the same estate, six months later. The suite is written out
+in the code so a reader can check it against the NSA's publication rather than
+trusting this project's memory of it; the transition *dates* are deliberately
+absent, because they have been revised, differ by category, and a compliance
+tool that invents a deadline is worse than one that reports none.
+
+**CBOM export is CycloneDX 1.6, validated against the published JSON schema in
+the test suite** rather than against a reading of it. Algorithms are emitted
+once and referenced by every certificate that uses them, so "what does moving
+off SHA-256 touch" is a graph query rather than a search — which is the only
+reason the document is worth producing over a list. The serial number is derived
+from the contents, so two exports of an unchanged estate are byte-identical and
+a diff means something.
+
+Verified live against real infrastructure: Google, Cloudflare and Amazon all
+negotiated X25519MLKEM768; three TLS 1.2 endpoints could not, and were reported
+as needing a protocol upgrade rather than a setting. The resulting CBOM
+validated against the real schema.
+
+Running it caught one defect the tests did not. The classical security level was
+looked up by algorithm *family* — and "ECDSA" is the same word for P-256 and
+P-521 — so the strongest and weakest elliptic keys both reported no classical
+strength at all. A CBOM with a hole in exactly the common case.
+
+**Issuance is not done, and is blocked rather than skipped.** `crypto/mldsa`
+does not exist in Go 1.26 and `crypto/x509` cannot build or parse an ML-DSA
+certificate, so issuing one would mean hand-rolling ASN.1 in a certificate
+management product plus a third-party signature implementation — for a
+certificate almost nothing can verify. That is a demo, not a feature, and it
+waits for the standard library.
 
 ---
 
@@ -1342,6 +1429,16 @@ Tracked honestly rather than quietly:
 - `certificates.deployment_target_id` survives from migration 001 and is no
   longer the answer to where a certificate is deployed. It is unread by anything
   in the deployment path and should be dropped once nothing else references it
+- Post-quantum *issuance* is not implemented. `crypto/mldsa` is not in Go 1.26
+  and `crypto/x509` cannot build an ML-DSA certificate, so this waits for the
+  standard library rather than being hand-rolled
+- TLS posture is recorded only for endpoints a discovery scan has reached. A
+  certificate deployed somewhere nothing has scanned has no handshake on record,
+  and the posture summary counts only what was observed rather than what exists
+- The CBOM covers certificates and observed TLS. Keys at rest, the algorithms
+  inside applications, and anything CertPilot has never seen are outside it —
+  which is most of an estate's cryptography, and the document should not be read
+  as though it were complete
 - Azure Key Vault and F5 deployment are written to their published APIs and
   verified by unit tests only. Neither has been run against a real vault or a
   real BIG-IP, so a misreading of either API would pass everything here. ACM was

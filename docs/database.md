@@ -304,6 +304,35 @@ A leader would have given one replica all the work and a failover window during
 which no certificate renews at all. These two lines give N equal workers and no
 window.
 
+### Migration 025 and a schema that waited twenty-three migrations
+
+Migration 002 was written in the first week of this project. It removed the
+hardcoded algorithm allow-lists, added `signature_algorithm`,
+`quantum_readiness_score` and `endpoint_tls_posture`, and created a
+`certificate_crypto_posture` view. Nothing wrote to any of it until migration
+025.
+
+That is worth recording rather than quietly fixing, because the schema was
+right and the wait was correct. Columns are cheap and cost nothing while empty;
+the assessment logic that fills them would have been guesswork in week one, and
+the most important column in the whole feature is one migration 002 did not
+think of.
+
+That column is `offered_hybrid`. "This endpoint did not negotiate a post-quantum
+key exchange" is a finding about the server only if CertPilot offered one; if it
+did not, the identical row is a finding about CertPilot. Go enables
+X25519MLKEM768 by default today and that default can change in a release, so
+what was offered is recorded per observation rather than inferred from the code
+that made it.
+
+Migration 025 also puts a comment on migration 002's `certificates_key_type_fkey`,
+which was created NOT VALID with a note to validate it "when convenient". It is
+now deliberately never validated: a certificate discovered on somebody's
+appliance carrying an algorithm the reference table has never heard of must
+still be recordable, because the whole point of finding it is that nobody knew
+it was there. A stale TODO in a file nobody reopens is now a decision written
+where the constraint is.
+
 ### Migration 024, two spellings of one provider, and a fourth widening
 
 `deployment_targets.target_type` needed `'f5'` and `'azure_key_vault'`. The

@@ -1882,6 +1882,96 @@ Alerts fire on **transitions**, not on states. A destination that has been
 failing since Tuesday must not send a message every cycle until somebody mutes
 the channel that also carries CA expiry alerts.
 
+## Cryptographic posture
+
+```
+GET /api/v1/posture             The headline, and what to do first
+GET /api/v1/posture/endpoints   What each handshake negotiated (?exposed=true)
+GET /api/v1/posture/cbom        CycloneDX 1.6
+```
+
+One distinction governs this section, and most reporting on the subject has it
+backwards:
+
+> A classical **signature** is a problem in the 2030s. A classical **key
+> exchange** is a problem this afternoon.
+
+Nobody forges a handshake that already happened, so an RSA-signed certificate
+expiring in ninety days is a plan, not a risk. Traffic under a classical key
+exchange is being recorded now. So the headline is about handshakes:
+
+```
+3 of 6 scanned endpoints do not negotiate a post-quantum key exchange. Traffic
+to them can be recorded today and decrypted whenever a quantum computer arrives
+— and unlike certificate algorithms, that is a cost being paid now rather than a
+deadline in the 2030s.
+```
+
+That answer needs a real connection to a real server, so it is collected by the
+discovery scanner during the handshake it was already making.
+
+### offered_hybrid, and why it is the important column
+
+| | |
+|:---|:---|
+| `hybrid_key_exchange` | The negotiated group carries ML-KEM |
+| `offered_hybrid` | **CertPilot offered one** |
+
+Without the second, the first being false is a fact about CertPilot rather than
+about the endpoint. Go enables X25519MLKEM768 by default and that default can
+change in a release, so the scanner states its curve preferences explicitly and
+records what it offered against every observation.
+
+### Verdicts
+
+| Verdict | |
+|:---|:---|
+| `EXPOSED` | Offered a post-quantum group and did not take it. Traffic here is being recorded now |
+| `HYBRID` | Negotiated one. Protected against harvest-now-decrypt-later |
+| `CLASSICAL` | An ordinary certificate, or a handshake that offered nothing to conclude from |
+| `READY` | Post-quantum throughout |
+| `WEAK` | Broken against **ordinary** computers today — SHA-1, RSA-1024. Not a quantum problem, and reported ahead of every quantum one |
+
+A TLS 1.2 endpoint is told apart from a TLS 1.3 one that declined, because there
+is no hybrid key exchange below 1.3: *"enabling a group will not fix it — this
+endpoint needs TLS 1.3."* Those are different jobs and read identically unless
+the message says so.
+
+### The score
+
+**The percentage of applicable CNSA 2.0 requirements met — not a risk score.** A
+certificate scoring zero is the normal state of nearly every certificate in
+production today, and presenting that as an alarm is how a report gets muted.
+What it is for is measuring movement: the same estate, six months later.
+
+CNSA 2.0's suite is written out in the source so it can be checked against the
+NSA's publication. The transition **dates are deliberately absent**: they have
+been revised, differ by category of system, and a compliance tool that invents a
+deadline is worse than one that reports none.
+
+SHA-256 is reported as a shortfall rather than a break — Grover halves the
+effective preimage resistance, giving 128 bits where the suite asks for 192.
+Lumping it in with SHA-1 would be false and would teach the reader to ignore the
+whole category.
+
+### CBOM
+
+CycloneDX 1.6, validated against the published JSON schema in the test suite
+rather than against a reading of it.
+
+Algorithms are emitted **once** and referenced by every certificate that uses
+them, with a `dependencies` graph linking the two. That is the only reason the
+document is worth producing over a list: *"what does moving off SHA-256 touch"*
+becomes a graph query somebody else's tool can answer.
+
+`nistQuantumSecurityLevel` is `0` for classical algorithms rather than omitted,
+so a reader can tell "a quantum computer breaks this" from "nobody assessed it".
+The serial number is derived from the contents, so two exports of an unchanged
+estate are byte-identical and a diff means something.
+
+Post-quantum **issuance** is not implemented: `crypto/mldsa` is not in Go 1.26
+and `crypto/x509` cannot build an ML-DSA certificate.
+
 ## Ownership and acknowledgement
 
 ```

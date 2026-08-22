@@ -2,6 +2,7 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -229,6 +230,17 @@ type Certificate struct {
 	// product exists to prevent, produced by this product — the inventory says
 	// ninety days remaining and the endpoint says twenty.
 	VerificationState string `json:"verification_state,omitempty"`
+
+	// Cryptographic posture, written by the assessment sweep rather than at
+	// issuance, so a certificate that arrives by any of the six routes into
+	// this system is assessed the same way.
+	SignatureAlgorithm    string          `json:"signature_algorithm,omitempty"`
+	PublicKeyAlgorithm    string          `json:"public_key_algorithm,omitempty"`
+	PostureVerdict        string          `json:"posture_verdict,omitempty"`
+	PostureSummary        string          `json:"posture_summary,omitempty"`
+	PostureRequirements   json.RawMessage `json:"posture_requirements,omitempty"`
+	QuantumReadinessScore *int            `json:"quantum_readiness_score,omitempty"`
+	QuantumAssessedAt     *time.Time      `json:"quantum_assessed_at,omitempty"`
 	// VerifyAfter is when the next check may run, set on a successful renewal
 	// to now plus a grace period: a deployment done by hand does not happen in
 	// the same second as the issuance.
@@ -1298,6 +1310,71 @@ type DeploymentJobFilter struct {
 	EscalatedOnly bool
 	Limit         int
 	Offset        int
+}
+
+// ── Cryptographic posture ───────────────────────────────────
+
+// EndpointTLSPosture is what one handshake with one endpoint actually
+// negotiated.
+//
+// The only table in this system whose contents cannot be derived from an
+// inventory. What a certificate is signed with is in the certificate; what an
+// endpoint negotiates is a property of a running server and its configuration,
+// and it takes a real connection to find out.
+type EndpointTLSPosture struct {
+	ID            string  `json:"id"`
+	Host          string  `json:"host"`
+	Port          int     `json:"port"`
+	CertificateID *string `json:"certificate_id,omitempty"`
+	ScanID        *string `json:"scan_id,omitempty"`
+
+	TLSVersion  string `json:"tls_version,omitempty"`
+	CipherSuite string `json:"cipher_suite,omitempty"`
+	// KeyExchangeGroup is the negotiated group — "X25519MLKEM768", "x25519".
+	KeyExchangeGroup string `json:"key_exchange_group,omitempty"`
+	// HybridKeyExchange is whether that group carries a post-quantum key
+	// encapsulation, which is the single fact in this record that protects
+	// traffic being recorded today.
+	HybridKeyExchange bool `json:"hybrid_key_exchange"`
+	// OfferedHybrid is whether CertPilot offered one. Without it,
+	// HybridKeyExchange being false is a fact about CertPilot rather than about
+	// the endpoint.
+	OfferedHybrid bool   `json:"offered_hybrid"`
+	SupportsTLS13 *bool  `json:"supports_tls13,omitempty"`
+	ALPN          string `json:"alpn,omitempty"`
+
+	Verdict      string          `json:"verdict,omitempty"`
+	Summary      string          `json:"summary,omitempty"`
+	Requirements json.RawMessage `json:"requirements,omitempty"`
+
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+// EndpointTLSPostureFilter narrows a listing.
+type EndpointTLSPostureFilter struct {
+	Host    string
+	Verdict string
+	// ExposedOnly returns the endpoints losing something today: traffic to them
+	// is protected by a key exchange a future quantum computer breaks
+	// retroactively.
+	ExposedOnly bool
+	Limit       int
+	Offset      int
+}
+
+// CertificatePostureUpdate is what one assessment concluded.
+//
+// A narrow writer rather than fields on the certificate row, for the reason
+// migration 016 taught: UpdateCertificate has an explicit column list, and
+// adding to the model without adding to that list drops the value in silence.
+type CertificatePostureUpdate struct {
+	Verdict            string
+	Summary            string
+	Score              int
+	Requirements       json.RawMessage
+	SignatureAlgorithm string
+	PublicKeyAlgorithm string
+	AssessedAt         time.Time
 }
 
 // ── Agents ──────────────────────────────────────────────────

@@ -8,6 +8,7 @@ import (
 	"github.com/certpilot/certpilot/core/engine/notifications"
 	"github.com/certpilot/certpilot/core/engine/pki"
 	"github.com/certpilot/certpilot/core/engine/policy"
+	"github.com/certpilot/certpilot/core/engine/posture"
 	"github.com/certpilot/certpilot/core/engine/renewal"
 	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/pluginmgr"
@@ -75,6 +76,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	ctHandler := NewCTHandler(deps.Store, deps.CTMonitor)
 	cloudHandler := NewCloudHandler(deps.Store, deps.CloudEngine, deps.Keyring)
 	deployHandler := NewDeploymentHandler(deps.Store, deps.Keyring)
+	postureHandler := NewPostureHandler(deps.Store, posture.ToolVersion)
 
 	// ── The agent API ──
 	//
@@ -255,6 +257,14 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// synchronous handler would be cut off partway with half an estate
 		// updated and no way to say which half.
 		v1.POST("/certificates/:id/deploy", middleware.RequireRole(middleware.RoleOperator), deployHandler.Deploy)
+
+		// Cryptographic posture. The ordering of this section is the argument
+		// it makes: what is losing something today, then what needs a plan.
+		v1.GET("/posture", postureHandler.Summary)
+		v1.GET("/posture/endpoints", postureHandler.Endpoints)
+		// CycloneDX 1.6, because the point of a CBOM is that something other
+		// than CertPilot reads it.
+		v1.GET("/posture/cbom", postureHandler.CBOM)
 
 		v1.GET("/deployments", deployHandler.ListJobs)
 		v1.GET("/deployments/:id", deployHandler.GetJob)

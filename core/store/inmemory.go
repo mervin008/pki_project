@@ -54,6 +54,7 @@ type MemoryStore struct {
 	agentCerts     []*AgentCertificate
 	agentGrants    map[string]*AgentGrant
 	agentInstalls  []*AgentInstallation
+	tlsPosture     map[string]*EndpointTLSPosture
 }
 
 // clone returns a shallow copy of a stored record.
@@ -259,6 +260,7 @@ func NewMemoryStore() *MemoryStore {
 		agents:      make(map[string]*Agent),
 		enrolTokens: make(map[string]*AgentEnrolToken),
 		agentGrants: make(map[string]*AgentGrant),
+		tlsPosture:  make(map[string]*EndpointTLSPosture),
 	}
 }
 
@@ -3415,4 +3417,120 @@ func (m *MemoryStore) heldBackByAFailure(job *DeploymentJob) bool {
 		}
 	}
 	return false
+}
+
+// ── Cryptographic posture ───────────────────────────────────
+
+func (m *MemoryStore) UpsertEndpointTLSPosture(ctx context.Context, p *EndpointTLSPosture) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if p.ObservedAt.IsZero() {
+		p.ObservedAt = time.Now()
+	}
+	key := fmt.Sprintf("%s:%d", p.Host, p.Port)
+	if existing, ok := m.tlsPosture[key]; ok {
+		p.ID = existing.ID
+	}
+	if p.ID == "" {
+		p.ID = uuid.New().String()
+	}
+	m.tlsPosture[key] = clone(p)
+	return nil
+}
+
+func (m *MemoryStore) ListEndpointTLSPosture(ctx context.Context,
+	filter EndpointTLSPostureFilter) ([]*EndpointTLSPosture, int64, error) {
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	matched := []*EndpointTLSPosture{}
+	for _, p := range m.tlsPosture {
+		switch {
+		case filter.Host != "" && p.Host != filter.Host:
+			continue
+		case filter.Verdict != "" && !strings.EqualFold(p.Verdict, filter.Verdict):
+			continue
+		case filter.ExposedOnly && (!p.OfferedHybrid || p.HybridKeyExchange):
+			continue
+		}
+		matched = append(matched, clone(p))
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		if matched[i].HybridKeyExchange != matched[j].HybridKeyExchange {
+			return !matched[i].HybridKeyExchange
+		}
+		if matched[i].Host != matched[j].Host {
+			return matched[i].Host < matched[j].Host
+		}
+		return matched[i].Port < matched[j].Port
+	})
+	return paginate(matched, filter.Limit, filter.Offset), int64(len(matched)), nil
+}
+
+func (m *MemoryStore) CountTLSPostureByVerdict(ctx context.Context) (map[string]int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := map[string]int64{}
+	for _, p := range m.tlsPosture {
+		verdict := p.Verdict
+		if verdict == "" {
+			verdict = "UNKNOWN"
+		}
+		out[verdict]++
+	}
+	return out, nil
+}
+
+func (m *MemoryStore) ListCertificatesForAssessment(ctx context.Context, limit int) ([]*Certificate, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	out := []*Certificate{}
+	for _, cert := range m.certificates {
+		if cert.CertificatePEM == nil || *cert.CertificatePEM == "" {
+			continue
+		}
+		if cert.QuantumAssessedAt != nil && !cert.QuantumAssessedAt.Before(cert.UpdatedAt) {
+			continue
+		}
+		out = append(out, clone(cert))
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (m *MemoryStore) UpdateCertificatePosture(ctx context.Context, id string,
+	update CertificatePostureUpdate) error {
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cert, ok := m.certificates[id]
+	if !ok {
+		return fmt.Errorf("certificate %s not found", id)
+	}
+	assessedAt := update.AssessedAt
+	if assessedAt.IsZero() {
+		assessedAt = time.Now()
+	}
+	cert.PostureVerdict = update.Verdict
+	cert.PostureSummary = update.Summary
+	cert.PostureRequirements = update.Requirements
+	cert.QuantumReadinessScore = &update.Score
+	if update.SignatureAlgorithm != "" {
+		cert.SignatureAlgorithm = update.SignatureAlgorithm
+	}
+	if update.PublicKeyAlgorithm != "" {
+		cert.PublicKeyAlgorithm = update.PublicKeyAlgorithm
+	}
+	cert.QuantumAssessedAt = &assessedAt
+	return nil
 }

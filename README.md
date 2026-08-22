@@ -110,6 +110,7 @@ explicitly.
 | Renewal queue | ✅ | Durable jobs with leases, an attempt log, and backoff that tightens as expiry approaches. Safe on N replicas with no leader. Per-CA rate limits defer rather than fail |
 | Post-renewal verification | ✅ | Re-probes the endpoints discovery has seen serving a certificate and reports when a renewal never reached them — the green-dashboard-over-an-expiring-estate failure, caught |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
+| Cryptographic posture | ✅ | Which endpoints negotiate a post-quantum key exchange and which do not, from real handshakes; CNSA 2.0 conformance per certificate; CycloneDX 1.6 CBOM export validated against the published schema. Post-quantum *issuance* waits for `crypto/x509` |
 | Deployment to servers | ✅ | Durable, retried, audited deployment to a signed webhook, a host running the agent, AWS ACM, Azure Key Vault and F5 BIG-IP. **A renewal deploys itself**, and a failing target halts the rest of the rollout rather than letting a bad certificate march through the estate. Key Vault and F5 are written to their published APIs and unit-tested; neither has been run against a real vault or appliance |
 | Host agent | ✅ | One binary that enrols, inventories, **requests certificates with keys it generates locally and never sends** — CertPilot cannot produce them and does not claim to — then installs them where the server actually reads them and reloads it. Bounded by grants an operator writes in advance |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
@@ -1050,6 +1051,66 @@ No AWS or Azure SDK is involved. CertPilot has spoken these APIs over plain HTTP
 since discovery — hand-rolled SigV4, checked against AWS's published test
 vectors — because two hundred dependency modules inside a process holding every
 private key you have issued is a worse trade than the code.
+
+### What your cryptography is made of, and what is costing you now
+
+One distinction governs this, and most reporting on the subject has it
+backwards:
+
+> A classical **signature** is a problem in the 2030s. A classical **key
+> exchange** is a problem this afternoon.
+
+Nobody forges a handshake that already happened, so RSA certificates are a plan.
+But traffic under a classical key exchange can be recorded today and decrypted
+whenever a quantum computer arrives — and the fix already ships in every current
+browser. So the report leads with the handshake:
+
+```
+GET /api/v1/posture
+
+3 of 6 scanned endpoints do not negotiate a post-quantum key exchange. Traffic
+to them can be recorded today and decrypted whenever a quantum computer arrives
+— and unlike certificate algorithms, that is a cost being paid now rather than a
+deadline in the 2030s.
+```
+
+That needs a real connection to a real server, which is why it lives in the
+scanner. An inventory knows what a certificate is signed with; only a handshake
+knows what a server chooses.
+
+```
+www.google.com:443        TLS 1.3  X25519MLKEM768  hybrid=True   offered=True
+www.cloudflare.com:443    TLS 1.3  X25519MLKEM768  hybrid=True   offered=True
+tls-v1-2.badssl.com:1012  TLS 1.2  CurveP256       hybrid=False  offered=True
+```
+
+`offered` is the column that makes the rest mean anything. "This endpoint did
+not negotiate a post-quantum group" is a fact about the server only if CertPilot
+offered one — otherwise it is a fact about CertPilot. And a TLS 1.2 endpoint is
+told apart from a TLS 1.3 one that declined, because there is no hybrid key
+exchange below 1.3 and no setting will fix it.
+
+Something broken *today* outranks something broken in 2035: a certificate signed
+with SHA-1 gets its own verdict and its own line, rather than being filed under
+quantum readiness. SHA-256 is reported as a shortfall against CNSA 2.0's 192-bit
+requirement, not as a break, because it is not one.
+
+**CBOM export** is CycloneDX 1.6, validated against the published schema in the
+test suite:
+
+```
+GET /api/v1/posture/cbom
+```
+
+Algorithms appear once and are referenced by everything that uses them, so *"what
+does moving off SHA-256 touch"* is a graph query rather than a search. The serial
+number is derived from the contents, so two exports of an unchanged estate are
+byte-identical and a diff means something.
+
+**Post-quantum issuance is not here**, and is blocked rather than skipped:
+`crypto/mldsa` is not in Go 1.26 and `crypto/x509` cannot build an ML-DSA
+certificate. Hand-rolling ASN.1 to produce a certificate almost nothing can
+verify would be a demo, not a feature.
 
 ## Security model
 

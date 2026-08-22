@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/certpilot/certpilot/core/engine/posture"
 	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/store"
 	"github.com/certpilot/certpilot/pkg/x509util"
@@ -177,6 +179,10 @@ type Probe struct {
 	// exchange, which is itself a finding.
 	CurveID tls.CurveID
 	ALPN    string
+	// OfferedHybrid records whether this probe offered a post-quantum group.
+	// Without it, "the server did not negotiate one" is not a statement about
+	// the server.
+	OfferedHybrid bool
 }
 
 // Probe completes a TLS handshake and records everything it can about it.
@@ -201,6 +207,16 @@ func (s *Scanner) Probe(ctx context.Context, target Target) *Probe {
 		MinVersion:   tls.VersionTLS10,
 		CipherSuites: allCipherSuites(),
 		NextProtos:   []string{"h2", "http/1.1"},
+		// Stated rather than inherited, and this is the line that makes the
+		// post-quantum finding mean anything.
+		//
+		// "This endpoint did not negotiate a hybrid group" is a fact about the
+		// server only if a hybrid group was offered. Go enables X25519MLKEM768
+		// by default today, so leaving this unset would work — until a release
+		// changed the default, at which point every endpoint in the estate
+		// would quietly start reporting as classical and the report would be
+		// about the scanner.
+		CurvePreferences: offeredCurves(),
 	}
 
 	dialer := &net.Dialer{Timeout: s.dialTimeout}
@@ -222,7 +238,83 @@ func (s *Scanner) Probe(ctx context.Context, target Target) *Probe {
 	probe.CipherSuite = state.CipherSuite
 	probe.CurveID = state.CurveID
 	probe.ALPN = state.NegotiatedProtocol
+	probe.OfferedHybrid = offeredHybrid()
 	return probe
+}
+
+// offeredCurves is what every probe offers, hybrid group first.
+//
+// The classical groups stay, and stay after it: a scanner that offered only
+// post-quantum groups would fail to connect to almost everything, and an
+// endpoint it could not reach is an endpoint it cannot report on.
+func offeredCurves() []tls.CurveID {
+	return []tls.CurveID{
+		tls.X25519MLKEM768,
+		tls.X25519,
+		tls.CurveP256,
+		tls.CurveP384,
+		tls.CurveP521,
+	}
+}
+
+// offeredHybrid reports whether the list above contains a post-quantum group,
+// so the recorded observation carries the fact its own meaning depends on.
+func offeredHybrid() bool {
+	for _, curve := range offeredCurves() {
+		if IsHybridGroup(curve) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsHybridGroup reports whether a negotiated group carries a post-quantum key
+// encapsulation alongside a classical exchange.
+//
+// Matched by name rather than by a list of numbers, because the numbers are
+// still moving: X25519MLKEM768 has had more than one codepoint during
+// standardisation and will acquire siblings. A name containing MLKEM is the
+// stable part.
+func IsHybridGroup(curve tls.CurveID) bool {
+	return strings.Contains(strings.ToUpper(curve.String()), "MLKEM")
+}
+
+// GroupName renders a negotiated group for a person.
+//
+// Go prints an unrecognised group as its number, which is the right thing for
+// a report to carry: a group this build does not know the name of is exactly
+// what somebody should go and look up.
+func GroupName(curve tls.CurveID) string {
+	if curve == 0 {
+		return ""
+	}
+	return curve.String()
+}
+
+// VersionName renders a TLS version.
+func VersionName(version uint16) string {
+	switch version {
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	case 0:
+		return ""
+	default:
+		return fmt.Sprintf("0x%04x", version)
+	}
+}
+
+// CipherName renders a negotiated cipher suite.
+func CipherName(suite uint16) string {
+	if suite == 0 {
+		return ""
+	}
+	return tls.CipherSuiteName(suite)
 }
 
 // ScanRequest is one run.
@@ -723,7 +815,54 @@ func (s *Scanner) judge(ctx context.Context, probe *Probe, anchors *TrustAnchors
 	result.Findings = append(result.Findings, findings...)
 	result.Findings = append(result.Findings, reconcile(result, baseline[probe.Target.String()])...)
 
+	// What this handshake actually negotiated, which is the one thing about
+	// an estate's cryptography that no inventory can produce. Recorded here
+	// because the connection has already been made; asking again later would
+	// be a second scan of somebody else's infrastructure to learn something
+	// this one already knew.
+	s.recordPosture(ctx, probe, result)
+
 	return result
+}
+
+// recordPosture stores what the handshake negotiated.
+//
+// Failure is logged and dropped rather than failing the scan. A scan exists to
+// find certificates; losing a posture row costs one line in a report and the
+// next scan writes it again, while failing the run would lose the certificates
+// too.
+func (s *Scanner) recordPosture(ctx context.Context, probe *Probe, result *store.DiscoveryResult) {
+	supportsTLS13 := probe.Version == tls.VersionTLS13
+	record := &store.EndpointTLSPosture{
+		Host:              probe.Target.Host,
+		Port:              probe.Target.Port,
+		CertificateID:     result.MatchedCertificateID,
+		TLSVersion:        VersionName(probe.Version),
+		CipherSuite:       CipherName(probe.CipherSuite),
+		KeyExchangeGroup:  GroupName(probe.CurveID),
+		HybridKeyExchange: IsHybridGroup(probe.CurveID),
+		OfferedHybrid:     probe.OfferedHybrid,
+		SupportsTLS13:     &supportsTLS13,
+		ALPN:              probe.ALPN,
+		ObservedAt:        probe.ScannedAt,
+	}
+	if result.ScanID != "" {
+		scanID := result.ScanID
+		record.ScanID = &scanID
+	}
+
+	assessment := posture.Endpoint(record.TLSVersion, record.KeyExchangeGroup,
+		record.HybridKeyExchange, record.OfferedHybrid)
+	record.Verdict = assessment.Verdict
+	record.Summary = assessment.Summary
+	if requirements, err := json.Marshal(assessment.Requirements); err == nil {
+		record.Requirements = requirements
+	}
+
+	if err := s.store.UpsertEndpointTLSPosture(ctx, record); err != nil {
+		slog.Warn("could not record what a handshake negotiated",
+			"host", record.Host, "port", record.Port, "error", err)
+	}
 }
 
 // loadBaseline reads what each target was last seen serving.

@@ -27,9 +27,24 @@ type CertInfo struct {
 	KeySize           int       `json:"key_size"`
 	FingerprintSHA256 string    `json:"fingerprint_sha256"`
 	IsCA              bool      `json:"is_ca"`
-	Issuer            string    `json:"issuer"`
-	CRLURLs           []string  `json:"crl_urls"`
-	OCSPURLs          []string  `json:"ocsp_urls"`
+
+	// SignatureAlgorithm is how this certificate was signed, which is a
+	// different fact from what its key is and is not derivable from it. A
+	// certificate can carry a perfectly good ECDSA P-384 key and be signed with
+	// SHA-1, and only one of those two is visible in KeyType. Cryptographic
+	// posture reporting that looked only at the key would call that certificate
+	// healthy.
+	SignatureAlgorithm string `json:"signature_algorithm,omitempty"`
+	// PublicKeyAlgorithm is the algorithm name as X.509 records it, kept beside
+	// KeyType because KeyType carries this project's own vocabulary and this
+	// carries the certificate's.
+	PublicKeyAlgorithm string `json:"public_key_algorithm,omitempty"`
+	// Curve is the named curve for an elliptic key — P-256, P-384 — which is
+	// the parameter set a CBOM has to name and which KeySize only implies.
+	Curve    string   `json:"curve,omitempty"`
+	Issuer   string   `json:"issuer"`
+	CRLURLs  []string `json:"crl_urls"`
+	OCSPURLs []string `json:"ocsp_urls"`
 }
 
 // ParseCertificatePEM parses a PEM-encoded certificate and returns CertInfo.
@@ -66,6 +81,9 @@ func CertInfoFromX509(cert *x509.Certificate) *CertInfo {
 		OCSPURLs:          cert.OCSPServer,
 	}
 
+	info.SignatureAlgorithm = cert.SignatureAlgorithm.String()
+	info.PublicKeyAlgorithm = cert.PublicKeyAlgorithm.String()
+
 	// Determine key type and size
 	switch pub := cert.PublicKey.(type) {
 	case *rsa.PublicKey:
@@ -75,12 +93,14 @@ func CertInfoFromX509(cert *x509.Certificate) *CertInfo {
 		info.KeyType = "ECDSA"
 		if pub.Curve != nil {
 			info.KeySize = pub.Curve.Params().BitSize
+			info.Curve = pub.Curve.Params().Name
 		} else {
 			info.KeySize = 256
 		}
 	case ed25519.PublicKey:
 		info.KeyType = "Ed25519"
 		info.KeySize = 256
+		info.Curve = "Curve25519"
 	default:
 		info.KeyType = "Unknown"
 		info.KeySize = 0

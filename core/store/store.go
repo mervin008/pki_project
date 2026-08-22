@@ -331,6 +331,21 @@ type Store interface {
 	// business connecting to in order to check a renewal reached them.
 	GetEndpointsServingCertificate(ctx context.Context, certificateID, fingerprint string) ([]string, error)
 
+	// ── Cryptographic posture ───────────────────────────────
+
+	// UpsertEndpointTLSPosture records what one handshake negotiated, keyed on
+	// host and port so a rescan updates rather than accumulates.
+	UpsertEndpointTLSPosture(ctx context.Context, p *EndpointTLSPosture) error
+	ListEndpointTLSPosture(ctx context.Context, filter EndpointTLSPostureFilter) ([]*EndpointTLSPosture, int64, error)
+	// CountTLSPostureByVerdict is what the headline sentence is built from:
+	// "142 of your endpoints do not negotiate a post-quantum key exchange".
+	CountTLSPostureByVerdict(ctx context.Context) (map[string]int64, error)
+	// ListCertificatesForAssessment returns certificates whose posture has not
+	// been worked out, or was worked out before the certificate last changed.
+	ListCertificatesForAssessment(ctx context.Context, limit int) ([]*Certificate, error)
+	// UpdateCertificatePosture writes one assessment.
+	UpdateCertificatePosture(ctx context.Context, id string, update CertificatePostureUpdate) error
+
 	// ── Agents ──────────────────────────────────────────────
 	//
 	// The most security-critical records in the schema: an agent credential
