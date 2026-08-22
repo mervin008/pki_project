@@ -1,22 +1,26 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/certpilot/certpilot/core/engine/fleet"
 	"github.com/certpilot/certpilot/core/events"
+	"github.com/certpilot/certpilot/core/pluginmgr"
 	"github.com/certpilot/certpilot/core/server/middleware"
 	"github.com/certpilot/certpilot/core/store"
 	"github.com/certpilot/certpilot/pkg/agentapi"
 	"github.com/certpilot/certpilot/pkg/agentauth"
+	"github.com/certpilot/certpilot/pkg/secrets"
 	"github.com/gin-gonic/gin"
 )
 
@@ -36,8 +40,16 @@ const (
 	// a quarter of an hour, rare enough that a thousand agents are twelve
 	// requests a second between them.
 	defaultHeartbeatSeconds = 300
-	minHeartbeatSeconds     = 30
-	maxHeartbeatSeconds     = 3600
+	// defaultMinKeySize is the floor a grant applies when its author did not
+	// pick one. 256 is a P-256 key; the same number would be indefensible for
+	// RSA, which is why AllowsKey compares against what the request actually
+	// carries rather than against a single global minimum.
+	defaultMinKeySize = 256
+	// defaultRenewBeforeDays is how much life must remain before a host may ask
+	// for a replacement.
+	defaultRenewBeforeDays = 30
+	minHeartbeatSeconds    = 30
+	maxHeartbeatSeconds    = 3600
 )
 
 // AgentHandler manages agents, the tokens that enrol them, and what they
@@ -46,11 +58,17 @@ type AgentHandler struct {
 	store     store.Store
 	broker    *events.Broker
 	inventory *fleet.Inventory
+	issuer    *fleet.Issuer
 }
 
 // NewAgentHandler creates the handler.
-func NewAgentHandler(s store.Store, broker *events.Broker) *AgentHandler {
-	return &AgentHandler{store: s, broker: broker, inventory: fleet.NewInventory(s, broker)}
+func NewAgentHandler(s store.Store, pm *pluginmgr.Manager, kr *secrets.Keyring, broker *events.Broker) *AgentHandler {
+	return &AgentHandler{
+		store:     s,
+		broker:    broker,
+		inventory: fleet.NewInventory(s, broker),
+		issuer:    fleet.NewIssuer(s, pm, kr, broker),
+	}
 }
 
 // ── Management, for people ──────────────────────────────────
@@ -707,9 +725,227 @@ func pick(n int64, one, many string) string {
 	return many
 }
 
+// labelText renders a selector the way somebody would write it.
+func labelText(labels map[string]string) string {
+	if len(labels) == 0 {
+		return "no labels"
+	}
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+labels[key])
+	}
+	return strings.Join(parts, ", ")
+}
+
 func capitalise(s string) string {
 	if s == "" {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// ── What a host may ask for ─────────────────────────────────
+
+// ListGrants handles GET /api/v1/agent-grants.
+func (h *AgentHandler) ListGrants(c *gin.Context) {
+	grants, err := h.store.ListAgentGrants(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	live := 0
+	for _, g := range grants {
+		if g.Live() {
+			live++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": grants, "total": len(grants), "live": live})
+}
+
+type grantRequest struct {
+	Name          string            `json:"name" binding:"required"`
+	AgentID       string            `json:"agent_id"`
+	LabelSelector map[string]string `json:"label_selector"`
+	Names         []string          `json:"names" binding:"required"`
+	CAAccountID   string            `json:"ca_account_id" binding:"required"`
+
+	MinKeySize      int      `json:"min_key_size"`
+	AllowedKeyTypes []string `json:"allowed_key_types"`
+	ValidityDays    int      `json:"validity_days"`
+	RenewBeforeDays int      `json:"renew_before_days"`
+}
+
+// CreateGrant handles POST /api/v1/agent-grants.
+//
+// The one place an operator decides what a host may obtain from the
+// organisation's CA. Every check here is about making that decision explicit
+// rather than accidental.
+func (h *AgentHandler) CreateGrant(c *gin.Context) {
+	var req grantRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.AgentID == "" && len(req.LabelSelector) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "a grant needs either agent_id or label_selector — one that targets nothing would sit in the list looking like permission somebody had given",
+		})
+		return
+	}
+
+	names := make([]string, 0, len(req.Names))
+	for _, name := range req.Names {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		// A grant permitting every name makes the agent credential equivalent
+		// to the CA behind it. There is no way to write "I meant it" that is
+		// better than listing the domains.
+		if name == "*" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "a grant may not permit `*`. Any host holding it could obtain a certificate for any name your CA will sign — list the domains, or the wildcard beneath them",
+			})
+			return
+		}
+		if strings.Count(name, "*") > 1 || (strings.Contains(name, "*") && !strings.HasPrefix(name, "*.")) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("%q is not a name or a wildcard. Wildcards look like `*.example.com` and match one level", name),
+			})
+			return
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "a grant needs at least one name"})
+		return
+	}
+
+	if _, err := h.store.GetCAAccount(c.Request.Context(), req.CAAccountID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.AgentID != "" {
+		if _, err := h.store.GetAgent(c.Request.Context(), req.AgentID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	grant := &store.AgentGrant{
+		Name:            strings.TrimSpace(req.Name),
+		LabelSelector:   req.LabelSelector,
+		Names:           names,
+		CAAccountID:     req.CAAccountID,
+		MinKeySize:      req.MinKeySize,
+		AllowedKeyTypes: req.AllowedKeyTypes,
+		ValidityDays:    req.ValidityDays,
+		RenewBeforeDays: req.RenewBeforeDays,
+		IsEnabled:       true,
+	}
+	if req.AgentID != "" {
+		grant.AgentID = &req.AgentID
+	}
+	if grant.MinKeySize <= 0 {
+		grant.MinKeySize = defaultMinKeySize
+	}
+	if len(grant.AllowedKeyTypes) == 0 {
+		grant.AllowedKeyTypes = []string{"ECDSA", "RSA", "Ed25519"}
+	}
+	if grant.RenewBeforeDays <= 0 {
+		grant.RenewBeforeDays = defaultRenewBeforeDays
+	}
+
+	actor, _ := actorOf(c)
+	grant.CreatedBy = actor
+
+	if err := h.store.CreateAgentGrant(c.Request.Context(), grant); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.audit(c, "agent_grant.created", grant.ID, fmt.Sprintf(
+		`{"name":%q,"names":%q,"agent_id":%q,"labels":%q}`,
+		grant.Name, strings.Join(grant.Names, ","), req.AgentID, labelText(req.LabelSelector)))
+
+	c.JSON(http.StatusCreated, gin.H{
+		"data":    grant,
+		"message": grantMessage(grant),
+	})
+}
+
+// grantMessage says what was just permitted, in the terms it will be used in.
+func grantMessage(grant *store.AgentGrant) string {
+	// Rendered rather than printed. Go's map formatting produced
+	// "map[env:prod tier:web]" in a sentence meant for a person.
+	who := "every agent labelled " + labelText(grant.LabelSelector)
+	if grant.AgentID != nil {
+		who = "one agent"
+	}
+	return fmt.Sprintf(
+		"%s may now obtain certificates for %s, with keys generated on the host. CertPilot will never hold those private keys.",
+		capitalise(who), strings.Join(grant.Names, ", "))
+}
+
+// RevokeGrant handles DELETE /api/v1/agent-grants/:id.
+func (h *AgentHandler) RevokeGrant(c *gin.Context) {
+	actor, _ := actorOf(c)
+	if err := h.store.RevokeAgentGrant(c.Request.Context(), c.Param("id"), actor); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	h.audit(c, "agent_grant.revoked", c.Param("id"), `{}`)
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Revoked. Certificates already issued under it keep working until they expire; nothing will replace them.",
+	})
+}
+
+// ── Issuance ────────────────────────────────────────────────
+
+// RequestCertificate handles POST /api/v1/agent/certificates.
+//
+// The point of the whole agent. The key was generated on the host that will use
+// it and has never left; what arrives here is a request. CertPilot signs it if
+// an operator granted this host those names, and never holds a secret it could
+// lose, copy, or be compelled to produce.
+func (h *AgentHandler) RequestCertificate(c *gin.Context) {
+	agentID := c.GetString(middleware.ContextAgentID)
+
+	var req fleet.Request
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	agent, err := h.store.GetAgent(c.Request.Context(), agentID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Bounded under the server's write timeout, like everything else that
+	// reaches out during a request: an ACME order can take a while, and a
+	// truncated response would leave the host unsure whether a certificate had
+	// been issued in its name.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 25*time.Second)
+	defer cancel()
+
+	issued, err := h.issuer.Issue(ctx, agent, req)
+	if err != nil {
+		// 403, not 400. The request was well-formed; it was not permitted, and
+		// the two are different things for whoever is reading the agent's log.
+		//
+		// The code distinguishes this from the other 403 an agent can get — a
+		// revoked credential — because the right response to each is the
+		// opposite: fix the grant, or stop for good.
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error(), "code": "not_permitted"})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"data": issued})
 }

@@ -52,6 +52,7 @@ type MemoryStore struct {
 	agents         map[string]*Agent
 	enrolTokens    map[string]*AgentEnrolToken
 	agentCerts     []*AgentCertificate
+	agentGrants    map[string]*AgentGrant
 }
 
 // clone returns a shallow copy of a stored record.
@@ -256,6 +257,7 @@ func NewMemoryStore() *MemoryStore {
 		// a credential somebody forgets to remove.
 		agents:      make(map[string]*Agent),
 		enrolTokens: make(map[string]*AgentEnrolToken),
+		agentGrants: make(map[string]*AgentGrant),
 	}
 }
 
@@ -406,6 +408,12 @@ func (m *MemoryStore) GetCertificatesDueForRenewal(ctx context.Context, leadDays
 	due := make([]*Certificate, 0)
 	for _, c := range m.certificates {
 		if !c.AutoRenew {
+			continue
+		}
+		// A certificate whose key lives on a host cannot be renewed from here:
+		// renewing means generating a key, and the point is that this process
+		// never has one. The agent renews its own by sending a new request.
+		if c.KeyCustody == KeyCustodyAgent {
 			continue
 		}
 		// The CA's advice takes precedence over the lead time when there is
@@ -3065,4 +3073,82 @@ func (m *MemoryStore) GetCertificateBySupersededFingerprint(ctx context.Context,
 		}
 	}
 	return nil, nil
+}
+
+// ── What a host may ask for ─────────────────────────────────
+
+func (m *MemoryStore) ListAgentGrants(ctx context.Context) ([]*AgentGrant, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make([]*AgentGrant, 0, len(m.agentGrants))
+	for _, g := range m.agentGrants {
+		out = append(out, clone(g))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *MemoryStore) GetAgentGrant(ctx context.Context, id string) (*AgentGrant, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	g, ok := m.agentGrants[id]
+	if !ok {
+		return nil, fmt.Errorf("grant %s not found", id)
+	}
+	return clone(g), nil
+}
+
+func (m *MemoryStore) CreateAgentGrant(ctx context.Context, g *AgentGrant) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	stored := clone(g)
+	if stored.ID == "" {
+		stored.ID = uuid.New().String()
+	}
+	now := time.Now()
+	stored.CreatedAt, stored.UpdatedAt = now, now
+	m.agentGrants[stored.ID] = stored
+	*g = *clone(stored)
+	return nil
+}
+
+func (m *MemoryStore) RevokeAgentGrant(ctx context.Context, id string, revokedBy *string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	g, ok := m.agentGrants[id]
+	if !ok || g.RevokedAt != nil {
+		return fmt.Errorf("grant %s is already revoked", id)
+	}
+	now := time.Now()
+	g.RevokedAt, g.RevokedBy, g.IsEnabled, g.UpdatedAt = &now, revokedBy, false, now
+	return nil
+}
+
+func (m *MemoryStore) GetGrantsForAgent(ctx context.Context, agentID string) ([]*AgentGrant, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	agent, ok := m.agents[agentID]
+	if !ok {
+		return nil, fmt.Errorf("agent %s not found", agentID)
+	}
+
+	out := []*AgentGrant{}
+	for _, g := range m.agentGrants {
+		if g.AppliesTo(agent) {
+			out = append(out, clone(g))
+		}
+	}
+	// Agent-specific grants first, matching the Postgres ORDER BY, so the same
+	// request resolves to the same grant whichever store is behind it.
+	sort.Slice(out, func(i, j int) bool {
+		if (out[i].AgentID == nil) != (out[j].AgentID == nil) {
+			return out[i].AgentID != nil
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
 }

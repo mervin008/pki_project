@@ -288,3 +288,62 @@ func TestASelfSignedServerCertificateIsALeaf(t *testing.T) {
 		t.Fatalf("a certificate with no names is an authority, got %q", got)
 	}
 }
+
+// TestAGuessedKeyNameIsNotAMismatch.
+//
+// A directory holding a leaf, its chain, and one `key.pem` is completely
+// ordinary. Pairing the chain with that key by filename and reporting the
+// failure as a mismatch produced a CRITICAL alert about a CA certificate whose
+// "key" was the leaf's — the kind of false positive that teaches people to
+// ignore the real ones.
+func TestAGuessedKeyNameIsNotAMismatch(t *testing.T) {
+	dir := t.TempDir()
+
+	// The layout the agent itself writes: cert.pem, chain.pem, key.pem.
+	writePair(t, dir, "leaf", "site.example.com", 0o600, false)
+	leafCert, _ := os.ReadFile(filepath.Join(dir, "leaf.crt"))
+	leafKey, _ := os.ReadFile(filepath.Join(dir, "leaf.key"))
+	writePair(t, dir, "other", "Some Issuing CA", 0o600, false)
+	chain, _ := os.ReadFile(filepath.Join(dir, "other.crt"))
+
+	for name, body := range map[string][]byte{
+		"cert.pem": leafCert, "key.pem": leafKey, "chain.pem": chain,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), body, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	for _, stale := range []string{"leaf.crt", "leaf.key", "other.crt", "other.key"} {
+		_ = os.Remove(filepath.Join(dir, stale))
+	}
+
+	report := Scan([]string{dir})
+
+	leaf := find(t, report, "cert.pem")
+	if leaf.PrivateKeyPath == "" || !leaf.PrivateKeyMatches {
+		t.Fatalf("the leaf's key should be found by convention and match: %+v", leaf)
+	}
+
+	other := find(t, report, "chain.pem")
+	if other.PrivateKeyPath != "" {
+		t.Fatalf("a guessed key that does not match is evidence the key is elsewhere, not a mismatch: %+v", other)
+	}
+}
+
+// TestAStemNamedKeyThatDoesNotMatchIsStillAMismatch. `site.key` beside
+// `site.crt` is a statement that the two belong together.
+func TestAStemNamedKeyThatDoesNotMatchIsStillAMismatch(t *testing.T) {
+	dir := t.TempDir()
+	writePair(t, dir, "site", "site.example.com", 0o600, false)
+	writePair(t, dir, "other", "other.example.com", 0o600, false)
+
+	otherKey, _ := os.ReadFile(filepath.Join(dir, "other.key"))
+	if err := os.WriteFile(filepath.Join(dir, "site.key"), otherKey, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	site := find(t, Scan([]string{dir}), "site.crt")
+	if site.PrivateKeyPath == "" || site.PrivateKeyMatches {
+		t.Fatalf("a stem-named key that does not match is a real mismatch: %+v", site)
+	}
+}

@@ -2,6 +2,8 @@
 package store
 
 import (
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -185,6 +187,14 @@ type Certificate struct {
 	CreatedBy           *string   `json:"created_by,omitempty"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+	// KeyCustody says who holds the private key: CERTPILOT (sealed here),
+	// AGENT (on a host, never anywhere else), or EXTERNAL (somebody we cannot
+	// name). Until agents existed, "no key stored" meant only the last of
+	// those; it now also means the best of the three.
+	KeyCustody string `json:"key_custody,omitempty"`
+	// KeyHolderAgentID is which host, when the answer is AGENT.
+	KeyHolderAgentID *string `json:"key_holder_agent_id,omitempty"`
+
 	// RenewalScheduledAt is when this certificate should next be renewed,
 	// whoever decided it. Nil means nobody has been told anything and the lead
 	// time applies.
@@ -1496,4 +1506,175 @@ type AgentInventorySummary struct {
 	ScannedAt time.Time
 	Seen      int
 	Unmanaged int
+}
+
+// Who holds a certificate's private key.
+const (
+	// KeyCustodyCertPilot means the key is sealed in this database —
+	// exportable, and therefore a thing that can be lost, copied, or subpoenaed.
+	KeyCustodyCertPilot = "CERTPILOT"
+	// KeyCustodyAgent means the key is on a host and has never been anywhere
+	// else. CertPilot could not produce it if ordered to.
+	KeyCustodyAgent = "AGENT"
+	// KeyCustodyExternal means somebody holds it and it is not us: discovered,
+	// imported, or issued elsewhere.
+	KeyCustodyExternal = "EXTERNAL"
+)
+
+// AgentGrant is what a host is allowed to ask for.
+//
+// The security question that matters, and getting it wrong is worse than not
+// having an agent at all. A credential that can request any name is a way to
+// obtain a certificate for the payroll system from a compromised web server,
+// signed by the organisation's own CA, looking exactly like every other
+// issuance in the log.
+type AgentGrant struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+
+	// AgentID targets one host. LabelSelector targets every agent carrying
+	// these labels — which come from the enrolment token rather than from the
+	// agent, so a host cannot label itself into somebody else's grant.
+	AgentID       *string           `json:"agent_id,omitempty"`
+	LabelSelector map[string]string `json:"label_selector,omitempty"`
+
+	// Names permitted, as exact hostnames or single-level wildcards.
+	Names []string `json:"names"`
+
+	// CAAccountID is part of the grant rather than chosen by the agent: one
+	// that could pick its own issuer could pick the cheapest, the least logged,
+	// or the one with the widest trust.
+	CAAccountID string `json:"ca_account_id"`
+
+	MinKeySize      int      `json:"min_key_size"`
+	AllowedKeyTypes []string `json:"allowed_key_types"`
+	ValidityDays    int      `json:"validity_days"`
+	RenewBeforeDays int      `json:"renew_before_days"`
+
+	IsEnabled bool       `json:"is_enabled"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy *string    `json:"revoked_by,omitempty"`
+	CreatedBy *string    `json:"created_by,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+}
+
+// Live reports whether this grant is currently permission for anything.
+func (g *AgentGrant) Live() bool {
+	return g != nil && g.IsEnabled && g.RevokedAt == nil
+}
+
+// AppliesTo reports whether this grant covers an agent.
+//
+// A label selector matches when every key it names matches. An empty selector
+// on a grant with no agent cannot happen — the schema refuses it — because a
+// grant matching nothing would sit in the list looking like permission somebody
+// had given.
+func (g *AgentGrant) AppliesTo(agent *Agent) bool {
+	if g == nil || agent == nil || !g.Live() {
+		return false
+	}
+	if g.AgentID != nil && *g.AgentID == agent.ID {
+		return true
+	}
+	if len(g.LabelSelector) == 0 {
+		return false
+	}
+	for key, want := range g.LabelSelector {
+		if agent.Labels[key] != want {
+			return false
+		}
+	}
+	return true
+}
+
+// Covers reports whether this grant permits a hostname.
+//
+// Wildcards match one level, exactly as they do in a certificate:
+// `*.example.com` covers `a.example.com`, and deliberately covers neither
+// `a.b.example.com` nor `example.com`. Following the same rule certificates
+// follow is what makes a grant mean what the person who wrote it thinks.
+func (g *AgentGrant) Covers(name string) bool {
+	if g == nil || name == "" {
+		return false
+	}
+	name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+
+	for _, pattern := range g.Names {
+		pattern = strings.ToLower(strings.TrimSpace(pattern))
+		if pattern == name {
+			return true
+		}
+		if !strings.HasPrefix(pattern, "*.") {
+			continue
+		}
+		suffix := pattern[1:] // ".example.com"
+		if !strings.HasSuffix(name, suffix) {
+			continue
+		}
+		label := name[:len(name)-len(suffix)]
+		if label != "" && !strings.Contains(label, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+// MinEllipticBits is the floor for elliptic keys, whatever a grant says.
+//
+// P-256 is the smallest curve anybody should be using and every curve above it
+// is larger, so there is nothing for a grant to tighten here — which is
+// fortunate, because a grant cannot express a curve.
+const MinEllipticBits = 256
+
+// AllowsKey reports whether a key is of a permitted type and strong enough.
+//
+// The type is checked first, and MinKeySize is applied only to RSA. **Key sizes
+// are not comparable across algorithms**: a P-256 key is considerably stronger
+// than RSA-2048, and the integer 256 is smaller than 2048. One number compared
+// against both refuses the stronger key for being the smaller number, which is
+// how this was first written and what a test caught.
+//
+// So a grant's MinKeySize means RSA bits, elliptic keys are floored at the
+// smallest curve worth using, and a grant that wants to require P-384
+// specifically cannot say so — recorded as a known gap rather than papered over
+// with a number that means two different things.
+func (g *AgentGrant) AllowsKey(keyType string, keySize int) (bool, string) {
+	if g == nil {
+		return false, "no grant"
+	}
+
+	if len(g.AllowedKeyTypes) > 0 {
+		permitted := false
+		for _, allowed := range g.AllowedKeyTypes {
+			if strings.EqualFold(allowed, keyType) {
+				permitted = true
+				break
+			}
+		}
+		if !permitted {
+			return false, fmt.Sprintf("this grant permits %s and the request carries %s",
+				strings.Join(g.AllowedKeyTypes, ", "), keyType)
+		}
+	}
+
+	switch strings.ToUpper(keyType) {
+	case "RSA":
+		floor := g.MinKeySize
+		if floor < 2048 {
+			// Nothing below this is worth signing, whatever a grant written
+			// years ago happens to say.
+			floor = 2048
+		}
+		if keySize < floor {
+			return false, fmt.Sprintf("this grant requires at least %d-bit RSA and the request carries %d",
+				floor, keySize)
+		}
+	default:
+		if keySize < MinEllipticBits {
+			return false, fmt.Sprintf("an elliptic key must be at least %d bits and the request carries %d",
+				MinEllipticBits, keySize)
+		}
+	}
+	return true, ""
 }

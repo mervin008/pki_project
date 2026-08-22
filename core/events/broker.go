@@ -97,7 +97,15 @@ const (
 	// did not issue and is not tracking — the fourth place they hide, after
 	// served, issued, and stored in a cloud.
 	TopicAgentUnmanaged = "agent.unmanaged"
-	TopicGatewayStatus  = "gateway.status"
+	// TopicAgentRequestRefused carries a host asking for a certificate it has
+	// not been granted.
+	//
+	// Published rather than only logged, because the two things it can mean are
+	// indistinguishable from inside the process: a misconfiguration somebody
+	// needs to fix, or the first use of a credential taken off a host that has
+	// been broken into. A person can tell those apart. Nothing here can.
+	TopicAgentRequestRefused = "agent.request_refused"
+	TopicGatewayStatus       = "gateway.status"
 	// TopicDiscoveryUnmanaged carries the one finding a discovery scan exists
 	// to produce: an endpoint serving a certificate this system has never seen.
 	// Published so it reaches the channels a team already configured, rather
@@ -187,6 +195,7 @@ func AllTopics() []string {
 		TopicAgentKeyExposed,
 		TopicAgentKeyMismatch,
 		TopicAgentUnmanaged,
+		TopicAgentRequestRefused,
 		TopicGatewayStatus,
 		TopicDiscoveryUnmanaged,
 		TopicDiscoveryChanged,

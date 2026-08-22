@@ -91,7 +91,8 @@ const certificateColumns = `id, fingerprint_sha256, common_name,
 		coalesce(ari_explanation_url, ''), ari_checked_at, ari_next_check_at, ari_supported,
 		coalesce(verification_state, ''), verify_after, last_verified_at,
 		coalesce(verification_attempts, 0), coalesce(verification_detail, ''),
-		coalesce(previous_fingerprint, '')`
+		coalesce(previous_fingerprint, ''),
+		coalesce(key_custody, 'EXTERNAL'), key_holder_agent_id`
 
 // scanCertificate reads one row of certificateColumns.
 func scanCertificate(row pgx.Row) (*Certificate, error) {
@@ -107,6 +108,7 @@ func scanCertificate(row pgx.Row) (*Certificate, error) {
 		&cert.ARIExplanationURL, &cert.ARICheckedAt, &cert.ARINextCheckAt, &cert.ARISupported,
 		&cert.VerificationState, &cert.VerifyAfter, &cert.LastVerifiedAt,
 		&cert.VerificationAttempts, &cert.VerificationDetail, &cert.PreviousFingerprint,
+		&cert.KeyCustody, &cert.KeyHolderAgentID,
 	)
 	if err != nil {
 		return nil, err
@@ -243,9 +245,11 @@ func (s *PostgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 			not_before, not_after, days_remaining, key_type, key_size, status,
 			auto_renew, renewal_lead_days, ca_account_id, ca_authority_id,
 			deployment_target_id, private_key_encrypted, certificate_pem, chain_pem,
-			discovered_via, environment, team, tags, created_by
+			discovered_via, environment, team, tags, created_by,
+			key_custody, key_holder_agent_id
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+			$25, $26
 		) RETURNING id, created_at, updated_at
 	`
 	return s.pool.QueryRow(ctx, query,
@@ -254,6 +258,7 @@ func (s *PostgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 		cert.AutoRenew, cert.RenewalLeadDays, cert.CAAccountID, cert.CAAuthorityID,
 		cert.DeploymentTargetID, cert.PrivateKeyEncrypted, cert.CertificatePEM, cert.ChainPEM,
 		cert.DiscoveredVia, nullIfEmpty(cert.Environment), cert.Team, tagsJSON, cert.CreatedBy,
+		custodyOrDefault(cert), cert.KeyHolderAgentID,
 	).Scan(&cert.ID, &cert.CreatedAt, &cert.UpdatedAt)
 }
 
@@ -277,7 +282,8 @@ func (s *PostgresStore) UpdateCertificate(ctx context.Context, cert *Certificate
 			auto_renew = $13, renewal_lead_days = $14, last_renewal_attempt = $15, renewal_error = $16,
 			renewal_count = $17, ca_account_id = $18, ca_authority_id = $19, deployment_target_id = $20,
 			certificate_pem = $21, chain_pem = $22, environment = $23, team = $24, tags = $25,
-			private_key_encrypted = COALESCE($26::text, private_key_encrypted), updated_at = now()
+			private_key_encrypted = COALESCE($26::text, private_key_encrypted),
+			key_custody = $27, key_holder_agent_id = $28, updated_at = now()
 		WHERE id = $1
 	`
 	// COALESCE, because both directions were wrong before.
@@ -298,9 +304,26 @@ func (s *PostgresStore) UpdateCertificate(ctx context.Context, cert *Certificate
 		cert.AutoRenew, cert.RenewalLeadDays, cert.LastRenewalAttempt, cert.RenewalError,
 		cert.RenewalCount, cert.CAAccountID, cert.CAAuthorityID, cert.DeploymentTargetID,
 		cert.CertificatePEM, cert.ChainPEM, nullIfEmpty(cert.Environment), cert.Team, tagsJSON,
-		cert.PrivateKeyEncrypted,
+		cert.PrivateKeyEncrypted, custodyOrDefault(cert), cert.KeyHolderAgentID,
 	)
 	return err
+}
+
+// custodyOrDefault fills in who holds the key when a caller did not say.
+//
+// Derived from whether a key is being stored, which is exactly what migration
+// 020's backfill did to the existing rows. Without this, every path that builds
+// a Certificate without setting the field — and there are several — would write
+// an empty string into a checked column and fail, which is migration 012's
+// lesson arriving a second time.
+func custodyOrDefault(cert *Certificate) string {
+	if cert.KeyCustody != "" {
+		return cert.KeyCustody
+	}
+	if cert.PrivateKeyEncrypted != nil && *cert.PrivateKeyEncrypted != "" {
+		return KeyCustodyCertPilot
+	}
+	return KeyCustodyExternal
 }
 
 // nullIfEmpty maps Go's zero value for a string to SQL NULL.
@@ -356,6 +379,13 @@ func (s *PostgresStore) GetCertificatesDueForRenewal(ctx context.Context, defaul
 		FROM public.certificates
 		WHERE auto_renew = true
 		  AND status IN ('ISSUED', 'EXPIRING', 'RENEWAL_FAILED')
+		  -- A certificate whose key lives on a host cannot be renewed from
+		  -- here: renewing means generating a key, and the whole point is that
+		  -- this process never has one. The agent renews its own by sending a
+		  -- new request. Without this line the queue would pick them up and
+		  -- fail on every attempt forever, which is a loud way of being wrong
+		  -- about something that is working perfectly.
+		  AND coalesce(key_custody, 'EXTERNAL') <> 'AGENT'
 		  AND CASE
 		        WHEN renewal_scheduled_at IS NOT NULL THEN
 		          renewal_scheduled_at <= now()
@@ -3914,4 +3944,146 @@ func orEmptyFindings(v []Finding) []Finding {
 		return []Finding{}
 	}
 	return v
+}
+
+// ── What a host may ask for ─────────────────────────────────
+
+const agentGrantColumns = `id, name, agent_id, coalesce(label_selector, '{}'::jsonb),
+		coalesce(names, '[]'::jsonb), ca_account_id,
+		coalesce(min_key_size, 256), coalesce(allowed_key_types, '[]'::jsonb),
+		coalesce(validity_days, 0), coalesce(renew_before_days, 30),
+		coalesce(is_enabled, true), revoked_at, revoked_by, created_by, created_at, updated_at`
+
+func scanAgentGrant(row pgx.Row) (*AgentGrant, error) {
+	g := &AgentGrant{}
+	var selectorJSON, namesJSON, keyTypesJSON []byte
+	err := row.Scan(&g.ID, &g.Name, &g.AgentID, &selectorJSON,
+		&namesJSON, &g.CAAccountID,
+		&g.MinKeySize, &keyTypesJSON,
+		&g.ValidityDays, &g.RenewBeforeDays,
+		&g.IsEnabled, &g.RevokedAt, &g.RevokedBy, &g.CreatedBy, &g.CreatedAt, &g.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if len(selectorJSON) > 0 {
+		_ = json.Unmarshal(selectorJSON, &g.LabelSelector)
+	}
+	if len(namesJSON) > 0 {
+		_ = json.Unmarshal(namesJSON, &g.Names)
+	}
+	if len(keyTypesJSON) > 0 {
+		_ = json.Unmarshal(keyTypesJSON, &g.AllowedKeyTypes)
+	}
+	return g, nil
+}
+
+func (s *PostgresStore) ListAgentGrants(ctx context.Context) ([]*AgentGrant, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+agentGrantColumns+" FROM public.agent_grants ORDER BY created_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []*AgentGrant{}
+	for rows.Next() {
+		g, err := scanAgentGrant(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+func (s *PostgresStore) GetAgentGrant(ctx context.Context, id string) (*AgentGrant, error) {
+	g, err := scanAgentGrant(s.pool.QueryRow(ctx,
+		"SELECT "+agentGrantColumns+" FROM public.agent_grants WHERE id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("grant %s not found", id)
+	}
+	return g, err
+}
+
+func (s *PostgresStore) CreateAgentGrant(ctx context.Context, g *AgentGrant) error {
+	selectorJSON, err := json.Marshal(orEmptyMap(g.LabelSelector))
+	if err != nil {
+		return err
+	}
+	namesJSON, err := json.Marshal(orEmptyStrings(g.Names))
+	if err != nil {
+		return err
+	}
+	keyTypesJSON, err := json.Marshal(orEmptyStrings(g.AllowedKeyTypes))
+	if err != nil {
+		return err
+	}
+	return s.pool.QueryRow(ctx, `
+		INSERT INTO public.agent_grants
+			(name, agent_id, label_selector, names, ca_account_id,
+			 min_key_size, allowed_key_types, validity_days, renew_before_days, is_enabled, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		RETURNING id, created_at, updated_at`,
+		g.Name, g.AgentID, selectorJSON, namesJSON, g.CAAccountID,
+		g.MinKeySize, keyTypesJSON, g.ValidityDays, g.RenewBeforeDays, g.IsEnabled, g.CreatedBy,
+	).Scan(&g.ID, &g.CreatedAt, &g.UpdatedAt)
+}
+
+func (s *PostgresStore) RevokeAgentGrant(ctx context.Context, id string, revokedBy *string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE public.agent_grants
+		SET revoked_at = now(), revoked_by = $2, is_enabled = false, updated_at = now()
+		WHERE id = $1 AND revoked_at IS NULL`, id, revokedBy)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("grant %s is already revoked", id)
+	}
+	return nil
+}
+
+// GetGrantsForAgent returns the live grants that apply to one host.
+//
+// The label match is done in the database with jsonb containment: the agent's
+// labels must contain everything the selector asks for. Doing it here rather
+// than by loading every grant and filtering in Go means an estate with a
+// thousand grants costs one indexed query per request rather than a thousand
+// comparisons.
+func (s *PostgresStore) GetGrantsForAgent(ctx context.Context, agentID string) ([]*AgentGrant, error) {
+	rows, err := s.pool.Query(ctx,
+		"SELECT "+agentGrantColumns+` FROM public.agent_grants g
+		 WHERE g.revoked_at IS NULL AND g.is_enabled
+		   AND (
+		     g.agent_id = $1
+		     OR (
+		       g.label_selector <> '{}'::jsonb
+		       AND EXISTS (
+		         SELECT 1 FROM public.agents a
+		         WHERE a.id = $1 AND coalesce(a.labels, '{}'::jsonb) @> g.label_selector
+		       )
+		     )
+		   )
+		 ORDER BY g.agent_id NULLS LAST, g.created_at DESC`, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []*AgentGrant{}
+	for rows.Next() {
+		g, err := scanAgentGrant(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+func orEmptyMap(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
 }

@@ -47,6 +47,8 @@ func main() {
 		err = runStatus(os.Args[2:])
 	case "scan":
 		err = runScan(os.Args[2:])
+	case "request":
+		err = runRequest(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -70,6 +72,7 @@ func usage() {
   certpilot-agent enrol  --server=URL --token=TOKEN [--name=NAME] [--interval=5m]
   certpilot-agent run    [--state-dir=DIR]
   certpilot-agent scan   [--path=DIR ...]      what this host would report
+  certpilot-agent request --name=HOST [--name=...] [--key-type=ECDSA]
   certpilot-agent status [--state-dir=DIR]
 
 Enrolment generates this host's identity key locally. The private half is never
@@ -129,18 +132,23 @@ func runAgent(ctx context.Context, args []string) error {
 		return err
 	}
 
-	runner := agent.NewRunner(agent.NewClient(state.Server, state.AgentID, key), state)
+	runner := agent.NewRunner(agent.NewClient(state.Server, state.AgentID, key), state, *stateDir)
 	if *once {
-		// Heartbeat *and* inventory. "Report once" has to mean everything this
-		// agent would report, or an estate running it from a systemd timer
-		// rather than as a daemon — which plenty will — would tell CertPilot it
-		// is alive and never tell it what is on the host.
+		// Everything one cycle of the daemon would do: report, renew what is
+		// due, and inventory. "Once" has to mean all of it, or an estate
+		// running this from a systemd timer rather than as a daemon — which
+		// plenty will — would have an agent that says it is alive and never
+		// rotates a key.
 		if _, err := runner.Heartbeat(ctx); err != nil {
 			return err
 		}
+		renewed := runner.RenewDue(ctx)
 		report, err := runner.ReportInventory(ctx)
 		if err != nil {
 			return err
+		}
+		if renewed > 0 {
+			fmt.Printf("renewed %d certificate(s)\n", renewed)
 		}
 		fmt.Printf("reported: %d certificate file(s) from %d file(s) scanned\n",
 			len(report.Certificates), report.FilesSeen)
@@ -235,4 +243,43 @@ func matchNote(found agent.Discovered) string {
 		return ""
 	}
 	return "  ** does not match this certificate **"
+}
+
+// runRequest asks the core for a certificate, with a key generated here.
+func runRequest(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("request", flag.ExitOnError)
+	stateDir := fs.String("state-dir", agent.DefaultStateDir(), "where this agent's identity is kept")
+	var names stringList
+	fs.Var(&names, "name", "a hostname to request (repeatable)")
+	keyType := fs.String("key-type", "ECDSA", "ECDSA, RSA, or Ed25519")
+	keySize := fs.Int("key-size", 0, "key size; defaults to 256 for ECDSA, 2048 for RSA")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("--name is required: the hostname this certificate is for")
+	}
+
+	key, state, err := agent.LoadIdentity(*stateDir)
+	if err != nil {
+		return err
+	}
+	runner := agent.NewRunner(agent.NewClient(state.Server, state.AgentID, key), state, *stateDir)
+
+	held, err := runner.Request(ctx, agent.RequestOptions{
+		Names: names, KeyType: *keyType, KeySize: *keySize,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Issued for %s\n", strings.Join(held.Names, ", "))
+	fmt.Printf("  expires    : %s\n", held.NotAfter.Format(time.RFC3339))
+	fmt.Printf("  renew after: %s (the core decides this, not this host)\n",
+		held.RenewAfter.Format(time.RFC3339))
+	fmt.Printf("  files      : %s\n", held.Directory)
+	fmt.Println()
+	fmt.Println("The private key was generated on this host and was never sent anywhere.")
+	fmt.Println("CertPilot cannot produce it, and does not claim to.")
+	return nil
 }

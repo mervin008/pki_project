@@ -256,7 +256,7 @@ func inspect(path string) *Discovered {
 		found.PrivateKeyMatches = keyMatches(keyInFile, leaf)
 		return found
 	}
-	if keyPath, key := findPrivateKey(path); key != nil {
+	if keyPath, key := findPrivateKey(path, leaf); key != nil {
 		keyInfo, err := os.Stat(keyPath)
 		if err == nil {
 			found.PrivateKeyPath = keyPath
@@ -315,39 +315,70 @@ func publicOf(block *pem.Block) crypto.PublicKey {
 	return nil
 }
 
-// keyCandidates are the names a certificate's key is kept under, relative to
-// the certificate itself.
-func keyCandidates(certPath string) []string {
+// keyCandidates are the names a certificate's key is kept under, split by how
+// much the name tells us.
+//
+// A stem-derived name — `site.key` beside `site.crt` — is a statement that
+// these two belong together, so a key found there that does not match the
+// certificate is a genuine mismatch worth alerting on.
+//
+// A conventional name — `key.pem`, `privkey.pem` — is a guess. It is usually
+// right, and when it is wrong it is wrong because the directory holds more than
+// one certificate. Treating a failed guess as a mismatch produced a CRITICAL
+// alert about a chain file whose "key" was the leaf's, which is precisely the
+// kind of false positive that teaches people to ignore the real ones.
+func keyCandidates(certPath string) (specific, conventional []string) {
 	dir := filepath.Dir(certPath)
 	base := filepath.Base(certPath)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
 
-	names := []string{
-		stem + ".key", stem + "-key.pem", stem + ".key.pem", stem + "_key.pem",
-		// Certbot: cert.pem / fullchain.pem sit beside privkey.pem.
-		"privkey.pem", "private.key", "server.key", "tls.key", "key.pem",
+	for _, name := range []string{stem + ".key", stem + "-key.pem", stem + ".key.pem", stem + "_key.pem"} {
+		specific = append(specific, filepath.Join(dir, name))
 	}
-	out := make([]string, 0, len(names))
-	for _, name := range names {
-		out = append(out, filepath.Join(dir, name))
+	// Certbot writes cert.pem and fullchain.pem beside privkey.pem.
+	for _, name := range []string{"privkey.pem", "private.key", "server.key", "tls.key", "key.pem"} {
+		conventional = append(conventional, filepath.Join(dir, name))
 	}
-	return out
+	return specific, conventional
 }
 
-func findPrivateKey(certPath string) (string, crypto.PublicKey) {
-	for _, candidate := range keyCandidates(certPath) {
+// findPrivateKey looks for the key belonging to a certificate.
+//
+// A key found under a name derived from the certificate's own is reported
+// whether or not it matches — that is the mismatch worth knowing about. A key
+// found under a conventional name is reported only if it does match, because a
+// guess that turns out wrong is evidence the key is elsewhere, not evidence the
+// pair is broken.
+func findPrivateKey(certPath string, cert *x509.Certificate) (string, crypto.PublicKey) {
+	specific, conventional := keyCandidates(certPath)
+
+	for _, candidate := range specific {
 		if candidate == certPath {
 			continue
 		}
-		raw, err := os.ReadFile(candidate)
-		if err != nil {
+		if key := readPublicHalf(candidate); key != nil {
+			return candidate, key
+		}
+	}
+	for _, candidate := range conventional {
+		if candidate == certPath {
 			continue
 		}
-		if _, key := parsePEMFile(raw); key != nil {
+		key := readPublicHalf(candidate)
+		if key != nil && keyMatches(key, cert) {
 			return candidate, key
 		}
 	}
 	return "", nil
+}
+
+func readPublicHalf(path string) crypto.PublicKey {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	_, key := parsePEMFile(raw)
+	return key
 }
 
 // keyMatches reports whether a private key belongs to a certificate.

@@ -24,6 +24,8 @@ const (
 	ContextAgentID = "agent_id"
 	// AuthMethodAgent is recorded on audit entries an agent caused.
 	AuthMethodAgent = "agent"
+	// CodeAgentRevoked marks the one 403 an agent must never retry.
+	CodeAgentRevoked = "agent_revoked"
 )
 
 // maxAgentBody bounds a signed request.
@@ -126,6 +128,12 @@ func AgentAuth(st store.Store) gin.HandlerFunc {
 				"path", c.Request.URL.Path, "ip", c.ClientIP())
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
 				"error": "this agent's credential has been revoked",
+				// A machine-readable code, because 403 is the right status for
+				// this *and* for "you may not have that certificate", and the
+				// two call for opposite responses: stop for good, or report a
+				// policy problem somebody can fix. An agent that could not tell
+				// them apart shut itself down over a missing grant.
+				"code": CodeAgentRevoked,
 			})
 			return
 		}

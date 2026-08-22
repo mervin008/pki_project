@@ -683,7 +683,7 @@ do something about it.
 | 1 | Deployment as a durable job, and the first target | ✅ |
 | 4a | The agent: enrolment, and an identity the core cannot impersonate | ✅ |
 | 4b | The agent inventories the certificate stores on its own host | ✅ |
-| 4c | Local key generation and CSR submission | |
+| 4c | Local key generation and CSR submission | ✅ |
 | 4d | Install and reload, as a deployment target | |
 | 2 | The deployers that need no agent: ACM, Azure Key Vault, F5 | deferred |
 | 3 | Deploy on renewal, and the loop that proves it landed | deferred |
@@ -923,8 +923,106 @@ has"*. And the key alert lumped exposure and mismatch into one message saying
 "one of these two things", which makes the reader go and look — the work an
 alert exists to save.
 
-**Still to come:** generating keys locally and submitting CSRs, then installing
-renewals with a reload hook — at which point the agent becomes a deployment
+**Step 4c** is the claim this product is built on, made true.
+
+Everything issued before this was issued by asking a gateway for a certificate
+*and a key*. That key was generated where it did not need to exist, travelled
+over gRPC, was sealed into the database, and — if the certificate was ever
+deployed — travelled again to the host serving it. Three places and two
+journeys, for a secret whose whole security model is that it stays in one.
+
+Now the agent generates the key on the host, signs a CSR with it, and sends only
+the request. **CertPilot never sees the key and cannot produce it.** `GET
+/certificates/:id/private-key` answers 404, truthfully.
+
+`certificates.key_custody` makes that legible. "No key stored" used to mean one
+thing — discovered or imported, somebody else holds it. It now also means the
+best possible outcome, and the two must not look alike: `CERTPILOT` (sealed
+here, and therefore losable, copyable, subpoenable), `AGENT` (on a host, never
+anywhere else), `EXTERNAL` (somebody has it and it is not us). *"Which of our
+certificates have keys we could not export even if we wanted to"* is a question
+a security team should be able to answer.
+
+**Authorisation is the whole security surface**, and getting it wrong is worse
+than not having an agent. A credential that can request any name is a way to
+obtain a certificate for the payroll system from a compromised web server,
+signed by the organisation's own CA, sitting in the audit log next to every
+legitimate issuance. So nothing is signed that an operator did not grant in
+advance, and the checks are these:
+
+- **A grant targets one agent or a set of labels**, and the labels come from the
+  enrolment token, not from the agent — so a host cannot label itself into a
+  grant written for another tier. Four hundred web servers are one grant; the
+  alternative is a grant per host created by a script, which is how a fleet ends
+  up with four hundred wildcards nobody reviewed.
+- **One grant must cover the whole request.** Assembling permission from several
+  would let a host combine one tier's names with another tier's CA account, and
+  the certificate would be something nobody authorised as a whole.
+- **The common name is authorised too**, not just the SANs — otherwise a request
+  with permitted SANs and an unpermitted CN produces a certificate for a name
+  nobody granted.
+- **`*` is refused as a grant.** A grant permitting every name makes the agent
+  credential equivalent to the CA behind it, and there is no way to write "I
+  meant it" that is better than listing the domains.
+- **A request asking to be an authority is refused, not stripped.** A correct CA
+  ignores CSR extensions and builds its own template — which is what the
+  gateways here do — but "the code downstream is careful" is a hope about code
+  that may be a third-party gateway next year, not a control. A CSR carrying
+  `basicConstraints CA:TRUE` or `keyCertSign` gets an error.
+- **The CSR signature is checked.** Without it, anyone reaching the endpoint
+  could obtain a certificate for somebody else's public key — which is a
+  certificate issued to that somebody else, by an authority this organisation
+  runs.
+- **A gateway that returns a private key for a CSR-based request is refused.**
+  It means the gateway ignored the request and generated its own pair, and
+  storing that would leave the host's certificate and the database's key
+  mismatched with both looking fine.
+
+The agent renews its own, because it is the only thing that can: rotating means
+generating a key. The core's renewal sweep excludes `key_custody = 'AGENT'` for
+exactly that reason — without it the queue would claim those jobs and fail
+forever, which is a loud way of being wrong about something that works. *When*
+to renew is the core's decision, carried back in `renew_after`: a host that
+picked its own moment could decide to renew hourly, and four hundred of them
+would be a denial of service against the CA.
+
+One gap had to be closed first: the selfsigned gateway ignored `csr_pem`
+entirely and always generated its own key, so no gateway in the tree could do
+CSR-based issuance except ACME. It signs requests now — which meant giving it a
+CA, because a self-signed certificate is one whose *subject key* signed it, and
+that is precisely what a CSR makes impossible. In memory, per process, so a
+development CA cannot quietly become load-bearing.
+
+Verified live end to end: enrolled a host, watched a request with no grant get
+refused by name; created a label-matched grant and had `*` refused as one;
+obtained a certificate whose key never left the host — confirmed by comparing
+the public key in the file against the one in the certificate, with `GET
+private-key` answering 404. Then a hostile client holding a valid credential and
+a valid grant tried a CSR with a permitted CN and an extra SAN (**refused**), and
+a CSR asking for `CA:TRUE` (**refused**), each producing a WARNING that says the
+two things it could mean and refuses to pick one. Finally the agent rotated its
+own key on a certificate that was due, and the new one had never been anywhere
+either.
+
+Running it caught five things. The agent treated the issuance refusal's 403 as a
+revocation and **shut itself down over a missing grant** — 403 is the right
+status for both, so the body now carries a code and the client reads it. The
+provenance check constraint refused `'AGENT'`, which is migration 012's lesson
+for the third time and the second widening of the same constraint. The response
+envelope was not decoded, producing a certificate on disk with an expiry in year
+one. `--once` did not renew, which quietly ruled out running the agent from a
+systemd timer — the case where renewal matters most. And the key-size floor
+compared one number across algorithms, so a grant written for RSA-2048 refused a
+P-256 key for being "smaller" when it is considerably stronger.
+
+The scanner from 4b also produced a CRITICAL about a chain file whose "key" was
+the leaf's, found by a conventional filename in a directory holding both. A
+guess that turns out wrong is evidence the key is elsewhere, not evidence the
+pair is broken — so a stem-named key that mismatches is still a finding, and a
+conventionally-named one is only accepted if it matches.
+
+**Still to come:** installing what the agent holds where the server actually
+reads it, with a reload hook — at which point the agent becomes a deployment
 target like any other, and the loopback exception in step 1's webhook rules
 stops being an exception and becomes the normal case.
 
@@ -990,6 +1088,11 @@ Tracked honestly rather than quietly:
 - Host inventory covers PEM and DER files only. Java keystores, the Windows
   certificate store, and PKCS#12 bundles are not read, so a JVM estate's
   certificates are invisible to it
+- A grant cannot require a specific curve. `min_key_size` means RSA bits, and
+  elliptic keys are floored at P-256 — because the numbers are not comparable
+  across algorithms and one field that meant two things would be worse
+- Certificates issued to an agent are never revoked when that agent is revoked.
+  The credential stops working; the certificates keep working until they expire
 - Which configurations name a certificate file is found by text search, not by
   parsing. nginx `include`, Apache variables, and generated configuration will
   be missed — deliberately erring towards reporting a file as unreferenced,

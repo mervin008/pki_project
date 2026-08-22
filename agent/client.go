@@ -88,7 +88,14 @@ func (c *Client) post(ctx context.Context, path string, payload, out any) error 
 
 	switch {
 	case resp.StatusCode == http.StatusForbidden:
-		return ErrRevoked
+		// 403 means two things and they call for opposite responses: a revoked
+		// credential is terminal, and a request the grants do not permit is a
+		// policy problem somebody can fix while this agent keeps running. The
+		// status code cannot carry that distinction, so the body does.
+		if bodyCode(raw) == "agent_revoked" {
+			return ErrRevoked
+		}
+		return fmt.Errorf("%s", oneLine(raw))
 	case resp.StatusCode == http.StatusUnauthorized:
 		if skewed(resp, time.Now()) {
 			return ErrClockSkew
@@ -126,7 +133,31 @@ func skewed(resp *http.Response, now time.Time) bool {
 	return drift > agentauth.DefaultTolerance
 }
 
+// bodyCode reads the machine-readable code out of an error response.
+func bodyCode(raw []byte) string {
+	var body struct {
+		Code string `json:"code"`
+	}
+	_ = json.Unmarshal(raw, &body)
+	return body.Code
+}
+
+// oneLine renders an error body as a single readable line.
+//
+// The core's refusals here are written to be read by whoever is operating the
+// host, so the message is passed through rather than replaced with one of this
+// program's own.
 func oneLine(raw []byte) string {
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &body); err == nil && body.Error != "" {
+		return body.Error
+	}
+	return compact(raw)
+}
+
+func compact(raw []byte) string {
 	text := strings.Join(strings.Fields(string(raw)), " ")
 	if len(text) > 200 {
 		return text[:200] + "…"

@@ -110,7 +110,7 @@ explicitly.
 | Post-renewal verification | ✅ | Re-probes the endpoints discovery has seen serving a certificate and reports when a renewal never reached them — the green-dashboard-over-an-expiring-estate failure, caught |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
 | Deployment to servers | ⚠️ | Durable, retried, audited deployment to a generic signed webhook — enough for anything you can put an HTTP receiver in front of. Kubernetes, ACM, Key Vault and F5 are next; deployment is triggered by hand, not yet by renewal |
-| Host agent | ⚠️ | One binary that enrols with a key it generates locally and never sends, then inventories the certificate files on its host — including the two things no remote observer can see: whether the private key is readable by other accounts, and whether it matches. It does not yet request or install certificates |
+| Host agent | ⚠️ | One binary that enrols, inventories, and **requests certificates with keys it generates locally and never sends** — CertPilot cannot produce them and does not claim to. Bounded by grants an operator writes in advance. It does not yet install what it holds where a server reads it |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
 | Vault, GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
 
@@ -807,6 +807,87 @@ logic on five hundred of them is parsing logic you cannot fix. A host's
 `ca-certificates` bundle is recorded as one row saying it holds 143 roots, not
 as 143 findings about a package nobody edited.
 
+### The key that never travels
+
+Everything above was issued by asking a gateway for a certificate *and a key*.
+That key was generated where it did not need to exist, crossed the network, was
+sealed into the database, and crossed the network again to reach the host — three
+places and two journeys, for a secret whose entire security model is that it
+stays in one.
+
+```bash
+# An operator grants a tier, once, in advance:
+curl -X POST localhost:8080/api/v1/agent-grants -d '{
+  "name": "web tier hosts",
+  "label_selector": {"tier": "web", "env": "prod"},
+  "names": ["*.web.example.com"],
+  "ca_account_id": "…"
+}'
+
+# On the host:
+certpilot-agent request --name=shop.web.example.com
+```
+```
+Issued for shop.web.example.com
+  expires    : 2027-08-22T11:04:42Z
+  renew after: 2027-07-23T11:04:42Z (the core decides this, not this host)
+
+The private key was generated on this host and was never sent anywhere.
+CertPilot cannot produce it, and does not claim to.
+```
+
+It does not claim to:
+
+```
+GET /api/v1/certificates/{id}/private-key  →  404
+{"error":"no private key is stored for this certificate — it was either
+ imported, discovered, or issued from a CSR whose key never left its host"}
+```
+
+`key_custody` makes the difference legible. "No key stored" used to mean one
+thing; it now also means the best possible outcome, and those must not look
+alike:
+
+| | |
+|:---|:---|
+| `CERTPILOT` | Sealed here — and therefore losable, copyable, subpoenable |
+| `AGENT` | On a host, never anywhere else |
+| `EXTERNAL` | Somebody has it and it is not us |
+
+**Authorisation is the whole security surface.** A credential that can request
+any name is a way to obtain a certificate for the payroll system from a
+compromised web server, signed by your own CA, sitting in the audit log next to
+every legitimate issuance. So:
+
+- Grants target one agent or a **set of labels — which come from the enrolment
+  token, not the agent**, so a host cannot label itself into another tier's
+  grant
+- One grant must cover the **whole** request, common name included
+- `*` is refused as a grant. It would make the agent credential equivalent to
+  the CA behind it
+- A CSR asking for `basicConstraints CA:TRUE` is **refused, not stripped**. A
+  correct CA ignores CSR extensions — but "the code downstream is careful" is a
+  hope about a gateway that may be third-party next year, not a control
+- A gateway that returns a private key for a CSR-based request is refused: it
+  ignored the request, and storing the result would leave the host's certificate
+  and the database's key mismatched with both looking fine
+
+A refused request is news, because from inside the process the two things it
+could mean are indistinguishable:
+
+```
+WARNING — web-01 asked for a certificate it is not allowed
+
+web-01 requested payroll.example.com and no grant permits it. Either the grant
+is wrong and somebody has a deployment that will not come up, or this host's
+credential is being used by somebody who should not have it.
+```
+
+The agent renews its own, because rotating means generating a key and only the
+host can. *When* is the core's decision — a host that picked its own moment
+could decide to renew hourly, and four hundred of them would be a denial of
+service against your CA.
+
 ## Security model
 
 Read this before deploying anything.
@@ -988,9 +1069,10 @@ complete: a streaming dashboard and wall display, network / CT / cloud
 discovery, and renewal as a durable queue with ARI and post-renewal
 verification. Deployment has begun — a certificate can now be installed
 somewhere, durably and with an attempt log — and the agent has an identity built
-on a key it generated and never sent, plus an inventory of the certificate files
-on its host. What remains of that phase is the agent requesting certificates and
-installing them.
+on a key it generated and never sent, an inventory of the certificate files on
+its host, and the ability to obtain certificates whose private keys CertPilot
+has never seen and cannot produce. What remains of that phase is installing them
+where the server actually reads them.
 
 ## License
 

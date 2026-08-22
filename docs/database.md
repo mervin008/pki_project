@@ -87,8 +87,10 @@ make migrate
   applied  017_deployment.sql
   applied  018_agents.sql
   applied  019_agent_inventory.sql
+  applied  020_agent_issuance.sql
+  applied  021_agent_provenance.sql
 
-Applied 19 migration(s).
+Applied 21 migration(s).
 ```
 
 Applied files are recorded in `public.schema_migrations` with a checksum, so
@@ -301,6 +303,35 @@ the second takes the next row rather than blocking or duplicating. The second
 A leader would have given one replica all the work and a failover window during
 which no certificate renews at all. These two lines give N equal workers and no
 window.
+
+### Migration 021, and a constraint that has now been the last to notice twice
+
+`certificates_discovered_via_check` refused `'AGENT'`. Migration 012 widened the
+same constraint for `'CLOUD'`, in the same circumstances, found the same way.
+
+Worth naming rather than repeating quietly: **this constraint needs widening
+every time a certificate can arrive from somewhere new**, and both times the
+temptation was to reuse an existing value instead. `'IMPORT'` would have passed
+and thrown away the answer to the only question the column exists for — a
+certificate whose key was generated on the host that serves it and has never
+been anywhere else is not the same thing as one somebody pasted into a form, and
+the difference is the entire point of the agent.
+
+Both times it was found by running rather than testing, because the in-memory
+store enforces no constraints. That is now five defects of this shape, and the
+list has stopped being a coincidence:
+
+| Migration | What only PostgreSQL knew |
+|:---|:---|
+| 012 | `discovered_via` refused `'CLOUD'` |
+| 016 | `UpdateCertificate`'s explicit column list silently dropped new writes |
+| 018 | An untyped `$1` in `$1 - <interval>` was inferred as an interval |
+| 021 | `discovered_via` refused `'AGENT'` |
+
+(The fifth was a deployment binding summary that read as an all-clear over a
+failing target — not a constraint, but the same root: the in-memory store cannot
+express what the database enforces, so the tests could not fail.) A
+container-backed suite remains the fix and remains unwritten.
 
 ### Migration 018 and a parameter PostgreSQL typed as an interval
 

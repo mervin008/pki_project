@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand/v2"
+	"path/filepath"
 	"time"
 )
 
@@ -33,10 +34,11 @@ type Runner struct {
 	scanPaths      []string
 	inventoryEvery time.Duration
 	lastInventory  time.Time
+	stateDir       string
 }
 
 // NewRunner creates a runner from a saved identity.
-func NewRunner(client *Client, state State) *Runner {
+func NewRunner(client *Client, state State, stateDir string) *Runner {
 	interval := time.Duration(state.HeartbeatIntervalSeconds) * time.Second
 	if interval < 30*time.Second {
 		interval = 5 * time.Minute
@@ -45,6 +47,15 @@ func NewRunner(client *Client, state State) *Runner {
 	if len(paths) == 0 {
 		paths = DefaultScanPaths()
 	}
+	// Including the agent's own certificate directory. What this host obtained
+	// is a certificate on this host, and an inventory that omitted it would be
+	// the one place in the estate CertPilot could see and chose not to.
+	//
+	// The identity key is not in there and would not be read if it were: a file
+	// holding a key and no certificate produces no row at all.
+	if stateDir != "" {
+		paths = append(append([]string{}, paths...), filepath.Join(stateDir, certsDir))
+	}
 	return &Runner{
 		client:         client,
 		state:          state,
@@ -52,6 +63,7 @@ func NewRunner(client *Client, state State) *Runner {
 		now:            time.Now,
 		scanPaths:      paths,
 		inventoryEvery: DefaultInventoryInterval,
+		stateDir:       stateDir,
 	}
 }
 
@@ -122,6 +134,10 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			failures = 0
 			r.warnOnDrift(served)
+			// Renewal before inventory, so a certificate replaced this cycle is
+			// reported in the state it is actually in rather than as the one it
+			// has just stopped being.
+			r.RenewDue(ctx)
 			r.inventoryIfDue(ctx)
 
 		case errors.Is(err, ErrRevoked):

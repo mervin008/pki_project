@@ -272,6 +272,25 @@ func AlertFromEvent(evt events.Event) Alert {
 			{Label: "Files", Value: fallback(listText(payload, "paths"), "—")},
 		}
 
+	case events.TopicAgentRequestRefused:
+		host := fallback(str(payload, "agent"), "a host")
+		names := fallback(listText(payload, "names"), "a name")
+		alert.Title = fmt.Sprintf("%s asked for a certificate it is not allowed", host)
+		// Phrased as two possibilities on purpose, because from inside the
+		// process they are indistinguishable and only a person can tell them
+		// apart. Picking one — "misconfiguration" — would be the reassuring
+		// half of the story, and picking the other would cry wolf every time
+		// somebody typoed a hostname.
+		alert.Summary = fmt.Sprintf(
+			"%s requested %s and no grant permits it. Either the grant is wrong and somebody has a deployment that will not come up, or this host's credential is being used by somebody who should not have it.",
+			host, names)
+		alert.Fields = []Field{
+			{Label: "Host", Value: host},
+			{Label: "Hostname", Value: fallback(str(payload, "hostname"), "—")},
+			{Label: "Asked for", Value: names},
+			{Label: "Refused because", Value: fallback(str(payload, "reason"), "—")},
+		}
+
 	case events.TopicCertExpiring:
 		cn := str(payload, "common_name")
 		alert.Title = fmt.Sprintf("Certificate expiring: %s", fallback(cn, "unnamed"))

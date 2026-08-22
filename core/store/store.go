@@ -384,6 +384,23 @@ type Store interface {
 	// nil when nothing matches, which is the ordinary case.
 	GetCertificateBySupersededFingerprint(ctx context.Context, fingerprint string) (*Certificate, error)
 
+	// ── What a host may ask for ─────────────────────────────
+	//
+	// Nothing is issued to an agent that an operator has not granted in
+	// advance. A credential that could request any name is a way to obtain a
+	// certificate for the payroll system from a compromised web server, signed
+	// by the organisation's own CA.
+
+	ListAgentGrants(ctx context.Context) ([]*AgentGrant, error)
+	GetAgentGrant(ctx context.Context, id string) (*AgentGrant, error)
+	CreateAgentGrant(ctx context.Context, g *AgentGrant) error
+	RevokeAgentGrant(ctx context.Context, id string, revokedBy *string) error
+	// GetGrantsForAgent returns the live grants that apply to one host, by id
+	// or by label. Matching happens here rather than at every call site,
+	// because "which grants apply" is the question an authorisation decision
+	// rests on and it must have exactly one answer.
+	GetGrantsForAgent(ctx context.Context, agentID string) ([]*AgentGrant, error)
+
 	ListAgentEnrolTokens(ctx context.Context) ([]*AgentEnrolToken, error)
 	CreateAgentEnrolToken(ctx context.Context, t *AgentEnrolToken) error
 	// GetAgentEnrolTokenByHash resolves a presented token. It returns the record

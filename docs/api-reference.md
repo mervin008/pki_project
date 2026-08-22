@@ -1562,6 +1562,85 @@ restart. They have different owners, and a message saying "one of these two
 things" makes the reader go and look — which is the work an alert exists to
 save.
 
+### Certificates with keys CertPilot has never seen
+
+```
+GET    /api/v1/agent-grants           What hosts may ask for      (any)
+POST   /api/v1/agent-grants           Grant it                    (operator)
+DELETE /api/v1/agent-grants/:id       Revoke it                   (operator)
+POST   /api/v1/agent/certificates     A host asks                 (signed)
+```
+
+The agent generates the key on the host, signs a CSR with it, and sends only the
+request. CertPilot never sees the key, and `GET /certificates/:id/private-key`
+answers **404** — truthfully.
+
+`certificates.key_custody` says who holds it: `CERTPILOT` (sealed here, and
+therefore losable, copyable, subpoenable), `AGENT` (on a host, never anywhere
+else), `EXTERNAL` (somebody has it and it is not us). Until agents existed, "no
+key stored" meant only the last of those.
+
+### Grants
+
+```json
+POST /api/v1/agent-grants
+{ "name": "web tier hosts",
+  "label_selector": {"tier": "web", "env": "prod"},
+  "names": ["*.web.example.com"],
+  "ca_account_id": "…",
+  "min_key_size": 2048,
+  "allowed_key_types": ["ECDSA", "RSA"],
+  "validity_days": 90,
+  "renew_before_days": 30 }
+```
+
+A grant targets one agent (`agent_id`) or a set of labels — and **the labels
+come from the enrolment token, not from the agent**, so a host cannot label
+itself into a grant written for another tier. Four hundred web servers are one
+grant.
+
+Wildcards match one level, exactly as certificates' do: `*.web.example.com`
+covers `a.web.example.com` and covers neither `a.b.web.example.com` nor
+`web.example.com`. Following the same rule certificates follow is what makes a
+grant mean what its author thinks.
+
+`*` is **refused**. A grant permitting every name makes the agent credential
+equivalent to the CA behind it.
+
+`min_key_size` means **RSA bits**. Key sizes are not comparable across
+algorithms — a P-256 key is considerably stronger than RSA-2048 and 256 is a
+smaller integer than 2048 — so elliptic keys are floored at P-256 instead. A
+grant cannot require a specific curve; that is a known gap rather than a number
+that means two things.
+
+### What is checked on a request
+
+| Check | Why |
+|:---|:---|
+| The CSR signature verifies | Otherwise anyone reaching the endpoint could obtain a certificate for somebody else's public key — which is a certificate issued to that somebody else |
+| Every name is covered, **common name included** | A request with permitted SANs and an unpermitted CN would produce a certificate for a name nobody granted |
+| **One** grant covers the whole request | Assembling permission from several would let a host combine one tier's names with another tier's CA account |
+| No `basicConstraints CA:TRUE`, no `keyCertSign` | Refused, not stripped. A correct CA ignores CSR extensions — but that is a hope about code that may be a third-party gateway next year, not a control |
+| DNS names only | IP, email, and URI names are validated differently and a grant has no way to express them |
+| The gateway returned **no** private key | If it did, it ignored the CSR and generated its own pair; storing that leaves the host's certificate and the database's key mismatched, both looking fine |
+
+A refusal is `403` with `"code": "not_permitted"`, and publishes
+`agent.request_refused`. The other 403 an agent can get is `"code":
+"agent_revoked"` — the codes exist because the right response to each is the
+opposite: fix the grant, or stop for good. An agent that could not tell them
+apart shut itself down over a missing grant.
+
+### Renewal
+
+The agent renews its own, because rotating means generating a key and only the
+host has one. The core's renewal sweep excludes `key_custody = 'AGENT'`; without
+that the queue would claim those jobs and fail forever.
+
+*When* is the core's decision, returned as `renew_after` and derived from the
+grant's `renew_before_days`. A host that picked its own moment could decide to
+renew hourly, and four hundred of them would be a denial of service against the
+CA.
+
 ## Ownership and acknowledgement
 
 ```

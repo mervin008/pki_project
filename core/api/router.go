@@ -66,7 +66,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	displayHandler := NewDisplayTokenHandler(deps.Store)
 	notifHandler := NewNotificationHandler(deps.Store, deps.Keyring, deps.Dispatcher)
 	ackHandler := NewAcknowledgementHandler(deps.Store)
-	agentHandler := NewAgentHandler(deps.Store, deps.Broker)
+	agentHandler := NewAgentHandler(deps.Store, deps.PluginMgr, deps.Keyring, deps.Broker)
 	ctHandler := NewCTHandler(deps.Store, deps.CTMonitor)
 	cloudHandler := NewCloudHandler(deps.Store, deps.CloudEngine, deps.Keyring)
 	deployHandler := NewDeploymentHandler(deps.Store, deps.Keyring)
@@ -92,6 +92,10 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// process on the machine can see; no field a private key could arrive
 		// in.
 		signed.POST("/inventory", agentHandler.Inventory)
+		// The point of the agent: the host generated the key, and sends only a
+		// request. CertPilot signs what an operator granted this host and never
+		// holds a private key it could lose or be compelled to produce.
+		signed.POST("/certificates", agentHandler.RequestCertificate)
 	}
 
 	v1 := engine.Group("/api/v1")
@@ -259,6 +263,14 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// ever mention. Reading is open to any authenticated user — it carries
 		// paths and permissions, never key material.
 		v1.GET("/agent-certificates", agentHandler.ListCertificates)
+
+		// What a host may ask for. Readable by any authenticated user — a grant
+		// is a statement of policy and holds no secret — and written by an
+		// operator, because it decides what the organisation's CA will sign on
+		// a machine's say-so.
+		v1.GET("/agent-grants", agentHandler.ListGrants)
+		v1.POST("/agent-grants", middleware.RequireRole(middleware.RoleOperator), agentHandler.CreateGrant)
+		v1.DELETE("/agent-grants/:id", middleware.RequireRole(middleware.RoleOperator), agentHandler.RevokeGrant)
 
 		v1.GET("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.ListEnrolTokens)
 		v1.POST("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.CreateEnrolToken)
