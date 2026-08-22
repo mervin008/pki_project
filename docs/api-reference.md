@@ -273,12 +273,48 @@ imported, discovered, or CSR-based certificates.
 ```
 GET    /api/v1/pki/authorities            List monitored CAs
 POST   /api/v1/pki/authorities            Register a CA               (operator)
+POST   /api/v1/pki/authorities/import     Import CAs from gateways    (operator)
 GET    /api/v1/pki/authorities/:id        Detail
 GET    /api/v1/pki/authorities/:id/chain  Trust chain to the root
 POST   /api/v1/pki/authorities/:id/check  Health, CRL, and OCSP check (operator)
 DELETE /api/v1/pki/authorities/:id        Remove                      (admin)
 GET    /api/v1/pki/tree                   Hierarchy for visualization
 ```
+
+### Importing the CAs behind a CA account
+
+```http
+POST /api/v1/pki/authorities/import
+POST /api/v1/pki/authorities/import?account=vault-issuing
+```
+
+Asks every connected gateway that reports `supports_ca_info` for its issuers and
+records them. This runs on its own timer and when a CA account is created; the
+endpoint is for the moment after somebody has rotated an issuer and wants to see
+it land rather than wait.
+
+```json
+{
+  "summary": {"added": 2, "refreshed": 0},
+  "data": [{
+    "account": "vault-issuing",
+    "outcomes": [
+      {"name": "pki-int/Corp Root CA", "action": "added", "days_remaining": 3649},
+      {"name": "pki-int/Corp Issuing CA", "action": "added", "days_remaining": 1824}
+    ]
+  }]
+}
+```
+
+An imported CA carries `source: "GATEWAY"` and `last_seen_at`. A sweep refreshes
+what the certificate says and never overwrites the name, alert thresholds,
+owning team, tags or notes — those are what an operator decided. A CA that stops
+being offered is not deleted: it signed certificates that are still being
+served, so `last_seen_at` goes stale instead.
+
+Entries a gateway names without sending a certificate are skipped with a reason.
+There is no expiry to monitor and nothing to identify them by, and the ACME
+gateway returns exactly this — ACME publishes no endpoint listing issuers.
 
 `GET /pki/authorities` filters and sorts:
 

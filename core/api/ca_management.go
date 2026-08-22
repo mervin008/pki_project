@@ -19,16 +19,76 @@ import (
 type CAHandler struct {
 	store         store.Store
 	caMonitor     *pki.CAMonitor
+	caImporter    *pki.Importer
 	chainResolver *pki.ChainResolver
 }
 
 // NewCAHandler creates a new CAHandler.
-func NewCAHandler(s store.Store, mon *pki.CAMonitor, cr *pki.ChainResolver) *CAHandler {
+func NewCAHandler(s store.Store, mon *pki.CAMonitor, imp *pki.Importer, cr *pki.ChainResolver) *CAHandler {
 	return &CAHandler{
 		store:         s,
 		caMonitor:     mon,
+		caImporter:    imp,
 		chainResolver: cr,
 	}
+}
+
+// ImportIssuers handles POST /api/v1/pki/authorities/import.
+//
+// The importer runs on a timer, and twelve hours is a long time to wait to see
+// whether a CA account's issuers arrived. This is the same sweep, on demand,
+// reporting what it did rather than what it found — an operator who has just
+// rotated a Vault issuer wants to know it was recorded, not to read a list.
+func (h *CAHandler) ImportIssuers(c *gin.Context) {
+	if h.caImporter == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "the issuer importer is not running"})
+		return
+	}
+	if unknown := unexpectedQuery(c, "account"); unknown != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf(
+			"%q is not a parameter this endpoint understands", unknown)})
+		return
+	}
+
+	ctx := c.Request.Context()
+	var results []pki.Result
+
+	if name := strings.TrimSpace(c.Query("account")); name != "" {
+		accounts, err := h.store.ListCAAccounts(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		var target *store.CAAccount
+		for _, account := range accounts {
+			if account.Name == name || account.ID == name {
+				target = account
+				break
+			}
+		}
+		if target == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("no CA account named %q", name)})
+			return
+		}
+		results = []pki.Result{h.caImporter.ImportAccount(ctx, target)}
+	} else {
+		var err error
+		results, err = h.caImporter.SweepAll(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	added, refreshed := 0, 0
+	for _, result := range results {
+		added += result.Added()
+		refreshed += result.Refreshed()
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data":    results,
+		"summary": gin.H{"added": added, "refreshed": refreshed},
+	})
 }
 
 // List handles GET /api/v1/pki/authorities.

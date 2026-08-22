@@ -446,7 +446,8 @@ func caColumns(includePEM bool) string {
 		coalesce(alert_thresholds, '[]'::jsonb),
 		last_alert_sent_at, last_alert_threshold, status, ca_account_id,
 		owner_team, owner_email,
-		coalesce(tags, '[]'::jsonb), coalesce(notes, ''), created_at, updated_at`
+		coalesce(tags, '[]'::jsonb), coalesce(notes, ''),
+		coalesce(source, 'MANUAL'), last_seen_at, created_at, updated_at`
 }
 
 func scanCAAuthority(row pgx.Row) (*CAAuthority, error) {
@@ -460,7 +461,7 @@ func scanCAAuthority(row pgx.Row) (*CAAuthority, error) {
 		&ca.OCSPLastChecked, &ca.CertificatesIssuedCount, &alertsJSON,
 		&ca.LastAlertSentAt, &ca.LastAlertThreshold, &ca.Status, &ca.CAAccountID,
 		&ca.OwnerTeam, &ca.OwnerEmail,
-		&tagsJSON, &ca.Notes, &ca.CreatedAt, &ca.UpdatedAt,
+		&tagsJSON, &ca.Notes, &ca.Source, &ca.LastSeenAt, &ca.CreatedAt, &ca.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -535,6 +536,23 @@ func (s *PostgresStore) GetCAAuthority(ctx context.Context, id string) (*CAAutho
 	return ca, nil
 }
 
+// GetCAAuthorityByFingerprint finds a CA by the certificate itself.
+//
+// Nothing found is not an error. The importer asks this about every issuer a
+// gateway offers, and returning an error for the ordinary answer would make
+// "this CA is new" indistinguishable from "the database is unreachable".
+func (s *PostgresStore) GetCAAuthorityByFingerprint(ctx context.Context, fingerprint string) (*CAAuthority, error) {
+	ca, err := scanCAAuthority(s.pool.QueryRow(ctx,
+		"SELECT "+caColumns(true)+" FROM public.ca_authorities WHERE fingerprint_sha256 = $1", fingerprint))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return ca, nil
+}
+
 func (s *PostgresStore) CreateCAAuthority(ctx context.Context, ca *CAAuthority) error {
 	daysRemaining := 0
 	d := time.Until(ca.NotAfter).Hours() / 24
@@ -548,15 +566,21 @@ func (s *PostgresStore) CreateCAAuthority(ctx context.Context, ca *CAAuthority) 
 			name, ca_type, subject_dn, issuer_dn, serial_number, not_before, not_after,
 			days_remaining, key_type, key_size, fingerprint_sha256, certificate_pem,
 			parent_ca_id, crl_distribution_url, ocsp_responder_url, ca_account_id,
-			status, notes, owner_team, owner_email
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			status, notes, owner_team, owner_email, source, last_seen_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 		RETURNING id, created_at, updated_at
 	`
+	// An empty source would violate the check constraint rather than take the
+	// column default, which is the same shape of defect as the agent heartbeat
+	// interval: an explicit zero value overrides a DEFAULT.
+	if strings.TrimSpace(ca.Source) == "" {
+		ca.Source = CASourceManual
+	}
 	return s.pool.QueryRow(ctx, query,
 		ca.Name, ca.CAType, ca.SubjectDN, ca.IssuerDN, ca.SerialNumber, ca.NotBefore, ca.NotAfter,
 		ca.DaysRemaining, ca.KeyType, ca.KeySize, ca.FingerprintSHA256, ca.CertificatePEM,
 		ca.ParentCAID, ca.CRLDistributionURL, ca.OCSPResponderURL, ca.CAAccountID,
-		ca.Status, ca.Notes, ca.OwnerTeam, ca.OwnerEmail,
+		ca.Status, ca.Notes, ca.OwnerTeam, ca.OwnerEmail, ca.Source, ca.LastSeenAt,
 	).Scan(&ca.ID, &ca.CreatedAt, &ca.UpdatedAt)
 }
 
@@ -588,9 +612,13 @@ func (s *PostgresStore) UpdateCAAuthority(ctx context.Context, ca *CAAuthority) 
 			certificates_issued_count = $20, alert_thresholds = $21,
 			last_alert_sent_at = $22, last_alert_threshold = $23,
 			status = $24, ca_account_id = $25, tags = $26, notes = $27,
-			owner_team = $28, owner_email = $29, updated_at = now()
+			owner_team = $28, owner_email = $29,
+			source = $30, last_seen_at = $31, updated_at = now()
 		WHERE id = $1
 	`
+	if strings.TrimSpace(ca.Source) == "" {
+		ca.Source = CASourceManual
+	}
 	_, err := s.pool.Exec(ctx, query,
 		ca.ID, ca.Name, ca.CAType, ca.SubjectDN, ca.IssuerDN, ca.SerialNumber,
 		ca.NotBefore, ca.NotAfter, ca.DaysRemaining, ca.KeyType, ca.KeySize,
@@ -600,7 +628,7 @@ func (s *PostgresStore) UpdateCAAuthority(ctx context.Context, ca *CAAuthority) 
 		ca.CertificatesIssuedCount, jsonbOrNil(ca.AlertThresholds),
 		ca.LastAlertSentAt, ca.LastAlertThreshold,
 		ca.Status, ca.CAAccountID, jsonbOrNil(ca.Tags), ca.Notes,
-		ca.OwnerTeam, ca.OwnerEmail,
+		ca.OwnerTeam, ca.OwnerEmail, ca.Source, ca.LastSeenAt,
 	)
 	return err
 }
@@ -624,27 +652,30 @@ func (s *PostgresStore) DeleteCAAuthority(ctx context.Context, id string) error 
 }
 
 func (s *PostgresStore) GetCAChain(ctx context.Context, id string) ([]*CAAuthority, error) {
-	// Recursive CTE to walk up the CA chain to root
+	// The CTE selects whole rows rather than naming columns.
+	//
+	// It used to enumerate them, and the list drifted from the one caColumns
+	// builds: migration 006 added owner_team and owner_email, the scanner
+	// learned about them, this did not, and every call failed against a real
+	// database with "column owner_team does not exist". The in-memory store
+	// walks a map and cannot express that mistake, so nothing caught it.
+	//
+	// Naming the columns correctly would fix the instance. Not keeping a second
+	// list fixes the class.
+	//
+	// The depth cap is not about deep hierarchies — nobody has sixteen tiers of
+	// CA. parent_ca_id is a plain self-reference with nothing preventing a
+	// cycle, and a cycle here is a recursive query that never returns while
+	// holding a connection.
 	query := `
 		WITH RECURSIVE ca_chain AS (
-			SELECT id, name, ca_type, subject_dn, issuer_dn, serial_number,
-			       not_before, not_after, days_remaining, key_type, key_size,
-			       fingerprint_sha256, certificate_pem, parent_ca_id, crl_distribution_url,
-			       ocsp_responder_url, is_crl_fresh, crl_last_checked, is_ocsp_responsive,
-			       ocsp_last_checked, certificates_issued_count, alert_thresholds,
-			       last_alert_sent_at, last_alert_threshold, status, ca_account_id,
-			       tags, notes, created_at, updated_at, 1 as depth
-			FROM public.ca_authorities WHERE id = $1
+			SELECT a.*, 1 AS depth
+			FROM public.ca_authorities a WHERE a.id = $1
 			UNION ALL
-			SELECT parent.id, parent.name, parent.ca_type, parent.subject_dn, parent.issuer_dn, parent.serial_number,
-			       parent.not_before, parent.not_after, parent.days_remaining, parent.key_type, parent.key_size,
-			       parent.fingerprint_sha256, parent.certificate_pem, parent.parent_ca_id, parent.crl_distribution_url,
-			       parent.ocsp_responder_url, parent.is_crl_fresh, parent.crl_last_checked, parent.is_ocsp_responsive,
-			       parent.ocsp_last_checked, parent.certificates_issued_count, parent.alert_thresholds,
-			       parent.last_alert_sent_at, parent.last_alert_threshold, parent.status, parent.ca_account_id,
-			       parent.tags, parent.notes, parent.created_at, parent.updated_at, child.depth + 1
+			SELECT parent.*, child.depth + 1
 			FROM public.ca_authorities parent
 			INNER JOIN ca_chain child ON child.parent_ca_id = parent.id
+			WHERE child.depth < 16
 		)
 		SELECT ` + caColumns(true) + `
 		FROM ca_chain ORDER BY depth ASC

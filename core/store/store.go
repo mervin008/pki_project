@@ -28,6 +28,12 @@ type Store interface {
 	// ── CA Authorities ──────────────────────────────────────
 	ListCAAuthorities(ctx context.Context, filter CAFilter) ([]*CAAuthority, error)
 	GetCAAuthority(ctx context.Context, id string) (*CAAuthority, error)
+	// GetCAAuthorityByFingerprint returns nil, nil when nothing matches.
+	//
+	// Absence is the ordinary answer rather than an error: the importer asks
+	// this about every issuer a gateway offers, and most of the time the answer
+	// is "not yet".
+	GetCAAuthorityByFingerprint(ctx context.Context, fingerprint string) (*CAAuthority, error)
 	CreateCAAuthority(ctx context.Context, ca *CAAuthority) error
 	UpdateCAAuthority(ctx context.Context, ca *CAAuthority) error
 	DeleteCAAuthority(ctx context.Context, id string) error

@@ -118,7 +118,7 @@ explicitly.
 | Deployment to servers | ✅ | Durable, retried, audited deployment to a signed webhook, a host running the agent, AWS ACM, Azure Key Vault and F5 BIG-IP. **A renewal deploys itself**, and a failing target halts the rest of the rollout rather than letting a bad certificate march through the estate. Key Vault and F5 are written to their published APIs and unit-tested; neither has been run against a real vault or appliance |
 | Host agent | ✅ | One binary that enrols, inventories, **requests certificates with keys it generates locally and never sends** — CertPilot cannot produce them and does not claim to — then installs them where the server actually reads them and reloads it. Bounded by grants an operator writes in advance |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
-| Vault issuers in the CA inventory | ❌ | The gateway reports them; the core does not yet record them as CA authorities, so they are not monitored or alerted on alongside everything else |
+| Vault issuers in the CA inventory | ✅ | Connecting a CA account records the CAs behind it, and from that moment they are monitored, thresholded and alerted on like everything else. The importer refreshes what the certificate says and never touches what an operator decided — the name, the thresholds, the owning team |
 | GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
 
 ## Quick start
@@ -347,6 +347,23 @@ A few other things worth knowing:
 - **Token, AppRole and Kubernetes** auth, with the token cached and renewed
   rather than a fresh login per issuance. A static token gets a warning: it
   cannot outlive its maximum TTL, and when it expires everything stops at once.
+
+Connecting the account also puts the CAs behind it into the inventory:
+
+```json
+"issuers": {
+  "outcomes": [
+    {"name": "pki-int/Corp Root CA",    "action": "added", "days_remaining": 3649},
+    {"name": "pki-int/Corp Issuing CA", "action": "added", "days_remaining": 1824}
+  ]
+}
+```
+
+From that moment they are monitored, thresholded and alerted on like everything
+else — the CA that signs the estate, in the same list as the estate. Sweeps
+refresh them on a timer, and a CA that has been rotated out of its mount is
+never deleted: it signed certificates that are still being served, and its
+expiry is still the date those stop working.
 
 ### Finding what nobody told you about
 

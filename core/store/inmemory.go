@@ -507,11 +507,33 @@ func (m *MemoryStore) GetCAAuthority(ctx context.Context, id string) (*CAAuthori
 	return clone(ca), nil
 }
 
+// GetCAAuthorityByFingerprint finds a CA by the certificate itself.
+//
+// Nothing found is nil, nil rather than an error, matching PostgresStore: the
+// importer asks this about every issuer a gateway offers, and most of the
+// answers are "not yet".
+func (m *MemoryStore) GetCAAuthorityByFingerprint(ctx context.Context, fingerprint string) (*CAAuthority, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, ca := range m.caAuthorities {
+		if ca.FingerprintSHA256 == fingerprint {
+			return clone(ca), nil
+		}
+	}
+	return nil, nil
+}
+
 func (m *MemoryStore) CreateCAAuthority(ctx context.Context, ca *CAAuthority) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if ca.ID == "" {
 		ca.ID = uuid.New().String()
+	}
+	// Defaulted here as well as in PostgresStore, because the two stores
+	// disagreeing about what an unset field means is the defect class this
+	// suite exists for.
+	if strings.TrimSpace(ca.Source) == "" {
+		ca.Source = CASourceManual
 	}
 	now := time.Now()
 	ca.CreatedAt = now
@@ -525,6 +547,9 @@ func (m *MemoryStore) UpdateCAAuthority(ctx context.Context, ca *CAAuthority) er
 	defer m.mu.Unlock()
 
 	ca.UpdatedAt = time.Now()
+	if strings.TrimSpace(ca.Source) == "" {
+		ca.Source = CASourceManual
+	}
 	stored := clone(ca)
 	// The stored PEM survives the update, because PostgresStore's UPDATE does
 	// not include the column. A caller that listed without CAFilter.IncludePEM

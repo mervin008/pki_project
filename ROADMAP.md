@@ -1320,11 +1320,23 @@ expiry, every renewal through it fails at once, with a message about a
 mount's issuers and their expiry through `GetCAInfo`, says it at account
 creation, and translates the refusal if it arrives anyway.
 
-Still to do here: **the core does not yet record what `GetCAInfo` returns.** The
-RPC has existed since the first proto and nothing has ever called it. Until it
-does, a Vault issuer is visible when an account is validated and is not in the
-CA inventory the monitor, the alerts and the wall display are built on — which
-is the whole reason to know about it.
+**The core now records what `GetCAInfo` returns ✅.** Connecting a CA account
+imports the CAs behind it, and from that moment they are in the same inventory
+as the certificates they signed — monitored, thresholded, alerted on, and
+sorted by urgency on the wall display. One rule governs the importer: *the
+certificate is the truth.* A gateway's account of a CA is hearsay about a
+document CertPilot has been handed, so everything derivable is derived from the
+certificate, and the gateway is believed only about the two things it does not
+contain — what the CA is called where it lives, and where the mount publishes
+its CRL. What an operator decided — the name, the thresholds, the owning team,
+the notes — is never touched by a sweep.
+
+This is also where the ACME gateway's `GetCAInfo` turns out to be a placeholder:
+ACME publishes no endpoint listing issuer certificates, so it returns the
+directory URL and nothing to track. The importer skips it and says so rather
+than creating a row that looks monitored and has no expiry. The real answer for
+public CAs is the chain already stored against every certificate, which is a
+different piece of work.
 
 Then Microsoft AD CS, AWS Private CA, Google Cloud CAS, EJBCA, DigiCert,
 Sectigo.

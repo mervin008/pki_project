@@ -29,6 +29,7 @@ type RouterDeps struct {
 	Store         store.Store
 	PluginMgr     *pluginmgr.Manager
 	CAMonitor     *pki.CAMonitor
+	CAImporter    *pki.Importer
 	ChainResolver *pki.ChainResolver
 	RenewalExec   *renewal.Executor
 	RenewalSched  *renewal.Scheduler
@@ -63,8 +64,8 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 
 	certHandler := NewCertificateHandler(deps.Store, deps.PluginMgr, deps.RenewalExec, deps.RenewalSched, deps.PolicyEngine, deps.Keyring, deps.Broker)
 	renewalHandler := NewRenewalHandler(deps.Store, deps.RenewalSched, deps.ARIPoller, deps.Verifier)
-	caHandler := NewCAHandler(deps.Store, deps.CAMonitor, deps.ChainResolver)
-	caAccHandler := NewCAAccountHandler(deps.Store, deps.PluginMgr, deps.Keyring)
+	caHandler := NewCAHandler(deps.Store, deps.CAMonitor, deps.CAImporter, deps.ChainResolver)
+	caAccHandler := NewCAAccountHandler(deps.Store, deps.PluginMgr, deps.Keyring, deps.CAImporter)
 	dashHandler := NewDashboardHandler(deps.Store)
 	discHandler := NewDiscoveryHandler(deps.Store, deps.Scanner)
 	policyHandler := NewPolicyHandler(deps.Store)
@@ -147,6 +148,11 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// ── PKI / CA Management ──
 		v1.GET("/pki/authorities", caHandler.List)
 		v1.POST("/pki/authorities", middleware.RequireRole(middleware.RoleOperator), caHandler.Create)
+		// Before the :id routes. Gin matches a static segment ahead of a
+		// parameter at the same position, and registering it after would still
+		// work — but reading it after would suggest an authority called
+		// "import", which is the kind of thing somebody eventually tries.
+		v1.POST("/pki/authorities/import", middleware.RequireRole(middleware.RoleOperator), caHandler.ImportIssuers)
 		v1.GET("/pki/authorities/:id", caHandler.Get)
 		v1.GET("/pki/authorities/:id/chain", caHandler.Chain)
 		v1.POST("/pki/authorities/:id/check", middleware.RequireRole(middleware.RoleOperator), caHandler.CheckHealth)

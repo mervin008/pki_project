@@ -44,12 +44,29 @@ type CAAuthority struct {
 	OwnerEmail *string `json:"owner_email,omitempty"`
 	Tags       string  `json:"tags,omitempty"`
 	Notes      string  `json:"notes,omitempty"`
+	// Source says who put this row here: a person, or a gateway that was asked
+	// for its issuers. The importer refreshes what a certificate says about
+	// itself and must never touch what an operator decided — the name they
+	// chose, the thresholds they tuned, the team they put on it — so it needs
+	// to know which rows are its own.
+	Source string `json:"source,omitempty"`
+	// LastSeenAt is when a gateway last reported this CA among its issuers.
+	// An old value means the CA has been rotated out of the mount it came
+	// from. It is not deleted: it signed certificates that are still being
+	// served, and its expiry is still the date those stop working.
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
 	// Acknowledgement is the current acknowledgement, when the caller asked for
 	// it to be resolved. Not a stored column — see AlertAcknowledgement.
 	Acknowledgement *AlertAcknowledgement `json:"acknowledgement,omitempty"`
 	CreatedAt       time.Time             `json:"created_at"`
 	UpdatedAt       time.Time             `json:"updated_at"`
 }
+
+// Where a CA authority record came from.
+const (
+	CASourceManual  = "MANUAL"
+	CASourceGateway = "GATEWAY"
+)
 
 // Entity types an acknowledgement can cover.
 const (

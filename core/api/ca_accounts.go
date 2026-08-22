@@ -3,8 +3,10 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 
+	"github.com/certpilot/certpilot/core/engine/pki"
 	"github.com/certpilot/certpilot/core/pluginmgr"
 	"github.com/certpilot/certpilot/core/server/middleware"
 	"github.com/certpilot/certpilot/core/store"
@@ -15,17 +17,19 @@ import (
 
 // CAAccountHandler handles CA account configurations and gateway plugin inspections.
 type CAAccountHandler struct {
-	store     store.Store
-	pluginMgr *pluginmgr.Manager
-	keyring   *secrets.Keyring
+	store      store.Store
+	pluginMgr  *pluginmgr.Manager
+	keyring    *secrets.Keyring
+	caImporter *pki.Importer
 }
 
 // NewCAAccountHandler creates a new CAAccountHandler.
-func NewCAAccountHandler(s store.Store, pm *pluginmgr.Manager, kr *secrets.Keyring) *CAAccountHandler {
+func NewCAAccountHandler(s store.Store, pm *pluginmgr.Manager, kr *secrets.Keyring, imp *pki.Importer) *CAAccountHandler {
 	return &CAAccountHandler{
-		store:     s,
-		pluginMgr: pm,
-		keyring:   kr,
+		store:      s,
+		pluginMgr:  pm,
+		keyring:    kr,
+		caImporter: imp,
 	}
 }
 
@@ -167,7 +171,33 @@ func (h *CAAccountHandler) Create(c *gin.Context) {
 		Details:    fmt.Sprintf(`{"name": %q, "provider_type": %q}`, acc.Name, acc.ProviderType),
 	})
 
-	c.JSON(http.StatusCreated, gin.H{"data": acc, "warnings": warnings})
+	// Ask the gateway what it signs with, now rather than at the next sweep.
+	//
+	// The account has just been validated against the CA, so the connection is
+	// known to work and the credential is known to be good — this is the one
+	// moment where asking costs nothing and the answer is most wanted. An
+	// operator who has just connected a Vault mount wants to see its issuing CA
+	// appear in the inventory, not to wonder for twelve hours whether it will.
+	issuers := h.importIssuers(c, acc)
+
+	c.JSON(http.StatusCreated, gin.H{"data": acc, "warnings": warnings, "issuers": issuers})
+}
+
+// importIssuers records the CAs behind a newly created account.
+//
+// Failure here is not failure of the account. The account exists, its
+// configuration validated, and it can issue; not having learned its issuers yet
+// is a smaller thing than that, and the timer will try again.
+func (h *CAAccountHandler) importIssuers(c *gin.Context, acc *store.CAAccount) *pki.Result {
+	if h.caImporter == nil {
+		return nil
+	}
+	result := h.caImporter.ImportAccount(c.Request.Context(), acc)
+	if result.Error != "" {
+		slog.Warn("could not import the issuers behind a new CA account",
+			"account", acc.Name, "error", result.Error)
+	}
+	return &result
 }
 
 // HealthCheck handles POST /api/v1/ca-accounts/:id/health.

@@ -35,6 +35,7 @@ type Server struct {
 	store        store.Store
 	pluginMgr    *pluginmgr.Manager
 	caMonitor    *pki.CAMonitor
+	caImporter   *pki.Importer
 	dispatcher   *notifications.Dispatcher
 	broker       *events.Broker
 	renewalSched *renewal.Scheduler
@@ -120,6 +121,11 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	broker := events.NewBroker()
 
 	caMonitor := pki.NewCAMonitor(st, broker)
+	// The other half of knowing about a CA: the monitor watches the ones that
+	// are recorded, and this is what records them. Until it existed, the CA
+	// signing an entire estate was in the inventory only if somebody had
+	// pasted its certificate in by hand.
+	caImporter := pki.NewImporter(st, pm, keyring, broker)
 	chainResolver := pki.NewChainResolver(st)
 	renewalExec := renewal.NewExecutor(st, pm, keyring, broker)
 	// The sweep finds what is due and enqueues it; the queue runs it. Both
@@ -188,6 +194,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		Store:         st,
 		PluginMgr:     pm,
 		CAMonitor:     caMonitor,
+		CAImporter:    caImporter,
 		ChainResolver: chainResolver,
 		RenewalExec:   renewalExec,
 		RenewalSched:  renewalSched,
@@ -221,6 +228,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		store:        st,
 		pluginMgr:    pm,
 		caMonitor:    caMonitor,
+		caImporter:   caImporter,
 		dispatcher:   dispatcher,
 		broker:       broker,
 		renewalSched: renewalSched,
@@ -287,6 +295,11 @@ func (s *Server) Start() error {
 		caInterval = 6 * time.Hour
 	}
 	s.caMonitor.Start(caInterval)
+	// Slower than the health sweep on purpose: a mount's issuers change when
+	// somebody rotates a CA, which is a thing that happens a few times a
+	// decade. What changes daily is how long they have left, and that is the
+	// monitor's job on rows this has already created.
+	s.caImporter.Start(12 * time.Hour)
 
 	// Its own interval comes from each schedule, so this only needs to wake
 	// often enough to notice one is due. A fresh install has no schedules and
@@ -318,6 +331,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.ariPoller.Stop()
 	s.verifier.Stop()
 	s.caMonitor.Stop()
+	s.caImporter.Stop()
 	s.discoverySch.Stop()
 	s.ctMonitor.Stop()
 	s.cloudEngine.Stop()

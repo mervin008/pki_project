@@ -25,6 +25,15 @@ import (
 const (
 	TopicCAHealth      = "ca.health"
 	TopicCAExpiryAlert = "ca.expiry_alert"
+	// TopicCADiscovered carries a CA that has entered the inventory because a
+	// gateway named it as one of its issuers, rather than because somebody
+	// registered it.
+	//
+	// Worth an event of its own rather than folding into ca.health: a CA
+	// appearing is a change in what is being monitored, and one that appears
+	// already inside an expiry threshold is the most urgent thing this system
+	// can find — nobody was watching it until this moment.
+	TopicCADiscovered  = "ca.discovered"
 	TopicCertIssued    = "cert.issued"
 	TopicCertRenewed   = "cert.renewed"
 	TopicCertRenewFail = "cert.renewal_failed"

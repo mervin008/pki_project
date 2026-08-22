@@ -580,3 +580,150 @@ func sampleCertificate(name string) *Certificate {
 		Tags:              []string{},
 	}
 }
+
+// ── CA authorities ──────────────────────────────────────────
+
+// TestTheChainOfACAComesBackFromBothStores covers a query no unit test could
+// have run.
+//
+// `GetCAChain` builds a recursive CTE that enumerates its own column list and
+// then hands the result to the shared scanner, whose list is built by
+// `caColumns`. The two drifted: migration 006 added owner_team and owner_email,
+// caColumns learned about them, the CTE did not, and every call to the endpoint
+// failed against a real database with "column owner_team does not exist". The
+// in-memory store walks a map and cannot express the mistake, so the suite was
+// green.
+//
+// The fix is not to add two columns to a list. It is to stop keeping a second
+// list: the CTE now selects the whole row, so a column added anywhere is
+// carried automatically.
+func TestTheChainOfACAComesBackFromBothStores(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+
+		root := sampleAuthority("conformance-root", "ROOT")
+		if err := s.CreateCAAuthority(ctx, root); err != nil {
+			t.Fatalf("creating the root: %v", err)
+		}
+		intermediate := sampleAuthority("conformance-issuing", "INTERMEDIATE")
+		intermediate.ParentCAID = &root.ID
+		if err := s.CreateCAAuthority(ctx, intermediate); err != nil {
+			t.Fatalf("creating the intermediate: %v", err)
+		}
+
+		chain, err := s.GetCAChain(ctx, intermediate.ID)
+		if err != nil {
+			t.Fatalf("walking the chain: %v", err)
+		}
+		if len(chain) != 2 {
+			t.Fatalf("chain has %d links, want the intermediate and its root", len(chain))
+		}
+		if chain[0].ID != intermediate.ID {
+			t.Fatalf("chain starts at %q, want the CA that was asked for", chain[0].Name)
+		}
+		if chain[1].ID != root.ID {
+			t.Fatalf("chain ends at %q, want the root", chain[1].Name)
+		}
+	})
+}
+
+// TestAnImportedAuthorityKeepsEveryFieldItWasGiven is class B for the columns
+// migration 026 adds. A writer that drops `source` would leave every imported
+// CA looking hand-registered, and the importer would then treat operator-owned
+// rows as its own to overwrite.
+func TestAnImportedAuthorityKeepsEveryFieldItWasGiven(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+
+		seen := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+		ca := sampleAuthority("conformance-imported", "ISSUING")
+		ca.Source = CASourceGateway
+		ca.LastSeenAt = &seen
+		if err := s.CreateCAAuthority(ctx, ca); err != nil {
+			t.Fatalf("creating: %v", err)
+		}
+
+		stored, err := s.GetCAAuthority(ctx, ca.ID)
+		if err != nil {
+			t.Fatalf("reading back: %v", err)
+		}
+		if stored.Source != CASourceGateway {
+			t.Fatalf("source = %q, want %q", stored.Source, CASourceGateway)
+		}
+		if stored.LastSeenAt == nil || !stored.LastSeenAt.UTC().Truncate(time.Second).Equal(seen) {
+			t.Fatalf("last seen = %v, want %v", stored.LastSeenAt, seen)
+		}
+
+		// And through an update, which is the path the importer takes on every
+		// sweep after the first.
+		later := time.Now().UTC().Truncate(time.Second)
+		stored.LastSeenAt = &later
+		if err := s.UpdateCAAuthority(ctx, stored); err != nil {
+			t.Fatalf("updating: %v", err)
+		}
+		again, err := s.GetCAAuthority(ctx, ca.ID)
+		if err != nil {
+			t.Fatalf("reading back after update: %v", err)
+		}
+		if again.LastSeenAt == nil || !again.LastSeenAt.UTC().Truncate(time.Second).Equal(later) {
+			t.Fatalf("last seen after update = %v, want %v", again.LastSeenAt, later)
+		}
+		if again.Source != CASourceGateway {
+			t.Fatalf("source after update = %q, want it preserved", again.Source)
+		}
+	})
+}
+
+// TestACAIsFoundByItsFingerprint covers the lookup the importer identifies by.
+//
+// The fingerprint is the certificate. Matching on a name would make a renamed
+// CA a second CA, and matching on a subject would merge two CAs that share a
+// DN — which is what a rotated issuing CA looks like.
+func TestACAIsFoundByItsFingerprint(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+
+		ca := sampleAuthority("conformance-byfingerprint", "ISSUING")
+		if err := s.CreateCAAuthority(ctx, ca); err != nil {
+			t.Fatalf("creating: %v", err)
+		}
+
+		found, err := s.GetCAAuthorityByFingerprint(ctx, ca.FingerprintSHA256)
+		if err != nil {
+			t.Fatalf("looking up by fingerprint: %v", err)
+		}
+		if found == nil || found.ID != ca.ID {
+			t.Fatalf("found %v, want the CA just created", found)
+		}
+
+		// Absence is not an error: the importer asks this question about every
+		// issuer it is offered, and most of the answers are "not yet".
+		missing, err := s.GetCAAuthorityByFingerprint(ctx, "0000-not-a-fingerprint")
+		if err != nil {
+			t.Fatalf("looking up one that does not exist: %v", err)
+		}
+		if missing != nil {
+			t.Fatalf("found %q for a fingerprint nothing has", missing.Name)
+		}
+	})
+}
+
+// sampleAuthority builds a CA authority whose unique columns are unique per
+// call, for the same reason sampleCertificate does.
+func sampleAuthority(name, caType string) *CAAuthority {
+	sampleSerial++
+	return &CAAuthority{
+		Name:              fmt.Sprintf("%s-%04d", name, sampleSerial),
+		CAType:            caType,
+		SubjectDN:         "CN=" + name,
+		IssuerDN:          "CN=Conformance Root",
+		SerialNumber:      fmt.Sprintf("%04x", sampleSerial),
+		NotBefore:         time.Now().Add(-24 * time.Hour),
+		NotAfter:          time.Now().Add(365 * 24 * time.Hour),
+		KeyType:           "ECDSA",
+		KeySize:           256,
+		FingerprintSHA256: fmt.Sprintf("%s-fingerprint-%04d", name, sampleSerial),
+		CertificatePEM:    "-----BEGIN CERTIFICATE-----\nconformance\n-----END CERTIFICATE-----\n",
+		Status:            "HEALTHY",
+	}
+}
