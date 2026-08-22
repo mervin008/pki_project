@@ -304,6 +304,81 @@ A leader would have given one replica all the work and a failover window during
 which no certificate renews at all. These two lines give N equal workers and no
 window.
 
+## The conformance suite
+
+Ten defects reached a live database that the test suite could not express. They
+were not ten unrelated mistakes. They were instances of four classes:
+
+| | Class | Instances |
+|:---|:---|:---|
+| **A** | A Go constant the database's CHECK constraint refuses | migrations 012, 021, 022, 024 |
+| **B** | A model field a writer does not persist | migration 016; later the in-memory store dropping `deploy_on_renewal` |
+| **C** | An empty Go string in a column whose CHECK passes on NULL | `certificates.environment`, the first live run |
+| **D** | A bound parameter PostgreSQL types differently from the driver | the CA expiry window; migration 018's interval |
+
+Testing the in-memory store alone finds none of them: it has no constraints, no
+column lists, no NULL, and no type inference. Testing PostgreSQL alone finds A,
+C and D but not B in the direction that actually bit — the in-memory store
+silently dropping a field the database persists correctly.
+
+So the shape is **one suite, both implementations**, in `core/store/conformance_test.go`:
+
+```
+docker compose -f deploy/plain-postgres/docker-compose.yml up -d
+make test-store
+```
+
+The most valuable test in it is `TestEveryValueThisCodebaseCanProduceIsAccepted`,
+and it is valuable because of what it does *not* do. It does not check that
+`'AGENT'` works — that is the shape of test written after a defect, and it
+passes for ever while the next value fails identically. It asserts the invariant
+those four migrations violated: **a value the Go code can write must be a value
+the schema accepts.** A constant added without widening its constraint now fails
+on a laptop instead of in production.
+
+Two classes are PostgreSQL-only, in `postgres_only_test.go`, because the
+in-memory store cannot exhibit them even in principle: queries with bound
+intervals actually run, and a row full of NULLs does not blank a whole list.
+
+Each test database is created, migrated **from the repository's own migration
+files by the migrator that ships**, and dropped. That is not a detail — a
+hand-maintained `schema_test.sql` would drift from `migrations/`, and the suite
+would go on passing while the two diverged, which is the exact failure this
+exercise exists to end.
+
+### What the suite found on its first run
+
+Three things, none of which any existing test could have caught.
+
+**The schema did not apply to plain PostgreSQL at all.** Migration 001
+references `auth.users`, `auth.jwt()` and a `supabase_realtime` publication.
+This had been a known gap since week one and nothing had ever tried it. It is
+now [`deploy/plain-postgres/prelude.sql`](../deploy/plain-postgres/prelude.sql)
+— a supported path, run by the suite so it cannot rot, and deliberately not in
+`migrations/` because a stub `auth.jwt()` applied to a real Supabase project
+would shadow the genuine one and break every RLS policy in the database.
+
+**`PostgresStore.CreateAgent` refused an agent the in-memory store accepted.**
+`agents.heartbeat_interval_seconds` carries `DEFAULT 300` and a CHECK that it is
+positive — but passing an explicit zero overrides the default and violates the
+check. The in-memory store applied a floor; PostgreSQL did not. Class B, in the
+direction where the database writer is the one missing something.
+
+**Migration 002 was never rerunnable.** PostgreSQL has no
+`add constraint if not exists`, so re-applying the file failed on
+`certificates_key_type_fkey` and rolled the whole thing back — breaking a rule
+migration 001 states in its own comments, on the day it was written. The
+migrator records what it has applied and never re-applies, so nothing noticed;
+what this protects is somebody running the SQL by hand against a database that
+already has the schema, which is precisely the case migration 001's note was
+about.
+
+> **Note on the checksum.** Fixing migration 002 changes its checksum, so the
+> migrator will report it as *drifted* once on an existing database. That is the
+> warning working, not a problem: the file is recorded as applied and will not
+> be re-applied. It is mentioned here because a warning nobody explained is a
+> warning somebody eventually silences.
+
 ### Migration 025 and a schema that waited twenty-three migrations
 
 Migration 002 was written in the first week of this project. It removed the
@@ -415,7 +490,8 @@ the difference is the entire point of the agent.
 
 Both times it was found by running rather than testing, because the in-memory
 store enforces no constraints. That is now six defects of this shape, and the
-list has stopped being a coincidence:
+list stopped being a coincidence — see
+[the conformance suite](#the-conformance-suite) for what was done about it:
 
 | Migration | What only PostgreSQL knew |
 |:---|:---|

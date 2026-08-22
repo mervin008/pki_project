@@ -1493,9 +1493,11 @@ Tracked honestly rather than quietly:
   Supabase dependency; the schema is the only coupling
 - Policy is evaluated on issuance only, not renewal; `key_type`, `naming`, and
   `approval_required` rule types are accepted by the schema but not implemented
-- `PostgresStore` is verified by hand end to end but has no automated tests; the
-  suite runs against the in-memory implementation, which cannot express the
-  defects the manual run turned up. A container-backed suite is the fix
+- The conformance suite covers the store's constraint, round-trip and queue
+  behaviour against both implementations, and the two classes only PostgreSQL
+  can exhibit. It does not yet cover discovery, CT, cloud sync or the
+  acknowledgement tables to the same depth — those still rely on the in-memory
+  store, and are where the next defect of this kind will come from
 - After a long outage the stream's backoff is capped at 30 seconds, so a display
   can take that long to notice the core is back. Deliberate — the alternative is
   a floor of wall displays stampeding a core the instant it restarts

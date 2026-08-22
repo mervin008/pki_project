@@ -65,17 +65,35 @@ alter table ca_authorities drop constraint if exists ca_authorities_key_type_che
 
 -- Referential integrity replaces the CHECK constraint: still validated, but now
 -- extensible without a schema change.
-alter table certificates
-  add constraint certificates_key_type_fkey
-  foreign key (key_type) references key_algorithms(name)
-  on update cascade
-  not valid;
+-- Guarded on the catalogue rather than written plainly, because PostgreSQL has
+-- no `add constraint if not exists` and every migration in this project is
+-- meant to be rerunnable — a rule migration 001 states and this file broke on
+-- the day it was written. Applying it to an already-migrated database failed
+-- here and rolled back the whole file.
+--
+-- Nothing ever noticed, because the migrator records what it has applied and
+-- never re-applies it. What this actually protects is the person running the
+-- SQL by hand against a database that already has the schema, which is exactly
+-- the situation migration 001's own note was written about.
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'certificates_key_type_fkey') then
+    alter table certificates
+      add constraint certificates_key_type_fkey
+      foreign key (key_type) references key_algorithms(name)
+      on update cascade
+      not valid;
+  end if;
 
-alter table ca_authorities
-  add constraint ca_authorities_key_type_fkey
-  foreign key (key_type) references key_algorithms(name)
-  on update cascade
-  not valid;
+  if not exists (select 1 from pg_constraint where conname = 'ca_authorities_key_type_fkey') then
+    alter table ca_authorities
+      add constraint ca_authorities_key_type_fkey
+      foreign key (key_type) references key_algorithms(name)
+      on update cascade
+      not valid;
+  end if;
+end
+$$;
 
 -- NOT VALID means existing rows are not checked on creation, so this cannot
 -- fail against a populated table. New and updated rows are checked from now on.

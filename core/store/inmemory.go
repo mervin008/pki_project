@@ -2765,7 +2765,7 @@ func (m *MemoryStore) CreateAgent(ctx context.Context, a *Agent) error {
 		stored.Status = AgentActive
 	}
 	if stored.HeartbeatIntervalSeconds <= 0 {
-		stored.HeartbeatIntervalSeconds = 300
+		stored.HeartbeatIntervalSeconds = defaultAgentHeartbeatSeconds
 	}
 	now := time.Now()
 	if stored.EnrolledAt.IsZero() {

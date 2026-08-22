@@ -264,3 +264,26 @@ configured. Wildcards require `dns-01`.
 - [API reference](api-reference.md)
 - [Writing a gateway](writing-a-gateway.md)
 - [Roadmap](../ROADMAP.md)
+
+
+## Running against plain PostgreSQL
+
+CertPilot's schema was written against Supabase, and migration 001 references
+things a plain server does not have — `auth.users`, `auth.jwt()`, and a
+`supabase_realtime` publication. Run the prelude once, then migrate:
+
+```bash
+psql "$CERTPILOT_DB_URL" -f deploy/plain-postgres/prelude.sql
+certpilot-core --migrate
+```
+
+The prelude creates a stub `auth.jwt()` that returns no claims, so the
+row-level security policies **fail closed**. That is deliberate: a stub cannot
+verify a token, and returning a role would hand every connection whatever role
+it named. CertPilot's own connection should own these tables — owners bypass RLS
+— and authorisation for people is enforced in the API layer, which is where it
+is enforced on Supabase too. What you do not get on a plain server is RLS as a
+second line.
+
+This path is exercised by `make test-store`, which migrates a throwaway database
+from the repository's own migration files on every run.

@@ -1379,6 +1379,14 @@ type CertificatePostureUpdate struct {
 
 // ── Agents ──────────────────────────────────────────────────
 
+// defaultAgentHeartbeatSeconds is what an agent reports at when nothing said
+// otherwise.
+//
+// Defined here rather than in each store, because the two applying different
+// floors is how a value the database refuses gets accepted in memory — which is
+// exactly what happened before the conformance suite existed.
+const defaultAgentHeartbeatSeconds = 300
+
 // Agent lifecycle states.
 const (
 	AgentActive  = "ACTIVE"

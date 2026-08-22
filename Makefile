@@ -1,4 +1,4 @@
-.PHONY: all build build-core build-agent build-gateways test test-frontend test-coverage lint proto proto-lint \
+.PHONY: test-store all build build-core build-agent build-gateways test test-frontend test-coverage lint proto proto-lint \
         dev dev-certs generate-kek run-core run-gateway-selfsigned run-gateway-acme run-frontend \
         clean help
 
@@ -102,6 +102,23 @@ test:
 		echo "==> $$m"; \
 		(cd $$m && $(GO) test ./... -cover) || exit 1; \
 	done
+
+## test-store runs the store conformance suite against a real PostgreSQL.
+##
+## The same assertions run against the in-memory store on every `make test`.
+## This adds the implementation that has produced every defect the unit tests
+## could not express: constraints, column lists, NULL, and type inference.
+##
+##   docker compose -f deploy/plain-postgres/docker-compose.yml up -d
+##   make test-store
+##
+## Override the server with `make test-store DB=postgres://...`. It creates and
+## drops databases, so point it at something throwaway.
+TEST_DB ?= postgres://postgres:conformance@127.0.0.1:55432/postgres?sslmode=disable
+
+test-store:
+	@CERTPILOT_TEST_DB_URL="$(if $(DB),$(DB),$(TEST_DB))" \
+		$(GO) test ./core/store/ -count=1 -v -run 'Conformance|TestEveryValue|TestAnUnset|TestAnUpdateKeeps|TestABindingKeeps|TestAnEmptyResult|TestTheDeploymentQueue|TestAnAgentTarget'
 
 test-race:
 	@for m in $(MODULES); do \

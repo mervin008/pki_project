@@ -3561,6 +3561,16 @@ func (s *PostgresStore) CreateAgent(ctx context.Context, a *Agent) error {
 	if err != nil {
 		return err
 	}
+
+	// The same floor the in-memory store applies. The column carries DEFAULT
+	// 300 and a CHECK that it is positive, but passing an explicit zero
+	// overrides the default and violates the check — so a caller that left the
+	// field unset was refused here and accepted in memory. Found by the
+	// conformance suite, which is the entire reason it exists.
+	if a.HeartbeatIntervalSeconds <= 0 {
+		a.HeartbeatIntervalSeconds = defaultAgentHeartbeatSeconds
+	}
+
 	return s.pool.QueryRow(ctx, `
 		INSERT INTO public.agents
 			(name, hostname, platform, version, public_key, key_id, status, labels,
