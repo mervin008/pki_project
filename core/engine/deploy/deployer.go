@@ -89,7 +89,7 @@ type Deployer interface {
 // tolerates it would create a target that can be configured, bound, and queued,
 // and that fails at the last moment with an error about an unknown type.
 func Types() []string {
-	return []string{TypeWebhook, TypeAgent}
+	return []string{TypeWebhook, TypeAgent, TypeACM, TypeKeyVault, TypeF5}
 }
 
 // ValidateConfig checks a target configuration and returns the JSON that will
@@ -119,6 +119,39 @@ func ValidateConfig(targetType string, config map[string]any) (raw []byte, deplo
 	return encoded, d.NeedsPrivateKey(), nil
 }
 
+// ValidateOptions checks a binding's placement before it is stored.
+//
+// Separate from ValidateConfig because the two answer different questions. A
+// target's config says which account or appliance; a binding's options say
+// *which certificate on it* — the ARN, the vault entry, the crypto-store name.
+//
+// Checked at binding time rather than at deploy time, and this is the most
+// valuable validation in the package. Every cloud deployer here has the same
+// failure available as one omitted field: install successfully, under an
+// identity nothing is pointing at, and let the thing in front of the users
+// expire on schedule while a console shows a fresh green certificate. Caught at
+// binding, that is a 400 somebody reads. Caught at deploy time it is a success.
+func ValidateOptions(targetType string, options map[string]any) error {
+	switch strings.TrimSpace(strings.ToLower(targetType)) {
+	case TypeACM:
+		if optionString(options, "certificate_arn") == "" {
+			return fmt.Errorf(
+				"an ACM deployment needs certificate_arn: the ARN of the certificate to replace. Importing without one creates a new certificate that no load balancer is pointing at, and the old one goes on being served until it expires")
+		}
+	case TypeKeyVault:
+		if optionString(options, "certificate_name") == "" {
+			return fmt.Errorf(
+				"a Key Vault deployment needs certificate_name: the name to import a new version of. A new name is a certificate nothing is configured to read")
+		}
+	case TypeF5:
+		if optionString(options, "name") == "" {
+			return fmt.Errorf(
+				"an F5 deployment needs name: the crypto-store name the client-SSL profile already references. A new name leaves the virtual server on the previous certificate")
+		}
+	}
+	return nil
+}
+
 // Build constructs a deployer from a sealed-then-opened configuration.
 func Build(targetType string, configJSON string) (Deployer, error) {
 	config := map[string]any{}
@@ -136,6 +169,12 @@ func build(targetType string, config map[string]any) (Deployer, error) {
 		return newWebhookDeployer(config)
 	case TypeAgent:
 		return newAgentDeployer(config)
+	case TypeACM:
+		return newACMDeployer(config)
+	case TypeKeyVault:
+		return newKeyVaultDeployer(config)
+	case TypeF5:
+		return newF5Deployer(config)
 	case "":
 		return nil, fmt.Errorf("a deployment target needs a target_type; supported: %s", strings.Join(Types(), ", "))
 	default:

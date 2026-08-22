@@ -1,8 +1,10 @@
 package cloudsync
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"net/http"
@@ -361,4 +363,100 @@ func issuerOrUnnamed(issuer string) string {
 		return "(none set)"
 	}
 	return issuer
+}
+
+// NewKeyVault builds a Key Vault client from a connection's sealed
+// configuration. See the note on NewACM for why this lives here.
+func NewKeyVault(config map[string]any) (*KeyVault, error) { return newKeyVault(config) }
+
+// VaultURL is which vault this client talks to.
+func (k *KeyVault) VaultURL() string { return k.vaultURL }
+
+// ImportCertificate uploads a certificate and its key into the vault under a
+// given name.
+//
+// **Importing over an existing name creates a new version, and that is the
+// point.** Key Vault certificates are versioned, references resolve to the
+// latest version by default, and anything holding a versionless secret
+// identifier picks the new one up. A new *name* would be a certificate nothing
+// is configured to read — the same one-field mistake as an ACM import without
+// an ARN, wearing different clothes.
+//
+// The material goes as an unencrypted PEM bundle rather than a PFX. Key Vault
+// accepts both, and building a PKCS#12 would mean either a passphrase to place
+// somewhere or a third-party encoder in a process that holds every private key
+// this system has issued. The bundle is key-then-certificate-then-chain, which
+// is the order Key Vault's own documentation gives.
+//
+// The certificate is imported with an `Unknown` issuer, which is exactly what
+// this is: a certificate Key Vault did not issue and cannot renew. Phase 5
+// reports that as a finding, and it will go on reporting it — correctly. Key
+// Vault is not renewing this; CertPilot is, and the record should say the true
+// thing rather than the flattering one.
+func (k *KeyVault) ImportCertificate(ctx context.Context, name, certPEM, keyPEM, chainPEM string) (string, error) {
+	if strings.TrimSpace(name) == "" {
+		return "", fmt.Errorf("a Key Vault certificate needs a name; importing under a new one would leave whatever reads the old name on the old certificate")
+	}
+	if strings.TrimSpace(certPEM) == "" {
+		return "", fmt.Errorf("Key Vault needs the certificate body and none was supplied")
+	}
+	if strings.TrimSpace(keyPEM) == "" {
+		return "", fmt.Errorf(
+			"Key Vault stores the private key with the certificate and CertPilot holds none for this one. A certificate that was discovered or imported has no key here until it is reissued through CertPilot")
+	}
+
+	bundle := keyPEM
+	if !strings.HasSuffix(bundle, "\n") {
+		bundle += "\n"
+	}
+	bundle += certPEM
+	if !strings.HasSuffix(bundle, "\n") {
+		bundle += "\n"
+	}
+	if strings.TrimSpace(chainPEM) != "" {
+		bundle += chainPEM
+	}
+
+	body := map[string]any{
+		"value": bundle,
+		"pwd":   "",
+		"policy": map[string]any{
+			"secret_props": map[string]any{"contentType": "application/x-pem-file"},
+		},
+	}
+
+	endpoint := fmt.Sprintf("%s/certificates/%s/import?api-version=%s",
+		k.vaultURL, url.PathEscape(name), keyVaultAPIVersion)
+
+	var resp struct {
+		ID  string `json:"id"`
+		Sid string `json:"sid"`
+	}
+	if err := k.post(ctx, endpoint, body, &resp); err != nil {
+		return "", err
+	}
+	if resp.ID == "" {
+		return "", fmt.Errorf("the vault accepted the import and did not return a certificate id")
+	}
+	return resp.ID, nil
+}
+
+// post performs one authenticated JSON write against the vault.
+func (k *KeyVault) post(ctx context.Context, endpoint string, body any, out any) error {
+	token, err := k.accessToken(ctx)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	return doJSON(k.client, req, out)
 }

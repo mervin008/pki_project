@@ -2,8 +2,10 @@ package deploy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/certpilot/certpilot/core/events"
@@ -73,11 +75,7 @@ func (e *Executor) Deploy(ctx context.Context, job *store.DeploymentJob) (string
 			cert.CommonName)
 	}
 
-	config, err := e.decryptConfig(target)
-	if err != nil {
-		return "", err
-	}
-	deployer, err := Build(target.TargetType, config)
+	deployer, err := e.buildDeployer(ctx, target)
 	if err != nil {
 		return "", err
 	}
@@ -259,4 +257,80 @@ func (e *Executor) decryptConfig(target *store.DeploymentTarget) (string, error)
 		return "", fmt.Errorf("could not decrypt the configuration for target %q: %w", target.Name, err)
 	}
 	return plaintext, nil
+}
+
+// buildDeployer opens a target's configuration and, for a cloud target, borrows
+// the credentials of the connection it names.
+//
+// Cloud deployers do not store their own copy of an account's credentials.
+// Two copies of one AWS key — one in cloud_connections for discovery, one in
+// deployment_targets for deployment — is one rotation away from a system that
+// can read an account it can no longer write to, and that surfaces at the worst
+// possible moment.
+//
+// The connection's values win on a collision. A target may carry placement of
+// its own, but it must never be able to override the credentials of the account
+// somebody registered.
+func (e *Executor) buildDeployer(ctx context.Context, target *store.DeploymentTarget) (Deployer, error) {
+	raw, err := e.decryptConfig(target)
+	if err != nil {
+		return nil, err
+	}
+
+	config := map[string]any{}
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &config); err != nil {
+			return nil, fmt.Errorf("the configuration for target %q is not valid JSON: %w", target.Name, err)
+		}
+	}
+
+	if id := ConnectionID(config); id != "" {
+		connection, err := e.store.GetCloudConnection(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"target %q borrows the credentials of a cloud connection that no longer exists: %w", target.Name, err)
+		}
+		if !connection.IsEnabled {
+			// An error rather than a silent skip, for the reason a disabled
+			// target is: somebody switched this off, and a queue that quietly
+			// discards work because a switch is off is a queue that lies.
+			return nil, fmt.Errorf(
+				"the cloud connection %q that target %q uses is switched off", connection.Name, target.Name)
+		}
+
+		connectionConfig, err := e.openConnection(connection)
+		if err != nil {
+			return nil, err
+		}
+		config = MergeConnection(config, connectionConfig)
+	}
+
+	merged, err := json.Marshal(config)
+	if err != nil {
+		return nil, err
+	}
+	return Build(target.TargetType, string(merged))
+}
+
+// openConnection decrypts a cloud connection's stored credentials.
+func (e *Executor) openConnection(connection *store.CloudConnection) (map[string]any, error) {
+	out := map[string]any{}
+	sealed := connection.ConfigEncrypted
+	if sealed == "" {
+		return out, nil
+	}
+	plaintext := sealed
+	if secrets.IsEnvelope(sealed) {
+		opened, err := e.keyring.DecryptString(sealed, secrets.ContextCloudConnectionConfig)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"could not decrypt the credentials for cloud connection %q: %w", connection.Name, err)
+		}
+		plaintext = opened
+	}
+	if err := json.Unmarshal([]byte(plaintext), &out); err != nil {
+		return nil, fmt.Errorf(
+			"the stored configuration for cloud connection %q is not valid JSON: %w", connection.Name, err)
+	}
+	return out, nil
 }

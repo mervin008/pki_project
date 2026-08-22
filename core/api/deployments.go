@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -75,7 +77,7 @@ func (h *DeploymentHandler) CreateTarget(c *gin.Context) {
 		return
 	}
 
-	sealed, deploysKey, err := h.sealConfig(req.TargetType, req.Config)
+	sealed, deploysKey, err := h.sealConfig(c.Request.Context(), req.TargetType, req.Config)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -94,6 +96,7 @@ func (h *DeploymentHandler) CreateTarget(c *gin.Context) {
 		ConfigEncrypted:   sealed,
 		IsEnabled:         enabled,
 		DeploysPrivateKey: deploysKey,
+		CloudConnectionID: connectionRef(req.Config),
 		CreatedBy:         actor,
 	}
 	if err := h.store.CreateDeploymentTarget(c.Request.Context(), target); err != nil {
@@ -138,13 +141,14 @@ func (h *DeploymentHandler) UpdateTarget(c *gin.Context) {
 	}
 
 	if len(req.Config) > 0 {
-		sealed, deploysKey, err := h.sealConfig(existing.TargetType, req.Config)
+		sealed, deploysKey, err := h.sealConfig(c.Request.Context(), existing.TargetType, req.Config)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 		existing.ConfigEncrypted = sealed
 		existing.DeploysPrivateKey = deploysKey
+		existing.CloudConnectionID = connectionRef(req.Config)
 	} else if _, err := deploy.Build(existing.TargetType, ""); err != nil && existing.ConfigEncrypted == "" {
 		// Changing the type without supplying a configuration would leave a
 		// target whose stored config belongs to the old type.
@@ -189,16 +193,99 @@ func (h *DeploymentHandler) DeleteTarget(c *gin.Context) {
 }
 
 // sealConfig validates a target configuration and encrypts it.
-func (h *DeploymentHandler) sealConfig(targetType string, config map[string]any) (string, bool, error) {
-	raw, deploysKey, err := deploy.ValidateConfig(strings.ToLower(strings.TrimSpace(targetType)), config)
+func (h *DeploymentHandler) sealConfig(ctx context.Context, targetType string, config map[string]any) (string, bool, error) {
+	targetType = strings.ToLower(strings.TrimSpace(targetType))
+
+	// A cloud target borrows a connection's credentials rather than storing its
+	// own copy, so the connection has to exist and has to be the right
+	// provider. Checked here because ValidateConfig cannot reach the store, and
+	// checked at all because the alternative is a target that looks configured
+	// and fails on its first renewal — which by then is somebody's evening.
+	// Validated as the whole thing, sealed as the half the target owns.
+	//
+	// The deployer cannot be built from a target's config alone — the region,
+	// the vault URL and the credentials all live on the connection — so a
+	// target created without merging would be validated against nothing and
+	// fail on its first renewal. And the merged config must never be what gets
+	// stored, or registering an account twice would be discouraged rather than
+	// impossible.
+	validateAgainst := config
+	if deploy.RequiresConnection(targetType) {
+		connectionConfig, err := h.openConnection(ctx, targetType, config)
+		if err != nil {
+			return "", false, err
+		}
+		validateAgainst = deploy.MergeConnection(config, connectionConfig)
+	}
+
+	_, deploysKey, err := deploy.ValidateConfig(targetType, validateAgainst)
+	if err != nil {
+		return "", false, err
+	}
+
+	raw, err := json.Marshal(config)
 	if err != nil {
 		return "", false, err
 	}
 	sealed, err := h.keyring.Encrypt(raw, secrets.ContextDeploymentConfig)
 	if err != nil {
-		return "", false, fmt.Errorf("failed to encrypt the target configuration, refusing to store it in the clear: %w", err)
+		return "", false, fmt.Errorf(
+			"failed to encrypt the target configuration, refusing to store it in the clear: %w", err)
 	}
 	return sealed, deploysKey, nil
+}
+
+// openConnection finds the cloud connection a target names and opens its
+// credentials, so the target can be validated as the whole thing it will be.
+func (h *DeploymentHandler) openConnection(ctx context.Context, targetType string,
+	config map[string]any) (map[string]any, error) {
+
+	id := deploy.ConnectionID(config)
+	if id == "" {
+		return nil, fmt.Errorf(
+			"a %s target needs connection_id: the id of the cloud connection whose credentials to use. Register the account once under cloud connections rather than pasting a second copy of the same credentials here — two copies is one rotation away from a system that can read an account it can no longer write to",
+			targetType)
+	}
+
+	connection, err := h.store.GetCloudConnection(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("no cloud connection with id %s: %w", id, err)
+	}
+	if connection.Provider != targetType {
+		return nil, fmt.Errorf(
+			"cloud connection %q is a %s connection, and this is a %s target",
+			connection.Name, connection.Provider, targetType)
+	}
+
+	out := map[string]any{}
+	if connection.ConfigEncrypted == "" {
+		return out, nil
+	}
+	plaintext := connection.ConfigEncrypted
+	if secrets.IsEnvelope(plaintext) {
+		opened, err := h.keyring.DecryptString(plaintext, secrets.ContextCloudConnectionConfig)
+		if err != nil {
+			return nil, fmt.Errorf("could not decrypt the credentials for %q: %w", connection.Name, err)
+		}
+		plaintext = opened
+	}
+	if err := json.Unmarshal([]byte(plaintext), &out); err != nil {
+		return nil, fmt.Errorf("the stored configuration for %q is not valid JSON: %w", connection.Name, err)
+	}
+	return out, nil
+}
+
+// connectionRef lifts the connection id out of the config into a plain column.
+//
+// Stored twice on purpose: inside the sealed config because that is what gets
+// handed to the deployer, and in a column because "which cloud accounts can
+// this system write to" must be answerable without the KEK.
+func connectionRef(config map[string]any) *string {
+	id := deploy.ConnectionID(config)
+	if id == "" {
+		return nil
+	}
+	return &id
 }
 
 // ── Bindings ────────────────────────────────────────────────
@@ -367,6 +454,17 @@ func (h *DeploymentHandler) CreateBinding(c *gin.Context) {
 			})
 			return
 		}
+	}
+
+	// The most valuable validation in the deployment path, and it costs a
+	// 400 now instead of a silent success later. Every cloud deployer has the
+	// same failure available as one omitted field: install correctly, under an
+	// identity nothing is pointing at, while the thing in front of the users
+	// expires on schedule and the provider's console shows a fresh green
+	// certificate.
+	if err := deploy.ValidateOptions(target.TargetType, req.Options); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 
 	enabled := true

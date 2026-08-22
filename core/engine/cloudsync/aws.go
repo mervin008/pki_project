@@ -357,3 +357,87 @@ func (a *ACM) assumeRoleWithWebIdentity(ctx context.Context) (awsCredentials, er
 	}
 	return creds, nil
 }
+
+// NewACM builds an ACM client from a connection's sealed configuration.
+//
+// Exported so the deployment side can reach it. Talking to a cloud provider —
+// credentials, signing, endpoints, the shape of its errors — lives in this
+// package once, and reading an account is not a different skill from writing to
+// it. A second copy of the SigV4 signer in a deploy package would be a second
+// place for a credential bug to live.
+func NewACM(config map[string]any) (*ACM, error) { return newACM(config) }
+
+// Region is which region this client talks to.
+func (a *ACM) Region() string { return a.region }
+
+// ImportCertificate uploads a certificate to ACM, replacing one in place when
+// an ARN is given.
+//
+// **The ARN is the whole of this method.** ImportCertificate with one replaces
+// the material behind an existing certificate and every listener, distribution
+// and API Gateway pointing at that ARN follows it. ImportCertificate without
+// one creates a *new* certificate with a *new* ARN — which succeeds, reports
+// success, and is attached to nothing. The load balancer carries on serving the
+// old certificate until it expires, and the console shows a fresh green
+// certificate next to it.
+//
+// That is the failure this whole product exists to prevent, available here as a
+// one-field mistake, so the caller has to have gone and found the ARN.
+//
+// AWS requires the chain separately from the leaf and rejects a chain that
+// includes the leaf. It also refuses a certificate whose key it already holds
+// under a different ARN, which is worth passing through verbatim rather than
+// dressing up.
+func (a *ACM) ImportCertificate(ctx context.Context, arn, certPEM, keyPEM, chainPEM string) (string, error) {
+	if strings.TrimSpace(certPEM) == "" {
+		return "", fmt.Errorf("ACM needs the certificate body and none was supplied")
+	}
+	if strings.TrimSpace(keyPEM) == "" {
+		return "", fmt.Errorf(
+			"ACM stores the private key with the certificate and CertPilot holds none for this one. A certificate that was discovered or imported has no key here until it is reissued through CertPilot")
+	}
+
+	body := map[string]any{
+		"Certificate": certPEM,
+		"PrivateKey":  keyPEM,
+	}
+	if strings.TrimSpace(chainPEM) != "" {
+		body["CertificateChain"] = chainPEM
+	}
+	if strings.TrimSpace(arn) != "" {
+		body["CertificateArn"] = arn
+	}
+
+	var resp struct {
+		CertificateArn string `json:"CertificateArn"`
+	}
+	if err := a.call(ctx, "CertificateManager.ImportCertificate", body, &resp); err != nil {
+		return "", err
+	}
+	if resp.CertificateArn == "" {
+		// ACM answers with the ARN on both create and replace. An empty one
+		// means something answered that was not ACM, and reporting success on
+		// it would be reporting a deployment that may not have happened.
+		return "", fmt.Errorf("ACM accepted the import and did not return a certificate ARN")
+	}
+	return resp.CertificateArn, nil
+}
+
+// DescribeCertificate reads back what ACM now holds, so a deployment can be
+// reported as what it is rather than as what was sent.
+func (a *ACM) DescribeCertificate(ctx context.Context, arn string) (string, []string, error) {
+	var resp struct {
+		Certificate struct {
+			Status                  string   `json:"Status"`
+			InUseBy                 []string `json:"InUseBy"`
+			RenewalEligibility      string   `json:"RenewalEligibility"`
+			DomainName              string   `json:"DomainName"`
+			SubjectAlternativeNames []string `json:"SubjectAlternativeNames"`
+		} `json:"Certificate"`
+	}
+	if err := a.call(ctx, "CertificateManager.DescribeCertificate",
+		map[string]any{"CertificateArn": arn}, &resp); err != nil {
+		return "", nil, err
+	}
+	return resp.Certificate.Status, resp.Certificate.InUseBy, nil
+}

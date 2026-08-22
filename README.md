@@ -110,7 +110,7 @@ explicitly.
 | Renewal queue | ✅ | Durable jobs with leases, an attempt log, and backoff that tightens as expiry approaches. Safe on N replicas with no leader. Per-CA rate limits defer rather than fail |
 | Post-renewal verification | ✅ | Re-probes the endpoints discovery has seen serving a certificate and reports when a renewal never reached them — the green-dashboard-over-an-expiring-estate failure, caught |
 | Notifications | ✅ | Slack (Block Kit), signed generic webhook, SMTP email. Deliberately not Teams or PagerDuty |
-| Deployment to servers | ⚠️ | Durable, retried, audited deployment to a generic signed webhook, and to a host running the agent — which installs, validates and reloads on the far side of every firewall, and rolls back what was working if either fails. **A renewal deploys itself**, and a failing target halts the rest of the rollout rather than letting a bad certificate march through the estate. ACM, Key Vault and F5 are next |
+| Deployment to servers | ✅ | Durable, retried, audited deployment to a signed webhook, a host running the agent, AWS ACM, Azure Key Vault and F5 BIG-IP. **A renewal deploys itself**, and a failing target halts the rest of the rollout rather than letting a bad certificate march through the estate. Key Vault and F5 are written to their published APIs and unit-tested; neither has been run against a real vault or appliance |
 | Host agent | ✅ | One binary that enrols, inventories, **requests certificates with keys it generates locally and never sends** — CertPilot cannot produce them and does not claim to — then installs them where the server actually reads them and reloads it. Bounded by grants an operator writes in advance |
 | PQC posture / CBOM | ❌ | Schema is ready ([002](migrations/002_crypto_agility.sql)); reporting is not built |
 | Vault, GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
@@ -995,6 +995,61 @@ evidence from a real handshake. Once every place a certificate belongs is
 holding it, that check comes forward from half an hour to three minutes — not to
 zero, because a verification that ran the instant a deployer returned would
 report the reload it did not wait for.
+
+### ACM, Key Vault, and F5
+
+Three deployers that have nothing in common architecturally and share exactly
+one mistake — which, in all three, returns 200:
+
+| | The one-field mistake | What is actually being served |
+|:---|:---|:---|
+| ACM | `ImportCertificate` with no ARN | Every listener still points at the old ARN |
+| Key Vault | Import under a new name | Whatever reads the old name is on the old certificate |
+| F5 | Install under a new crypto-store name | The client-SSL profile references the previous one |
+
+**Installing the certificate is the easy half. Installing it as the thing that
+is already being served is the job.** So the identity of what is being replaced
+is required per binding, and refused when you bind rather than when you deploy:
+
+```
+POST /api/v1/certificates/{id}/targets
+{ "target_id": "…" }
+
+400  an ACM deployment needs certificate_arn: the ARN of the certificate to
+     replace. Importing without one creates a new certificate that no load
+     balancer is pointing at, and the old one goes on being served until it
+     expires
+```
+
+ACM also refuses the *result*. An import that returns a different ARN means AWS
+created rather than replaced, and calling that a successful deployment would be
+calling something nothing is serving a success. When it does replace, the
+read-back says what is actually attached:
+
+```
+reimported …/prod-wildcard into AWS Certificate Manager in eu-west-1
+(issued, in use by 1 resource(s))
+```
+
+**A cloud target borrows a connection's credentials.** Register the account once
+under cloud connections; the deployment target names it and stores no copy. Two
+copies of one AWS key is one rotation away from a system that can read an
+account it can no longer write to.
+
+```
+ships private keys to 1 of 1 target(s)
+  acm-eu-west-1    aws_acm    keys:True  connection:eb874b8d
+```
+
+This also closes a loop: [phase 5](#certificates-nobody-is-renewing) exists to
+find ACM certificates that were *imported* and which AWS will therefore never
+renew. That account is now the account CertPilot deploys to, and that
+certificate is the one it replaces.
+
+No AWS or Azure SDK is involved. CertPilot has spoken these APIs over plain HTTP
+since discovery — hand-rolled SigV4, checked against AWS's published test
+vectors — because two hundred dependency modules inside a process holding every
+private key you have issued is a worse trade than the code.
 
 ## Security model
 

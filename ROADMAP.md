@@ -686,9 +686,9 @@ do something about it.
 | 4c | Local key generation and CSR submission | ✅ |
 | 4d | Install and reload, as a deployment target | ✅ |
 | 3 | Deploy on renewal, and the loop that proves it landed | ✅ |
-| 2 | The deployers that need no agent: ACM, Azure Key Vault, F5 | deferred |
+| 2 | The deployers that need no agent: ACM, Azure Key Vault, F5 | ✅ |
 
-**Steps 2 and 3 are deliberately out of order.** Kubernetes was going to be the
+**Steps 2 and 3 were deliberately taken out of order.** Kubernetes was going to be the
 first agentless deployer and it should not be: clusters that manage certificates
 already run cert-manager, and this roadmap's own out-of-scope list says
 integrate with it rather than replace it. Writing a second thing that fights
@@ -1229,6 +1229,75 @@ the parameter: **a filter an endpoint does not understand is now a 400 that
 names it.** A narrowing parameter that silently does not narrow is harmless on a
 page a person reads and destructive the moment anything acts on the result.
 
+**Step 2** is three deployers that share one mistake.
+
+ACM, Key Vault and a BIG-IP have nothing in common architecturally — an AWS API,
+an Azure vault, an appliance on a management address reachable from nowhere. But
+all three offer the same failure, in three vocabularies, and in every case the
+API returns 200:
+
+| | The one-field mistake | What is actually being served |
+|:---|:---|:---|
+| ACM | `ImportCertificate` with no `CertificateArn` | Every listener still points at the old ARN |
+| Key Vault | Import under a new name | Whatever reads the old name is on the old certificate |
+| F5 | Install under a new crypto-store name | The client-SSL profile references the previous one |
+
+> **Installing the certificate is the easy half. Installing it as the thing that
+> is already being served is the job.**
+
+Get it wrong and the deployment succeeds, the attempt log says so, the
+provider's console shows a fresh green certificate beside the old one, and the
+thing in front of the users expires on schedule. That is this product's own
+founding complaint, available as an omitted field. So the identifier of the
+thing being replaced is required **per binding and refused at binding time** —
+a 400 somebody reads, rather than a success nobody questions. ACM goes further
+and refuses the *result*: an import that comes back with a different ARN means
+it created rather than replaced, and reporting that as a deployment would be
+reporting one that nothing is serving.
+
+The F5 deployer stops after installing over the existing name, and does not
+touch the client-SSL profile. Pointing an existing profile at a *different*
+certificate is a change to what a virtual server serves, and that belongs to
+whoever owns the virtual server. Replacing the material behind the name they
+already chose does not.
+
+**A cloud target borrows a connection's credentials rather than storing its
+own.** Two copies of one AWS key — one in `cloud_connections` for discovery, one
+in `deployment_targets` for deployment — is one rotation away from a system that
+can read an account it can no longer write to, and that surfaces at the worst
+possible moment. Proven rather than asserted: the target's sealed config was
+decrypted straight out of the database and holds `{"connection_id": …}` and
+nothing else.
+
+It also closes a loop this project opened. Phase 5's headline finding is that an
+*imported* ACM certificate is never renewed by AWS and that almost everybody
+believes otherwise. The account that finding comes from is now the account this
+deploys to, and the certificate it names is the one being replaced.
+
+None of this needed an AWS SDK. `cloudsync` has spoken these APIs over plain
+HTTP since phase 5 — hand-rolled SigV4, checked against AWS's published test
+vectors — so the write side is a method beside the read side rather than two
+hundred modules of dependency inside a process that holds every private key this
+system has issued.
+
+**What was verified, and what was not.** ACM was exercised end to end against a
+stub that verifies the SigV4 signature independently, recomputing it from the
+connection's secret: a renewal nobody asked for reached it, the ARN was
+preserved, and the read-back reported what was using the certificate. Docker was
+unavailable on this machine, so LocalStack was not used and no real AWS account
+was touched. **Key Vault and F5 were written to their published APIs and are
+covered by unit tests only** — neither has been run against a real vault or a
+real appliance, and a misreading of either API would pass every test here. That
+is recorded as a gap rather than smoothed over.
+
+Running it caught two things. The endpoint override key was guessed rather than
+looked up, so the first test run **signed requests with test credentials and
+sent them to the real `acm.eu-west-1.amazonaws.com`** — rejected, harmless, and
+exactly the accident a test suite should be incapable of having. And a
+pre-existing test used `"f5"` as its example of a target type nothing can deploy
+to, which stopped being true the moment this shipped; the negative case is now a
+name nothing will ever implement.
+
 ### Phase 7 — More CAs
 
 HashiCorp Vault PKI first — it is what most organisations running private PKI
@@ -1273,6 +1342,16 @@ Tracked honestly rather than quietly:
 - `certificates.deployment_target_id` survives from migration 001 and is no
   longer the answer to where a certificate is deployed. It is unread by anything
   in the deployment path and should be dropped once nothing else references it
+- Azure Key Vault and F5 deployment are written to their published APIs and
+  verified by unit tests only. Neither has been run against a real vault or a
+  real BIG-IP, so a misreading of either API would pass everything here. ACM was
+  exercised end to end, but against a stub rather than LocalStack or a real
+  account
+- The F5 deployer installs over the existing crypto-store name and does not
+  touch the client-SSL profile, so a certificate bound to a name no profile
+  references installs successfully and serves nothing. That is deliberate —
+  repointing a virtual server is its owner's decision — but nothing here detects
+  it, the way ACM's read-back detects an unattached ARN
 - Deployment ordering is not expressible. A failing target now halts the rest of
   a rollout automatically, which bounds a bad one to at most `workers` targets
   per replica — but there is no way to say "staging first, then production", and

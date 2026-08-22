@@ -1394,6 +1394,73 @@ not to zero, because a verification that ran the instant a deployer returned
 would report the reload it did not wait for, and not at all on a partial
 rollout, because that is a STALE nobody needed to see.
 
+### Cloud targets
+
+```
+aws_acm           borrows an AWS connection      binding needs certificate_arn
+azure_key_vault   borrows an Azure connection    binding needs certificate_name
+f5                its own host and credentials   binding needs name
+```
+
+All three terminate TLS, so all three carry the private key and all three appear
+in the answer to *"where does this organisation ship private keys"*.
+
+**A cloud target names a connection instead of holding credentials.**
+
+```json
+POST /api/v1/deployment-targets
+{ "name": "acm-eu-west-1", "target_type": "aws_acm",
+  "config": { "connection_id": "…" } }
+```
+
+Anything else is refused. Two copies of one account's credentials — one in
+`cloud_connections` for discovery, one here for deployment — is one rotation
+away from a system that can read an account it can no longer write to. The
+target's sealed config holds the connection id and nothing else; `region`,
+`vault_url` and the credentials are read from the connection at deploy time, and
+the connection wins on any collision.
+
+`deployment_targets.cloud_connection_id` is a plain column beside the sealed
+blob, for the reason `deploys_private_key` is: *"which cloud accounts can this
+system write to"* has to be answerable with a SELECT by somebody who does not
+hold the KEK.
+
+### The one mistake all three share
+
+| | The one-field mistake | What is actually being served |
+|:---|:---|:---|
+| ACM | `ImportCertificate` with no `CertificateArn` | Every listener still points at the old ARN |
+| Key Vault | Import under a new name | Whatever reads the old name is on the old certificate |
+| F5 | Install under a new crypto-store name | The client-SSL profile references the previous one |
+
+In all three the API returns 200, the attempt log records a success, and the
+console shows a fresh green certificate beside the old one. So the identifier of
+what is being replaced is required per binding and refused **at binding time**:
+
+```
+400  an ACM deployment needs certificate_arn: the ARN of the certificate to
+     replace. Importing without one creates a new certificate that no load
+     balancer is pointing at, and the old one goes on being served until it
+     expires
+```
+
+ACM additionally refuses the *result*: an import returning a different ARN means
+AWS created rather than replaced, which is the same failure arriving as a
+success. On a real replacement it reads back what is attached —
+`(issued, in use by 1 resource(s))`, or a warning that nothing is using this ARN
+at all.
+
+**The F5 deployer does not touch the client-SSL profile.** It installs over the
+crypto-store name the profile already references, which is the deployment.
+Repointing a profile at a *different* certificate changes what a virtual server
+serves and belongs to whoever owns that virtual server.
+
+Its management address must be `https`, because the certificate and its private
+key travel over it. `insecure_skip_verify` is available for the very common case
+of a BIG-IP presenting its own admin-generated certificate — allowed, because
+refusing outright means somebody copies the certificate by hand instead, and
+named in `Describe()` so it is never invisible.
+
 ### Cancelling a deployment
 
 ```

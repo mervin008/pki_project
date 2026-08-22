@@ -20,8 +20,22 @@ func TestADeploymentTargetIsValidatedBeforeItIsStored(t *testing.T) {
 		want string
 	}{
 		"a type nothing can deploy to": {
-			gin.H{"name": "big-ip", "target_type": "f5", "config": gin.H{"host": "10.0.0.1"}},
+			gin.H{"name": "carrier-pigeon", "target_type": "carrier-pigeon", "config": gin.H{}},
 			"cannot be deployed to yet",
+		},
+		// An appliance whose management address is plaintext. The certificate
+		// and its private key travel over that connection.
+		"an F5 reached over http": {
+			gin.H{"name": "big-ip", "target_type": "f5",
+				"config": gin.H{"host": "http://10.0.0.1", "username": "admin", "password": "x"}},
+			"private key travel",
+		},
+		// A cloud target that brought its own credentials instead of naming the
+		// account somebody already registered.
+		"an ACM target with its own keys": {
+			gin.H{"name": "acm-eu", "target_type": "aws_acm",
+				"config": gin.H{"region": "eu-west-1", "access_key_id": "A", "secret_access_key": "s"}},
+			"connection_id",
 		},
 		"a webhook nobody can authenticate": {
 			gin.H{"name": "unsigned", "target_type": "webhook",

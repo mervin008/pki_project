@@ -71,7 +71,10 @@ func TestAWebhookTargetIsRefusedWhenItCannotBeTrusted(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			targetType := TypeWebhook
 			if tc.config == nil {
-				targetType, tc.config = "f5", map[string]any{}
+				// A type nothing can deploy to. Deliberately not a plausible
+				// one: "f5" used to stand here and became real, which is the
+				// hazard with using a real-sounding name as a negative case.
+				targetType, tc.config = "carrier-pigeon", map[string]any{}
 			}
 			_, _, err := ValidateConfig(targetType, tc.config)
 			if err == nil {

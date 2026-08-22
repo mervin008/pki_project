@@ -304,6 +304,30 @@ A leader would have given one replica all the work and a failover window during
 which no certificate renews at all. These two lines give N equal workers and no
 window.
 
+### Migration 024, two spellings of one provider, and a fourth widening
+
+`deployment_targets.target_type` needed `'f5'` and `'azure_key_vault'`. The
+first is new. The second is the interesting one.
+
+Migration 001 spelled that provider `azure_kv` in this constraint. Migration 011
+spelled it `azure_key_vault` in `cloud_connections.provider`. Both have been
+sitting there ever since and nothing noticed, because until now nothing ever
+compared them — a cloud connection was for reading and a deployment target was
+for writing, and the two never met.
+
+Step 2 made them meet. A cloud deployment target borrows the credentials of a
+cloud connection rather than storing a second copy, and the check that the
+connection is the right kind of account compares those two strings directly. Two
+spellings of one provider had been a latent bug in the schema since migration
+001, waiting for the first join.
+
+`azure_kv` is left in the permitted list rather than removed. It is unused, and
+dropping a value from a check constraint is how a migration fails on somebody
+else's data at three in the morning.
+
+This is also the fourth widening of a constraint that enumerates kinds of thing,
+one migration after 022 predicted there would be more.
+
 ### Migration 023 and a default that does not apply to existing rows
 
 `certificate_deployments.deploy_on_renewal` defaults to `true`, and the same
@@ -371,6 +395,7 @@ list has stopped being a coincidence:
 | 018 | An untyped `$1` in `$1 - <interval>` was inferred as an interval |
 | 021 | `discovered_via` refused `'AGENT'` |
 | 022 | `deployment_targets.target_type` refused `'agent'` |
+| 024 | The same constraint refused `'f5'`, and spelled Key Vault differently from `cloud_connections` |
 
 (The remaining one was a deployment binding summary that read as an all-clear over a
 failing target — not a constraint, but the same root: the in-memory store cannot

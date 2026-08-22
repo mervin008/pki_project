@@ -753,14 +753,15 @@ func (s *PostgresStore) DeleteCAAccount(ctx context.Context, id string) error {
 // deploymentTargetColumns is the read shape, in one place so a column added to
 // the table cannot be picked up by the list query and missed by the detail one.
 const deploymentTargetColumns = `id, name, coalesce(description, ''), target_type,
-		coalesce(config_encrypted, ''), coalesce(is_enabled, true), coalesce(deploys_private_key, false), agent_id,
+		coalesce(config_encrypted, ''), coalesce(is_enabled, true), coalesce(deploys_private_key, false),
+		cloud_connection_id, agent_id,
 		last_deployment_at, last_deployment_status, coalesce(last_deployment_error, ''), last_success_at,
 		created_by, created_at, updated_at`
 
 func scanDeploymentTarget(row pgx.Row) (*DeploymentTarget, error) {
 	t := &DeploymentTarget{}
 	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.TargetType,
-		&t.ConfigEncrypted, &t.IsEnabled, &t.DeploysPrivateKey, &t.AgentID,
+		&t.ConfigEncrypted, &t.IsEnabled, &t.DeploysPrivateKey, &t.CloudConnectionID, &t.AgentID,
 		&t.LastDeploymentAt, &t.LastDeploymentStatus, &t.LastDeploymentError, &t.LastSuccessAt,
 		&t.CreatedBy, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
@@ -800,11 +801,13 @@ func (s *PostgresStore) GetDeploymentTarget(ctx context.Context, id string) (*De
 func (s *PostgresStore) CreateDeploymentTarget(ctx context.Context, target *DeploymentTarget) error {
 	return s.pool.QueryRow(ctx, `
 		INSERT INTO public.deployment_targets
-			(name, description, target_type, config_encrypted, is_enabled, deploys_private_key, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+			(name, description, target_type, config_encrypted, is_enabled, deploys_private_key,
+			 cloud_connection_id, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, created_at, updated_at`,
 		target.Name, nullIfEmpty(target.Description), target.TargetType,
-		nullIfEmpty(target.ConfigEncrypted), target.IsEnabled, target.DeploysPrivateKey, target.CreatedBy,
+		nullIfEmpty(target.ConfigEncrypted), target.IsEnabled, target.DeploysPrivateKey,
+		target.CloudConnectionID, target.CreatedBy,
 	).Scan(&target.ID, &target.CreatedAt, &target.UpdatedAt)
 }
 
@@ -812,10 +815,11 @@ func (s *PostgresStore) UpdateDeploymentTarget(ctx context.Context, target *Depl
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE public.deployment_targets
 		SET name = $2, description = $3, target_type = $4, config_encrypted = $5,
-		    is_enabled = $6, deploys_private_key = $7, updated_at = now()
+		    is_enabled = $6, deploys_private_key = $7, cloud_connection_id = $8, updated_at = now()
 		WHERE id = $1`,
 		target.ID, target.Name, nullIfEmpty(target.Description), target.TargetType,
-		nullIfEmpty(target.ConfigEncrypted), target.IsEnabled, target.DeploysPrivateKey)
+		nullIfEmpty(target.ConfigEncrypted), target.IsEnabled, target.DeploysPrivateKey,
+		target.CloudConnectionID)
 	if err != nil {
 		return err
 	}

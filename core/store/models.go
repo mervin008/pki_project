@@ -269,6 +269,15 @@ type DeploymentTarget struct {
 	// — without the KEK, and without decrypting anything.
 	DeploysPrivateKey bool `json:"deploys_private_key"`
 
+	// CloudConnectionID names the account whose credentials this target
+	// borrows, for the target types that borrow one.
+	//
+	// A plain column rather than a field inside the sealed config, and for the
+	// same reason DeploysPrivateKey is one: "which cloud accounts can this
+	// system write to" has to be answerable by reading the target list, without
+	// the KEK and without decrypting anything.
+	CloudConnectionID *string `json:"cloud_connection_id,omitempty"`
+
 	// AgentID is set when this target is a host running the agent.
 	//
 	// It changes who does the work rather than what the work is. Everything
