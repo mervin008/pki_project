@@ -6,15 +6,20 @@ import DataState from '@/components/common/DataState.vue'
 import PanelBox from '@/components/ui/PanelBox.vue'
 import SevChip from '@/components/ui/SevChip.vue'
 import {
-  Plus, Search, RotateCw, Eye, CircleX, ShieldCheck,
+  Plus, Search, RotateCw, CircleX, ShieldCheck, Download, KeyRound, FileSignature,
 } from 'lucide-vue-next'
 import {
   certStateLabel, certUrgency, compareSeverity, sevBg, sevClass,
 } from '@/lib/severity'
 import { formatDate, formatDaysShort, truncate } from '@/lib/format'
-import type { CaAccount, Certificate, ListResponse } from '@/lib/types'
+import { downloadText, fullChain, pemFilename } from '@/lib/download'
+import { useAuthStore } from '@/stores/auth'
+import MetadataInput from '@/components/metadata/MetadataInput.vue'
+import { formatMetadataValue } from '@/lib/types'
+import type { CaAccount, Certificate, ListResponse, MetadataField } from '@/lib/types'
 
 const api = useApi()
+const auth = useAuthStore()
 
 const certs = useAsyncData<ListResponse<Certificate>>((s) =>
   api.get<ListResponse<Certificate>>('/api/v1/certificates', s),
@@ -23,12 +28,63 @@ const certs = useAsyncData<ListResponse<Certificate>>((s) =>
 const accounts = useAsyncData<ListResponse<CaAccount>>((s) =>
   api.get<ListResponse<CaAccount>>('/api/v1/ca-accounts', s),
 )
+// Archived fields included: a certificate may hold a value for one, and without
+// the definition the panel could only print the raw stored value with no label.
+const metaFields = useAsyncData<ListResponse<MetadataField>>((s) =>
+  api.get<ListResponse<MetadataField>>('/api/v1/metadata-fields?include_archived=true', s),
+)
 
 const certificates = computed(() => certs.data.value?.data ?? [])
 const caAccounts = computed(() => accounts.data.value?.data ?? [])
+const allFields = computed(() => metaFields.data.value?.data ?? [])
+/** Offered on new certificates and in the editor. */
+const liveFields = computed(() => allFields.value.filter((f) => !f.is_archived))
 
 const searchQuery = ref('')
 const filterStatus = ref<'all' | 'ok' | 'warning' | 'critical'>('all')
+
+/**
+ * Metadata filters, one selected value per field.
+ *
+ * The reason for letting people define fields at all: an inventory you cannot
+ * slice is a list. Applied client-side over the already-fetched list, like the
+ * search box beside it.
+ */
+const metaFilter = ref<Record<string, string>>({})
+
+const activeMetaFilters = computed(() =>
+  Object.entries(metaFilter.value).filter(([, v]) => v !== ''),
+)
+
+function clearMetaFilters() {
+  metaFilter.value = {}
+}
+
+/** Distinct answers actually present, so a filter never offers an empty result. */
+function answersInUse(field: MetadataField): { value: string; label: string }[] {
+  const seen = new Set<string>()
+  for (const cert of certificates.value) {
+    const raw = cert.metadata?.[field.key]
+    if (raw === undefined || raw === null || raw === '') continue
+    for (const v of Array.isArray(raw) ? raw : [raw]) seen.add(String(v))
+  }
+  return [...seen]
+    .map((value) => ({
+      value,
+      label: field.options.find((o) => o.value === value)?.label
+        ?? (field.field_type === 'BOOLEAN' ? (value === 'true' ? 'Yes' : 'No') : value),
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label))
+}
+
+function matchesMetadata(cert: Certificate): boolean {
+  return activeMetaFilters.value.every(([key, wanted]) => {
+    const raw = cert.metadata?.[key]
+    if (raw === undefined || raw === null) return false
+    if (Array.isArray(raw)) return raw.map(String).includes(wanted)
+    return String(raw) === wanted
+  })
+}
 
 // Filters group by severity rather than by exact status: an operator scanning
 // for trouble wants "everything critical", not to remember that REVOKED and
@@ -44,7 +100,7 @@ const filtered = computed(() => {
         (c.serial_number ?? '').toLowerCase().includes(q)
       const matchesStatus =
         filterStatus.value === 'all' || certUrgency(c) === filterStatus.value
-      return matchesSearch && matchesStatus
+      return matchesSearch && matchesStatus && matchesMetadata(c)
     })
     .sort((a, b) => {
       const bySeverity = compareSeverity(certUrgency(a), certUrgency(b))
@@ -78,6 +134,8 @@ const blankRequest = () => ({
   team: '',
   auto_renew: true,
 })
+/** Values being entered on the request form, keyed by field key. */
+const reqMeta = ref<Record<string, unknown>>({})
 const reqForm = ref(blankRequest())
 
 // RSA and ECDSA have entirely different meaningful key sizes; offering 2048 for
@@ -104,9 +162,11 @@ async function requestCert() {
       environment: reqForm.value.environment || undefined,
       team: reqForm.value.team || undefined,
       auto_renew: reqForm.value.auto_renew,
+      metadata: reqMeta.value,
     })
     showRequest.value = false
     reqForm.value = blankRequest()
+    reqMeta.value = {}
     await certs.refresh()
   } catch (err) {
     requestError.value = err instanceof Error ? err.message : String(err)
@@ -135,6 +195,206 @@ async function renewCert(cert: Certificate) {
 }
 
 const selected = ref<Certificate | null>(null)
+
+// ── Exporting ─────────────────────────────────────────────
+
+const exportError = ref<string | null>(null)
+const exportingKey = ref(false)
+
+/**
+ * Whether an export can succeed.
+ *
+ * Read from key_custody rather than from provenance. A CSR-signed certificate
+ * is `REQUESTED` like every other one and CertPilot holds no key for it, so a
+ * button keyed off `discovered_via` would offer a download that can only 404 —
+ * and on this of all operations, an offer that fails is worse than no offer.
+ */
+function holdsKey(cert: Certificate): boolean {
+  return cert.key_custody === 'CERTPILOT'
+}
+
+/** Why the key cannot be exported, in the terms the reader needs. */
+function keyCustodyNote(cert: Certificate): string {
+  switch (cert.key_custody) {
+    case 'AGENT':
+      return 'The key was generated on the host that uses it and has never left. CertPilot cannot produce it.'
+    case 'CERTPILOT':
+      return 'Sealed in the database. Exporting is admin-only and writes an audit record.'
+    default:
+      return 'Issued from a signing request or imported — the key never reached CertPilot.'
+  }
+}
+
+async function exportPrivateKey(cert: Certificate) {
+  exportingKey.value = true
+  exportError.value = null
+  try {
+    const res = await api.get<{ common_name: string; private_key_pem: string }>(
+      `/api/v1/certificates/${cert.id}/private-key`,
+    )
+    // Fetched on demand and never held in component state: a key parked in a
+    // reactive ref survives in the heap and in the devtools inspector for as
+    // long as the page is open.
+    downloadText(pemFilename(cert.common_name, 'key'), res.private_key_pem)
+  } catch (err) {
+    exportError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    exportingKey.value = false
+  }
+}
+
+/**
+ * The list view omits the PEM, so a download needs the full record.
+ *
+ * Fetching it here rather than widening the list query keeps the certificate
+ * bodies out of a response that returns every certificate in the estate.
+ */
+async function withPEM(cert: Certificate): Promise<Certificate> {
+  if (cert.certificate_pem) return cert
+  return api.get<Certificate>(`/api/v1/certificates/${cert.id}`)
+}
+
+async function exportPEM(cert: Certificate, what: 'cert' | 'chain' | 'fullchain') {
+  exportError.value = null
+  try {
+    const full = await withPEM(cert)
+    if (!full.certificate_pem) throw new Error('no certificate body is stored for this record')
+    switch (what) {
+      case 'cert':
+        downloadText(pemFilename(full.common_name, 'crt'), full.certificate_pem)
+        break
+      case 'chain':
+        if (!full.chain_pem) throw new Error('no issuer chain is stored for this certificate')
+        downloadText(pemFilename(full.common_name, 'chain.crt'), full.chain_pem)
+        break
+      case 'fullchain':
+        downloadText(
+          pemFilename(full.common_name, 'fullchain.crt'),
+          fullChain(full.certificate_pem, full.chain_pem),
+        )
+        break
+    }
+  } catch (err) {
+    exportError.value = err instanceof Error ? err.message : String(err)
+  }
+}
+
+// ── Editing what an operator owns ─────────────────────────
+
+/**
+ * A certificate record has two halves, and only one of them is anybody's to
+ * change. Serial, fingerprint, expiry and renewal state are facts the CA
+ * established; environment, team, tags and the custom fields are decisions
+ * somebody made and may need to correct. Until now there was no way to correct
+ * any of them — a certificate outlives the team that requested it, and a record
+ * that cannot be fixed becomes a record nobody trusts.
+ */
+const editingMeta = ref(false)
+const savingMeta = ref(false)
+const metaError = ref<string | null>(null)
+const metaDraft = ref<{
+  environment: string
+  team: string
+  tags: string
+  metadata: Record<string, unknown>
+}>({ environment: '', team: '', tags: '', metadata: {} })
+
+function startEditMeta(cert: Certificate) {
+  metaError.value = null
+  editingMeta.value = true
+  metaDraft.value = {
+    environment: cert.environment ?? '',
+    team: cert.team ?? '',
+    tags: (cert.tags ?? []).join(', '),
+    metadata: { ...(cert.metadata ?? {}) },
+  }
+}
+
+async function saveMeta(cert: Certificate) {
+  savingMeta.value = true
+  metaError.value = null
+  try {
+    // Only what this form owns is sent. The endpoint leaves an omitted field
+    // alone, so a stale tab cannot blank something it never displayed.
+    const updated = await api.patch<Certificate>(`/api/v1/certificates/${cert.id}`, {
+      environment: metaDraft.value.environment,
+      team: metaDraft.value.team,
+      tags: metaDraft.value.tags.split(',').map((t) => t.trim()).filter(Boolean),
+      metadata: metaDraft.value.metadata,
+    })
+    selected.value = updated
+    editingMeta.value = false
+    await certs.refresh()
+  } catch (err) {
+    metaError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    savingMeta.value = false
+  }
+}
+
+/** Fields with a value on this certificate, archived ones included. */
+function answeredFields(cert: Certificate): MetadataField[] {
+  return allFields.value.filter((f) => {
+    const v = cert.metadata?.[f.key]
+    return v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && !v.length)
+  })
+}
+
+// ── Signing an existing request ───────────────────────────
+
+/**
+ * Two ways to get a certificate, and they are genuinely different operations.
+ *
+ * "Generate" has CertPilot produce the key and keep it. "Sign" takes a request
+ * whose key was made somewhere else — an HSM, a load balancer, a team whose
+ * policy forbids a key leaving their host — and never sees the secret at all.
+ * Presenting the second as an option on the first would hide that the choice
+ * decides who holds the key for the certificate's whole life.
+ */
+type RequestMode = 'generate' | 'sign'
+const requestMode = ref<RequestMode>('generate')
+const csrText = ref('')
+
+function setMode(mode: RequestMode) {
+  requestMode.value = mode
+  requestError.value = null
+}
+
+async function readCSRFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  csrText.value = await file.text()
+  input.value = ''
+}
+
+/** Names and key come from the request itself, so those fields are not asked for. */
+async function signCSR() {
+  requesting.value = true
+  requestError.value = null
+  try {
+    await api.post('/api/v1/certificates', {
+      csr_pem: csrText.value,
+      ca_account_id: reqForm.value.ca_account_id,
+      validity_days: Number(reqForm.value.validity_days),
+      environment: reqForm.value.environment || undefined,
+      team: reqForm.value.team || undefined,
+      metadata: reqMeta.value,
+      // Renewal needs a key to produce a new certificate with, and there is no
+      // key here. Offering it would schedule a renewal that can only fail.
+      auto_renew: false,
+    })
+    showRequest.value = false
+    csrText.value = ''
+    reqForm.value = blankRequest()
+    reqMeta.value = {}
+    await certs.refresh()
+  } catch (err) {
+    requestError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    requesting.value = false
+  }
+}
 </script>
 
 
@@ -202,6 +462,34 @@ const selected = ref<Certificate | null>(null)
             placeholder="Common name, SAN, or serial"
           />
         </label>
+      </div>
+
+      <!-- Slicing by what this organisation defined. Only fields that some
+           certificate actually answers are offered, so a filter never presents
+           a choice that can only return nothing. -->
+      <div v-if="liveFields.length" class="meta-filter">
+        <template v-for="field in liveFields" :key="field.id">
+          <label v-if="answersInUse(field).length" class="meta-filter-item">
+            <span class="label-micro">{{ field.label }}</span>
+            <select
+              class="input-console"
+              :value="metaFilter[field.key] ?? ''"
+              @change="metaFilter[field.key] = ($event.target as HTMLSelectElement).value"
+            >
+              <option value="">Any</option>
+              <option v-for="a in answersInUse(field)" :key="a.value" :value="a.value">
+                {{ a.label }}
+              </option>
+            </select>
+          </label>
+        </template>
+        <button
+          v-if="activeMetaFilters.length"
+          class="btn-console self-end"
+          @click="clearMetaFilters"
+        >
+          Clear
+        </button>
       </div>
 
       <!-- Table beside detail rather than a modal over it. A modal makes you
@@ -305,6 +593,138 @@ const selected = ref<Certificate | null>(null)
               />
             </div>
 
+            <!-- Export. The reason most people open this panel, so it is above
+                 the metadata rather than buried under it. -->
+            <div class="export">
+              <div class="export-row">
+                <button class="btn-console" @click="exportPEM(selected, 'fullchain')">
+                  <Download class="w-3 h-3" /> Full chain
+                </button>
+                <button class="btn-console" @click="exportPEM(selected, 'cert')">
+                  <Download class="w-3 h-3" /> Certificate
+                </button>
+                <button
+                  class="btn-console"
+                  :disabled="!selected.chain_pem && !!selected.certificate_pem"
+                  @click="exportPEM(selected, 'chain')"
+                >
+                  <Download class="w-3 h-3" /> Chain
+                </button>
+              </div>
+              <!-- Named because it is the one people get wrong by hand: nginx
+                   and HAProxy want leaf first, issuers after, in one file. -->
+              <p class="field-help">
+                Full chain is leaf then issuers — what nginx and HAProxy expect.
+              </p>
+
+              <div class="export-key">
+                <button
+                  v-if="holdsKey(selected) && auth.isAdmin"
+                  class="btn-console"
+                  :disabled="exportingKey"
+                  @click="exportPrivateKey(selected)"
+                >
+                  <KeyRound class="w-3 h-3" />
+                  {{ exportingKey ? 'Exporting…' : 'Private key' }}
+                </button>
+                <!-- Both refusals are stated, and they are different facts. One
+                     is "you may not"; the other is "nobody can". Rendering them
+                     as the same greyed-out button would let an operator spend an
+                     afternoon chasing a permission that would not have helped. -->
+                <span v-else-if="holdsKey(selected)" class="export-refusal">
+                  Private key export is admin-only
+                </span>
+                <span v-else class="export-refusal">No private key to export</span>
+                <span class="field-help">{{ keyCustodyNote(selected) }}</span>
+              </div>
+
+              <p v-if="exportError" role="alert" class="export-error">{{ exportError }}</p>
+            </div>
+
+            <!-- Metadata, above the immutable facts. It is the part somebody
+                 came here to change; the serial is not. -->
+            <div class="meta-block">
+              <div class="meta-head">
+                <span class="label-rail">Metadata</span>
+                <button
+                  v-if="!editingMeta && auth.canWrite"
+                  class="btn-console"
+                  @click="startEditMeta(selected)"
+                >
+                  Edit
+                </button>
+              </div>
+
+              <p v-if="metaError" role="alert" class="export-error">{{ metaError }}</p>
+
+              <template v-if="editingMeta">
+                <div class="grid gap-2 sm:grid-cols-2">
+                  <div class="field">
+                    <label class="label-micro" for="ed-env">Environment</label>
+                    <select id="ed-env" v-model="metaDraft.environment" class="input-console">
+                      <option value="">— not set —</option>
+                      <option value="production">production</option>
+                      <option value="staging">staging</option>
+                      <option value="development">development</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label class="label-micro" for="ed-team">Owning team</label>
+                    <input id="ed-team" v-model="metaDraft.team" type="text" class="input-console" />
+                  </div>
+                </div>
+                <div class="field">
+                  <label class="label-micro" for="ed-tags">Tags</label>
+                  <input id="ed-tags" v-model="metaDraft.tags" type="text" class="input-console" />
+                  <p class="field-help">Comma separated.</p>
+                </div>
+
+                <MetadataInput
+                  v-for="field in liveFields"
+                  :key="field.id"
+                  :field="field"
+                  :model-value="metaDraft.metadata[field.key]"
+                  @update:model-value="metaDraft.metadata[field.key] = $event"
+                />
+
+                <div class="flex justify-end gap-2">
+                  <button class="btn-console" @click="editingMeta = false">Cancel</button>
+                  <button
+                    class="btn-console"
+                    data-variant="signal"
+                    :disabled="savingMeta"
+                    @click="saveMeta(selected)"
+                  >
+                    {{ savingMeta ? 'Saving…' : 'Save' }}
+                  </button>
+                </div>
+              </template>
+
+              <dl v-else class="detail-list">
+                <div>
+                  <dt class="label-micro">Environment</dt>
+                  <dd>{{ selected.environment || '—' }}</dd>
+                </div>
+                <div>
+                  <dt class="label-micro">Team</dt>
+                  <dd>{{ selected.team || '—' }}</dd>
+                </div>
+                <div v-if="selected.tags?.length" class="detail-wide">
+                  <dt class="label-micro">Tags</dt>
+                  <dd>{{ selected.tags.join(', ') }}</dd>
+                </div>
+                <div v-for="field in answeredFields(selected)" :key="field.id">
+                  <dt class="label-micro">
+                    {{ field.label }}
+                    <span v-if="field.is_archived" class="sev-unknown">(archived)</span>
+                  </dt>
+                  <!-- The label, never the stored value: tier_1 is what the
+                       database holds and "Tier 1" is what it means. -->
+                  <dd>{{ formatMetadataValue(field, selected.metadata?.[field.key]) }}</dd>
+                </div>
+              </dl>
+            </div>
+
             <dl class="detail-list">
               <div class="detail-wide">
                 <dt class="label-micro">Subject alternative names</dt>
@@ -317,6 +737,18 @@ const selected = ref<Certificate | null>(null)
               <div>
                 <dt class="label-micro">Key</dt>
                 <dd>{{ selected.key_type }}-{{ selected.key_size }}</dd>
+              </div>
+              <div>
+                <dt class="label-micro">Key held by</dt>
+                <dd>
+                  {{
+                    selected.key_custody === 'CERTPILOT'
+                      ? 'CertPilot'
+                      : selected.key_custody === 'AGENT'
+                        ? 'The host'
+                        : 'Elsewhere'
+                  }}
+                </dd>
               </div>
               <div>
                 <dt class="label-micro">Renewals</dt>
@@ -357,35 +789,95 @@ const selected = ref<Certificate | null>(null)
     <!-- Request. A modal is right here: it is a create action with its own
          validity, not a thing to compare against the list behind it. -->
     <div v-if="showRequest" class="modal-scrim" @click.self="showRequest = false">
-      <PanelBox label="Request certificate" class="modal-panel">
+      <PanelBox label="New certificate" class="modal-panel">
         <div v-if="requestError" role="alert" class="action-error mb-3">
           <CircleX class="w-3.5 h-3.5 shrink-0 sev-critical" />
           <span>{{ requestError }}</span>
         </div>
 
-        <form class="flex flex-col gap-2.5" @submit.prevent="requestCert">
-          <div class="field">
-            <label class="label-micro" for="cn">Common name</label>
-            <input
-              id="cn"
-              v-model="reqForm.common_name"
-              type="text"
-              required
-              placeholder="app.example.com"
-              class="input-console"
-            />
-          </div>
+        <!-- Two operations, not one with an option. The choice decides who
+             holds the private key for the certificate's whole life, which is
+             not a detail to bury inside a form. -->
+        <div class="mode-switch">
+          <button
+            type="button"
+            class="mode-option"
+            :data-active="requestMode === 'generate' || undefined"
+            @click="setMode('generate')"
+          >
+            <KeyRound class="w-3.5 h-3.5" />
+            <span class="mode-title">Generate a key</span>
+            <span class="mode-note">CertPilot creates the key and seals it here</span>
+          </button>
+          <button
+            type="button"
+            class="mode-option"
+            :data-active="requestMode === 'sign' || undefined"
+            @click="setMode('sign')"
+          >
+            <FileSignature class="w-3.5 h-3.5" />
+            <span class="mode-title">Sign a request</span>
+            <span class="mode-note">Your key stays where it is — CertPilot never sees it</span>
+          </button>
+        </div>
 
-          <div class="field">
-            <label class="label-micro" for="sans">Additional names — comma separated</label>
-            <input
-              id="sans"
-              v-model="reqForm.sans"
-              type="text"
-              placeholder="www.example.com, api.example.com"
-              class="input-console"
-            />
-          </div>
+        <form
+          class="flex flex-col gap-2.5"
+          @submit.prevent="requestMode === 'sign' ? signCSR() : requestCert()"
+        >
+          <template v-if="requestMode === 'sign'">
+            <div class="field">
+              <label class="label-micro" for="csr">Signing request</label>
+              <p class="field-help">
+                The names, key type and key size are read from the request itself, so they are
+                not asked for here.
+              </p>
+              <textarea
+                id="csr"
+                v-model="csrText"
+                required
+                rows="7"
+                spellcheck="false"
+                placeholder="-----BEGIN CERTIFICATE REQUEST-----"
+                class="input-console csr-input"
+              ></textarea>
+              <div class="flex items-center gap-2 flex-wrap">
+                <label class="btn-console cursor-pointer">
+                  Load .csr file
+                  <input type="file" accept=".csr,.pem,.req,.txt" class="hidden" @change="readCSRFile" />
+                </label>
+                <span class="field-help" data-tone="warning">
+                  Never paste a private key here — the server refuses it and logs the attempt.
+                </span>
+              </div>
+            </div>
+          </template>
+
+          <template v-else>
+            <div class="field">
+              <label class="label-micro" for="cn">Common name</label>
+              <input
+                id="cn"
+                v-model="reqForm.common_name"
+                type="text"
+                required
+                placeholder="app.example.com"
+                class="input-console"
+              />
+            </div>
+
+            <div class="field">
+              <label class="label-micro" for="sans">Additional names</label>
+              <p class="field-help">Comma separated.</p>
+              <input
+                id="sans"
+                v-model="reqForm.sans"
+                type="text"
+                placeholder="www.example.com, api.example.com"
+                class="input-console"
+              />
+            </div>
+          </template>
 
           <div class="field">
             <label class="label-micro" for="ca-account">Issue from</label>
@@ -395,13 +887,13 @@ const selected = ref<Certificate | null>(null)
                 {{ acc.name }} ({{ acc.provider_type }})
               </option>
             </select>
-            <p v-if="accounts.loaded.value && !caAccounts.length" class="label-micro sev-warning">
+            <p v-if="accounts.loaded.value && !caAccounts.length" class="field-help" data-tone="warning">
               No CA accounts configured — add one on the Gateways page first.
             </p>
           </div>
 
-          <div class="grid grid-cols-3 gap-2">
-            <div class="field">
+          <div class="grid gap-2" :class="requestMode === 'sign' ? 'grid-cols-1' : 'grid-cols-3'">
+            <div v-if="requestMode !== 'sign'" class="field">
               <label class="label-micro" for="kt">Key type</label>
               <select
                 id="kt"
@@ -413,7 +905,7 @@ const selected = ref<Certificate | null>(null)
                 <option value="RSA">RSA</option>
               </select>
             </div>
-            <div class="field">
+            <div v-if="requestMode !== 'sign'" class="field">
               <label class="label-micro" for="ks">Key size</label>
               <select id="ks" v-model="reqForm.key_size" class="input-console">
                 <option v-for="size in keySizeOptions" :key="size" :value="size">{{ size }}</option>
@@ -455,15 +947,37 @@ const selected = ref<Certificate | null>(null)
             </div>
           </div>
 
-          <label class="flex items-center gap-2 cursor-pointer" style="font-size: var(--fs-small)">
+          <!-- Whatever this organisation decided it needs to know. Required
+               ones are enforced by the server at issuance. -->
+          <MetadataInput
+            v-for="field in liveFields"
+            :key="field.id"
+            :field="field"
+            :model-value="reqMeta[field.key]"
+            @update:model-value="reqMeta[field.key] = $event"
+          />
+
+          <label
+            v-if="requestMode !== 'sign'"
+            class="flex items-center gap-2 cursor-pointer"
+            style="font-size: var(--fs-small)"
+          >
             <input v-model="reqForm.auto_renew" type="checkbox" />
             Renew automatically before expiry
           </label>
+          <!-- Automatic renewal needs a key to build the next certificate with,
+               and there is none here. Offering the checkbox would schedule a
+               renewal that can only fail, months from now, unattended. -->
+          <p v-else class="field-help">
+            Automatic renewal is unavailable: renewing needs the private key, which stays with
+            you. Send a new request before this one expires.
+          </p>
 
           <div class="flex justify-end gap-2 pt-1">
             <button type="button" class="btn-console" @click="showRequest = false">Cancel</button>
             <button type="submit" class="btn-console" data-variant="signal" :disabled="requesting">
-              {{ requesting ? 'Requesting…' : 'Request' }}
+              <template v-if="requesting">Working…</template>
+              <template v-else>{{ requestMode === 'sign' ? 'Sign request' : 'Request' }}</template>
             </button>
           </div>
         </form>
@@ -654,10 +1168,149 @@ const selected = ref<Certificate | null>(null)
   max-width: 30rem;
 }
 
+.meta-filter {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 0.625rem;
+  background: var(--ink-panel);
+  border: 1px solid var(--line);
+}
+
+.meta-filter-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+/* A select sizes to its widest option, so a field whose answers are all short
+   collapses to a box narrower than its own label. */
+.meta-filter-item select {
+  min-width: 9rem;
+}
+
+.meta-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  background: var(--ink-raised);
+  border: 1px solid var(--line);
+}
+
+.meta-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
 .field {
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
   min-width: 0;
+}
+
+.mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  margin-bottom: 0.75rem;
+}
+
+.mode-option {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-areas: 'icon title' 'icon note';
+  align-items: center;
+  gap: 0.1rem 0.5rem;
+  padding: 0.5rem 0.625rem;
+  text-align: left;
+  background: var(--ink-panel);
+  border: 0;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.mode-option > svg {
+  grid-area: icon;
+}
+
+.mode-option:hover {
+  background: var(--ink-hover);
+}
+
+.mode-option[data-active] {
+  color: var(--text-primary);
+  background: var(--ink-raised);
+  box-shadow: inset 0 -2px 0 0 var(--signal);
+}
+
+.mode-title {
+  grid-area: title;
+  font-size: var(--fs-small);
+  font-weight: 600;
+}
+
+.mode-note {
+  grid-area: note;
+  font-size: var(--fs-micro);
+  color: var(--text-muted);
+  line-height: 1.3;
+}
+
+.csr-input {
+  font-size: var(--fs-micro);
+  line-height: 1.4;
+  resize: vertical;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+.export {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  padding: 0.5rem;
+  background: var(--ink-raised);
+  border: 1px solid var(--line);
+}
+
+.export-row {
+  display: flex;
+  gap: 0.375rem;
+  flex-wrap: wrap;
+}
+
+.export-key {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  align-items: flex-start;
+  padding-top: 0.375rem;
+  border-top: 1px solid var(--line);
+}
+
+.export-note {
+  font-size: var(--fs-micro);
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
+.export-refusal {
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.export-error {
+  font-size: var(--fs-micro);
+  color: var(--sev-critical);
+  word-break: break-word;
 }
 </style>

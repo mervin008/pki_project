@@ -57,3 +57,24 @@ func normalizeEnvironment(environment string) (string, error) {
 		"environment %q is not one of %s. Refusing here rather than at the database, because by then the CA has already issued a certificate that nothing would have a record of",
 		environment, strings.Join(certificateEnvironments, ", "))
 }
+
+// dedupeNames removes repeats while preserving order, comparing without regard
+// to case because DNS names are case-insensitive and "APP.example.com" and
+// "app.example.com" are one name.
+func dedupeNames(names []string) []string {
+	seen := make(map[string]bool, len(names))
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		key := strings.ToLower(n)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, n)
+	}
+	return out
+}

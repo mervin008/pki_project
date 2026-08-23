@@ -47,7 +47,17 @@ frontend/dist/
 frontend/.vite/
 
 # ── Tooling ──────────────────────────────────────────────
-.claude/
+# Ignored by contents rather than as a directory: git does not descend into an
+# ignored directory, so a negation inside one never takes effect.
+#
+# The exception is this project's own skill. It is the working knowledge of the
+# codebase — how to run it, how to verify it, and the defects that shaped its
+# invariants — and it is only worth writing if it reaches whoever works here
+# next. Everything else under .claude/ is a local collection of unrelated skills.
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/certpilot-dev/
 .idea/
 .vscode/
 *.swp

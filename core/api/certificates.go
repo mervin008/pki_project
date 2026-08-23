@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/certpilot/certpilot/core/engine/policy"
@@ -93,16 +94,35 @@ func (h *CertificateHandler) Get(c *gin.Context) {
 
 // RequestCertificateInput defines the payload to request a new certificate.
 type RequestCertificateInput struct {
-	CommonName      string   `json:"common_name" binding:"required"`
-	SANs            []string `json:"sans"`
-	CAAccountID     string   `json:"ca_account_id" binding:"required"`
-	KeyType         string   `json:"key_type"`
-	KeySize         int      `json:"key_size"`
-	ValidityDays    int      `json:"validity_days"`
-	Environment     string   `json:"environment"`
-	Team            string   `json:"team"`
-	AutoRenew       bool     `json:"auto_renew"`
-	RenewalLeadDays int      `json:"renewal_lead_days"`
+	// CommonName is required unless CSRPEM is supplied, in which case the names
+	// come from the request itself. Validated below rather than by a binding
+	// tag, which cannot express "one of these two".
+	CommonName  string   `json:"common_name"`
+	SANs        []string `json:"sans"`
+	CAAccountID string   `json:"ca_account_id" binding:"required"`
+
+	// CSRPEM is a certificate signing request whose private key was generated
+	// somewhere else and never sent here.
+	//
+	// This is the path for the keys CertPilot must not hold: an HSM, a load
+	// balancer that generates its own, a team whose policy forbids a key
+	// leaving their host. The names, key type and key size are taken from the
+	// request and the corresponding fields above are ignored, because the only
+	// key that can serve the certificate is the one the requester already has —
+	// honouring a conflicting key_type here would issue a certificate nobody
+	// can use.
+	CSRPEM string `json:"csr_pem"`
+
+	KeyType         string `json:"key_type"`
+	KeySize         int    `json:"key_size"`
+	ValidityDays    int    `json:"validity_days"`
+	Environment     string `json:"environment"`
+	Team            string `json:"team"`
+	AutoRenew       bool   `json:"auto_renew"`
+	RenewalLeadDays int    `json:"renewal_lead_days"`
+	// Metadata holds values for the admin-defined fields. Required ones are
+	// enforced at request time.
+	Metadata map[string]any `json:"metadata"`
 }
 
 // Create handles POST /api/v1/certificates (Requests and issues a new certificate).
@@ -120,6 +140,44 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 	}
 	input.Environment = environment
 
+	// A signing request, when there is one, is the authority on what is being
+	// asked for. Parsed first so the policy engine and the gateway both see the
+	// real names and the real key rather than whatever the form also sent.
+	var csrInfo *x509util.CSRInfo
+	if strings.TrimSpace(input.CSRPEM) != "" {
+		csrInfo, err = x509util.ParseCSRPEM([]byte(input.CSRPEM))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		names := csrInfo.Names()
+		input.CommonName = names[0]
+		input.SANs = names[1:]
+		input.KeyType = csrInfo.KeyType
+		input.KeySize = csrInfo.KeySize
+	}
+
+	if input.CommonName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "common_name is required when no csr_pem is supplied",
+		})
+		return
+	}
+
+	// Required fields are enforced here and only here: at the moment somebody
+	// asks for a certificate, which is when the organisation gets to insist on
+	// a cost centre or a change ticket.
+	metadataFields, err := h.store.ListMetadataFields(c.Request.Context(), false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	cleanedMetadata, err := validateMetadata(metadataFields, input.Metadata, true)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	if input.KeyType == "" {
 		input.KeyType = "RSA"
 	}
@@ -133,7 +191,14 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		input.RenewalLeadDays = 30
 	}
 
-	allDomains := append([]string{input.CommonName}, input.SANs...)
+	// Deduplicated, case-insensitively.
+	//
+	// CAB Forum rules require the common name to also appear as a SAN, so
+	// nearly every client sends it in both fields — and the certificate came
+	// back listing the same name twice, which the inventory then reported as
+	// "one extra name". Harmless in the certificate, wrong on every screen
+	// that counts them.
+	allDomains := dedupeNames(append([]string{input.CommonName}, input.SANs...))
 
 	// 1. Fetch CA account
 	caAccount, err := h.store.GetCAAccount(c.Request.Context(), input.CAAccountID)
@@ -189,6 +254,11 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		ValidityDays:   int32(input.ValidityDays),
 		ProviderConfig: providerConfig,
 	}
+	if csrInfo != nil {
+		// With a CSR present the gateway signs the key it was given instead of
+		// generating one, so no private key comes back and none is stored.
+		issueReq.CsrPem = []byte(input.CSRPEM)
+	}
 
 	resp, err := gw.Client.IssueCertificate(c.Request.Context(), issueReq)
 	if err != nil {
@@ -242,6 +312,11 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 	certPEM := string(resp.Certificate.CertificatePem)
 	notBefore, notAfter := info.NotBefore, info.NotAfter
 
+	keyCustody := store.KeyCustodyExternal
+	if privateKey != nil {
+		keyCustody = store.KeyCustodyCertPilot
+	}
+
 	certRecord := &store.Certificate{
 		FingerprintSHA256:   info.FingerprintSHA256,
 		CommonName:          info.CommonName,
@@ -264,6 +339,11 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		Environment:         input.Environment,
 		Team:                input.Team,
 		CreatedBy:           createdBy,
+		Metadata:            cleanedMetadata,
+		// Stated rather than inferred. A CSR-signed certificate is REQUESTED
+		// like any other, so provenance cannot answer "do we hold the key" —
+		// and that is the question deciding whether an export is even offered.
+		KeyCustody: keyCustody,
 	}
 
 	if err := h.store.CreateCertificate(c.Request.Context(), certRecord); err != nil {
@@ -279,8 +359,9 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		EntityID:   &certRecord.ID,
 		ActorID:    createdBy,
 		ActorEmail: &userEmail,
-		Details: fmt.Sprintf(`{"cn": %q, "gateway": %q, "serial": %q, "not_after": %q}`,
-			certRecord.CommonName, gw.Name, certRecord.SerialNumber, notAfter.Format(time.RFC3339)),
+		Details: fmt.Sprintf(`{"cn": %q, "gateway": %q, "serial": %q, "not_after": %q, "key_custody": %q}`,
+			certRecord.CommonName, gw.Name, certRecord.SerialNumber,
+			notAfter.Format(time.RFC3339), keyCustody),
 	})
 
 	h.broker.Publish(events.Event{
@@ -296,14 +377,115 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		},
 	})
 
-	if len(violations) > 0 {
+	var warnings []string
+	if csrInfo != nil {
+		if dropped := csrInfo.DroppedNames(); len(dropped) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"the signing request asked for %s, which this issuance path does not carry; the certificate covers DNS names only",
+				strings.Join(dropped, ", ")))
+		}
+	}
+
+	if len(violations) > 0 || len(warnings) > 0 {
 		// Non-blocking violations were allowed through, so the response has to
 		// say so — silently discarding them makes a policy that reports
 		// nothing indistinguishable from a policy that found nothing.
-		c.JSON(http.StatusCreated, gin.H{"certificate": certRecord, "policy_violations": violations})
+		body := gin.H{"certificate": certRecord}
+		if len(violations) > 0 {
+			body["policy_violations"] = violations
+		}
+		if len(warnings) > 0 {
+			body["warnings"] = warnings
+		}
+		c.JSON(http.StatusCreated, body)
 		return
 	}
 	c.JSON(http.StatusCreated, certRecord)
+}
+
+// UpdateMetadataInput is what an operator may change on a certificate.
+//
+// Pointers, so an omitted field is left alone rather than cleared. A form that
+// edits only the team must not blank the environment, and a client that knows
+// about three of these fields must not erase the fourth.
+type UpdateMetadataInput struct {
+	Environment *string        `json:"environment"`
+	Team        *string        `json:"team"`
+	Tags        *[]string      `json:"tags"`
+	Metadata    map[string]any `json:"metadata"`
+}
+
+// UpdateMetadata handles PATCH /api/v1/certificates/:id.
+//
+// The only mutable part of a certificate record. Everything else on it —
+// serial, fingerprint, expiry, renewal state — is a fact about the certificate
+// rather than a decision about it, and none of those are a person's to edit.
+func (h *CertificateHandler) UpdateMetadata(c *gin.Context) {
+	id := c.Param("id")
+
+	existing, err := h.store.GetCertificate(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	var input UpdateMetadataInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	update := store.CertificateMetadataUpdate{Tags: input.Tags}
+
+	if input.Environment != nil {
+		environment, err := normalizeEnvironment(*input.Environment)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		update.Environment = &environment
+	}
+	if input.Team != nil {
+		team := strings.TrimSpace(*input.Team)
+		update.Team = &team
+	}
+
+	if input.Metadata != nil {
+		fields, err := h.store.ListMetadataFields(c.Request.Context(), true)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		// Required is not enforced here. Marking a field required later must
+		// not make every existing certificate unsaveable — an operator would
+		// be unable to correct the team on a certificate because of an
+		// unrelated new field somebody added this morning.
+		cleaned, err := validateMetadata(fields, input.Metadata, false)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		update.Metadata = cleaned
+	}
+
+	updated, err := h.store.UpdateCertificateMetadata(c.Request.Context(), id, update)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	actorID := c.GetString(middleware.ContextUserID)
+	actorEmail := c.GetString(middleware.ContextUserEmail)
+	_ = h.store.CreateAuditLog(c.Request.Context(), &store.AuditLog{
+		Action:     "cert.metadata_updated",
+		EntityType: "certificate",
+		EntityID:   &existing.ID,
+		ActorID:    &actorID,
+		ActorEmail: &actorEmail,
+		Details:    fmt.Sprintf(`{"cn": %q}`, existing.CommonName),
+	})
+
+	c.JSON(http.StatusOK, updated)
 }
 
 // Renew handles POST /api/v1/certificates/:id/renew.

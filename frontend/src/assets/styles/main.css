@@ -287,6 +287,28 @@
     font-weight: 500;
   }
 
+  /*
+   * Help text: a sentence, not a heading.
+   *
+   * label-micro tracks and uppercases, which is right above a figure and wrong
+   * for anything with a verb in it — a two-line uppercase warning about not
+   * pasting private keys is precisely the sentence a reader most needs to be
+   * able to read at a glance, and tracking it out destroys word shape. Set in
+   * the proportional face for the same reason.
+   */
+  .field-help {
+    font-family: var(--font-sans);
+    font-size: var(--fs-micro);
+    line-height: 1.4;
+    color: var(--text-muted);
+    letter-spacing: 0;
+    text-transform: none;
+  }
+
+  .field-help[data-tone='warning'] {
+    color: var(--sev-warning);
+  }
+
   .label-rail {
     font-size: var(--fs-label);
     letter-spacing: 0.18em;

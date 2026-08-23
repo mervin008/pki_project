@@ -63,6 +63,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	})
 
 	certHandler := NewCertificateHandler(deps.Store, deps.PluginMgr, deps.RenewalExec, deps.RenewalSched, deps.PolicyEngine, deps.Keyring, deps.Broker)
+	metadataHandler := NewMetadataHandler(deps.Store)
 	renewalHandler := NewRenewalHandler(deps.Store, deps.RenewalSched, deps.ARIPoller, deps.Verifier)
 	caHandler := NewCAHandler(deps.Store, deps.CAMonitor, deps.CAImporter, deps.ChainResolver)
 	caAccHandler := NewCAAccountHandler(deps.Store, deps.PluginMgr, deps.Keyring, deps.CAImporter)
@@ -139,6 +140,9 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.GET("/certificates", certHandler.List)
 		v1.POST("/certificates", middleware.RequireRole(middleware.RoleOperator), certHandler.Create)
 		v1.GET("/certificates/:id", certHandler.Get)
+		// The only mutable part of a certificate: the decisions people record
+		// about it, not the facts the CA established.
+		v1.PATCH("/certificates/:id", middleware.RequireRole(middleware.RoleOperator), certHandler.UpdateMetadata)
 		v1.POST("/certificates/:id/renew", middleware.RequireRole(middleware.RoleOperator), certHandler.Renew)
 		// Exporting a private key is admin-only and audited: it is the one
 		// operation that removes a secret from the system's custody.
@@ -334,6 +338,16 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/notification-channels/:id/test", middleware.RequireRole(middleware.RoleOperator), notifHandler.Test)
 
 		// ── Policies ──
+		// ── Custom metadata fields ──
+		//
+		// Readable by anyone, because a viewer needs the labels to make sense of
+		// the values on a certificate. Defining them is admin-only: a required
+		// field changes what everyone else has to supply to get a certificate.
+		v1.GET("/metadata-fields", metadataHandler.List)
+		v1.POST("/metadata-fields", middleware.RequireRole(middleware.RoleAdmin), metadataHandler.Create)
+		v1.PUT("/metadata-fields/:id", middleware.RequireRole(middleware.RoleAdmin), metadataHandler.Update)
+		v1.DELETE("/metadata-fields/:id", middleware.RequireRole(middleware.RoleAdmin), metadataHandler.Archive)
+
 		v1.GET("/policies", policyHandler.List)
 		v1.GET("/policies/:id", policyHandler.Get)
 		v1.POST("/policies", middleware.RequireRole(middleware.RoleOperator), policyHandler.Create)

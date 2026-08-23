@@ -80,6 +80,12 @@ migrate: build-core
 dev:
 	./scripts/dev.sh
 
+## Fill a running CertPilot with a realistic estate: a CA hierarchy, certificates
+## across the whole expiry range, metadata fields of every type, and values on
+## every certificate. Idempotent, and deletes nothing.
+seed:
+	./scripts/seed-demo.sh
+
 run-core:
 	$(GO) run ./core/cmd/ --config=config.dev.yaml
 

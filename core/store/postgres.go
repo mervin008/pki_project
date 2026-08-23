@@ -87,7 +87,7 @@ const certificateColumns = `id, fingerprint_sha256, common_name,
 		last_renewal_attempt, renewal_error, coalesce(renewal_count, 0),
 		ca_account_id, ca_authority_id, deployment_target_id, certificate_pem, chain_pem,
 		coalesce(discovered_via, 'MANUAL'), coalesce(environment, ''), coalesce(team, ''),
-		coalesce(tags, '[]'::jsonb), created_by, created_at, updated_at,
+		coalesce(tags, '[]'::jsonb), coalesce(metadata, '{}'::jsonb), created_by, created_at, updated_at,
 		renewal_scheduled_at, ari_window_start, ari_window_end,
 		coalesce(ari_explanation_url, ''), ari_checked_at, ari_next_check_at, ari_supported,
 		coalesce(verification_state, ''), verify_after, last_verified_at,
@@ -102,13 +102,14 @@ const certificateColumns = `id, fingerprint_sha256, common_name,
 // scanCertificate reads one row of certificateColumns.
 func scanCertificate(row pgx.Row) (*Certificate, error) {
 	cert := &Certificate{}
-	var sansJSON, tagsJSON, postureJSON []byte
+	var sansJSON, tagsJSON, metadataJSON, postureJSON []byte
 	err := row.Scan(
 		&cert.ID, &cert.FingerprintSHA256, &cert.CommonName, &sansJSON, &cert.SerialNumber, &cert.IssuerDN,
 		&cert.NotBefore, &cert.NotAfter, &cert.DaysRemaining, &cert.KeyType, &cert.KeySize, &cert.Status,
 		&cert.AutoRenew, &cert.RenewalLeadDays, &cert.LastRenewalAttempt, &cert.RenewalError, &cert.RenewalCount,
 		&cert.CAAccountID, &cert.CAAuthorityID, &cert.DeploymentTargetID, &cert.CertificatePEM, &cert.ChainPEM,
-		&cert.DiscoveredVia, &cert.Environment, &cert.Team, &tagsJSON, &cert.CreatedBy, &cert.CreatedAt, &cert.UpdatedAt,
+		&cert.DiscoveredVia, &cert.Environment, &cert.Team, &tagsJSON, &metadataJSON,
+		&cert.CreatedBy, &cert.CreatedAt, &cert.UpdatedAt,
 		&cert.RenewalScheduledAt, &cert.ARIWindowStart, &cert.ARIWindowEnd,
 		&cert.ARIExplanationURL, &cert.ARICheckedAt, &cert.ARINextCheckAt, &cert.ARISupported,
 		&cert.VerificationState, &cert.VerifyAfter, &cert.LastVerifiedAt,
@@ -126,6 +127,13 @@ func scanCertificate(row pgx.Row) (*Certificate, error) {
 	}
 	if len(tagsJSON) > 0 {
 		_ = json.Unmarshal(tagsJSON, &cert.Tags)
+	}
+	// Never nil. A template indexing metadata should not need a guard, and a
+	// nil map marshals to null rather than {} — which a client then has to
+	// special-case on every read.
+	cert.Metadata = map[string]any{}
+	if len(metadataJSON) > 0 {
+		_ = json.Unmarshal(metadataJSON, &cert.Metadata)
 	}
 	cert.PostureRequirements = postureJSON
 	return cert, nil
@@ -255,10 +263,10 @@ func (s *PostgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 			auto_renew, renewal_lead_days, ca_account_id, ca_authority_id,
 			deployment_target_id, private_key_encrypted, certificate_pem, chain_pem,
 			discovered_via, environment, team, tags, created_by,
-			key_custody, key_holder_agent_id
+			key_custody, key_holder_agent_id, metadata
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-			$25, $26
+			$25, $26, $27
 		) RETURNING id, created_at, updated_at
 	`
 	return s.pool.QueryRow(ctx, query,
@@ -267,8 +275,21 @@ func (s *PostgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 		cert.AutoRenew, cert.RenewalLeadDays, cert.CAAccountID, cert.CAAuthorityID,
 		cert.DeploymentTargetID, cert.PrivateKeyEncrypted, cert.CertificatePEM, cert.ChainPEM,
 		cert.DiscoveredVia, nullIfEmpty(cert.Environment), cert.Team, tagsJSON, cert.CreatedBy,
-		custodyOrDefault(cert), cert.KeyHolderAgentID,
+		custodyOrDefault(cert), cert.KeyHolderAgentID, metadataJSON(cert.Metadata),
 	).Scan(&cert.ID, &cert.CreatedAt, &cert.UpdatedAt)
+}
+
+// metadataJSON encodes a metadata map for a jsonb column that is NOT NULL.
+// A nil map marshals to `null`, which the column refuses.
+func metadataJSON(m map[string]any) []byte {
+	if m == nil {
+		return []byte("{}")
+	}
+	encoded, err := json.Marshal(m)
+	if err != nil || len(encoded) == 0 {
+		return []byte("{}")
+	}
+	return encoded
 }
 
 func (s *PostgresStore) UpdateCertificate(ctx context.Context, cert *Certificate) error {
@@ -292,7 +313,8 @@ func (s *PostgresStore) UpdateCertificate(ctx context.Context, cert *Certificate
 			renewal_count = $17, ca_account_id = $18, ca_authority_id = $19, deployment_target_id = $20,
 			certificate_pem = $21, chain_pem = $22, environment = $23, team = $24, tags = $25,
 			private_key_encrypted = COALESCE($26::text, private_key_encrypted),
-			key_custody = $27, key_holder_agent_id = $28, updated_at = now()
+			key_custody = $27, key_holder_agent_id = $28,
+			metadata = COALESCE($29::jsonb, metadata), updated_at = now()
 		WHERE id = $1
 	`
 	// COALESCE, because both directions were wrong before.
@@ -314,8 +336,22 @@ func (s *PostgresStore) UpdateCertificate(ctx context.Context, cert *Certificate
 		cert.RenewalCount, cert.CAAccountID, cert.CAAuthorityID, cert.DeploymentTargetID,
 		cert.CertificatePEM, cert.ChainPEM, nullIfEmpty(cert.Environment), cert.Team, tagsJSON,
 		cert.PrivateKeyEncrypted, custodyOrDefault(cert), cert.KeyHolderAgentID,
+		// COALESCE for the same reason as the key above: renewal builds a record
+		// from the gateway's response and carries no metadata, so assigning
+		// unconditionally would wipe an operator's cost centre every time a
+		// certificate renewed itself.
+		nullableMetadata(cert.Metadata),
 	)
 	return err
+}
+
+// nullableMetadata returns nil when there is nothing to write, so the COALESCE
+// above preserves what is stored.
+func nullableMetadata(m map[string]any) []byte {
+	if len(m) == 0 {
+		return nil
+	}
+	return metadataJSON(m)
 }
 
 // custodyOrDefault fills in who holds the key when a caller did not say.
@@ -4743,5 +4779,149 @@ func (s *PostgresStore) UpdateCertificatePosture(ctx context.Context, id string,
 		WHERE id = $1`,
 		id, nullIfEmpty(update.Verdict), nullIfEmpty(update.Summary), requirements,
 		update.Score, update.SignatureAlgorithm, update.PublicKeyAlgorithm, assessedAt)
+	return err
+}
+
+// UpdateCertificateMetadata writes only the fields an operator owns.
+//
+// Narrow on purpose. Everything else on the row is a fact about the certificate
+// itself — serial, fingerprint, expiry, renewal state — and a full-object write
+// driven by a form is how a stale copy in a browser tab overwrites what a
+// renewal recorded thirty seconds ago. Each field is written only when the
+// caller supplied one, so a form that edits the team does not blank the
+// environment.
+func (s *PostgresStore) UpdateCertificateMetadata(
+	ctx context.Context, id string, update CertificateMetadataUpdate,
+) (*Certificate, error) {
+	var tagsJSON []byte
+	if update.Tags != nil {
+		tagsJSON, _ = json.Marshal(*update.Tags)
+	}
+
+	query := `
+		UPDATE public.certificates SET
+			environment = COALESCE($2, environment),
+			team        = COALESCE($3, team),
+			tags        = COALESCE($4::jsonb, tags),
+			metadata    = COALESCE($5::jsonb, metadata),
+			updated_at  = now()
+		WHERE id = $1
+		RETURNING ` + certificateColumns
+
+	var environment, team *string
+	if update.Environment != nil {
+		environment = update.Environment
+	}
+	if update.Team != nil {
+		team = update.Team
+	}
+
+	row := s.pool.QueryRow(ctx, query, id, environment, team,
+		nullableBytes(tagsJSON), nullableMetadata(update.Metadata))
+	return scanCertificate(row)
+}
+
+// nullableBytes keeps an unsupplied jsonb parameter NULL so COALESCE preserves
+// the stored value, rather than sending an empty byte slice PostgreSQL would
+// reject as invalid json.
+func nullableBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
+// ── Custom metadata fields ─────────────────────────────────
+
+const metadataFieldColumns = `id, key, label, field_type,
+		coalesce(options, '[]'::jsonb), display, coalesce(help_text, ''),
+		is_required, sort_order, is_archived, created_by, created_at, updated_at`
+
+func scanMetadataField(row pgx.Row) (*MetadataField, error) {
+	f := &MetadataField{}
+	var optionsJSON []byte
+	err := row.Scan(&f.ID, &f.Key, &f.Label, &f.FieldType, &optionsJSON, &f.Display,
+		&f.HelpText, &f.IsRequired, &f.SortOrder, &f.IsArchived,
+		&f.CreatedBy, &f.CreatedAt, &f.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	f.Options = []MetadataOption{}
+	if len(optionsJSON) > 0 {
+		_ = json.Unmarshal(optionsJSON, &f.Options)
+	}
+	return f, nil
+}
+
+func (s *PostgresStore) ListMetadataFields(ctx context.Context, includeArchived bool) ([]*MetadataField, error) {
+	query := `SELECT ` + metadataFieldColumns + ` FROM public.metadata_fields`
+	if !includeArchived {
+		query += ` WHERE is_archived = false`
+	}
+	query += ` ORDER BY sort_order, label`
+
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	fields := []*MetadataField{}
+	for rows.Next() {
+		f, err := scanMetadataField(rows)
+		if err != nil {
+			return nil, err
+		}
+		fields = append(fields, f)
+	}
+	return fields, rows.Err()
+}
+
+func (s *PostgresStore) GetMetadataField(ctx context.Context, id string) (*MetadataField, error) {
+	row := s.pool.QueryRow(ctx,
+		`SELECT `+metadataFieldColumns+` FROM public.metadata_fields WHERE id = $1`, id)
+	return scanMetadataField(row)
+}
+
+func (s *PostgresStore) CreateMetadataField(ctx context.Context, field *MetadataField) error {
+	optionsJSON, _ := json.Marshal(field.Options)
+	if len(optionsJSON) == 0 {
+		optionsJSON = []byte("[]")
+	}
+	return s.pool.QueryRow(ctx, `
+		INSERT INTO public.metadata_fields (
+			key, label, field_type, options, display, help_text,
+			is_required, sort_order, created_by
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id, created_at, updated_at`,
+		field.Key, field.Label, field.FieldType, optionsJSON, field.Display,
+		field.HelpText, field.IsRequired, field.SortOrder, field.CreatedBy,
+	).Scan(&field.ID, &field.CreatedAt, &field.UpdatedAt)
+}
+
+// UpdateMetadataField changes everything except the key.
+//
+// The key is what certificates store their values under, so renaming it would
+// orphan every value already recorded. Labels, options, help text and ordering
+// are all free to change precisely because none of them are the identity.
+func (s *PostgresStore) UpdateMetadataField(ctx context.Context, field *MetadataField) error {
+	optionsJSON, _ := json.Marshal(field.Options)
+	if len(optionsJSON) == 0 {
+		optionsJSON = []byte("[]")
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE public.metadata_fields SET
+			label = $2, field_type = $3, options = $4, display = $5,
+			help_text = $6, is_required = $7, sort_order = $8,
+			is_archived = $9, updated_at = now()
+		WHERE id = $1`,
+		field.ID, field.Label, field.FieldType, optionsJSON, field.Display,
+		field.HelpText, field.IsRequired, field.SortOrder, field.IsArchived)
+	return err
+}
+
+func (s *PostgresStore) ArchiveMetadataField(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE public.metadata_fields SET is_archived = true, updated_at = now() WHERE id = $1`, id)
 	return err
 }
