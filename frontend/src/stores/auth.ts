@@ -3,7 +3,6 @@ import { computed, ref } from 'vue'
 import {
   loadAuthConfig,
   currentAccessToken,
-  hasResumableSession,
   beginSignIn,
   signOut as oidcSignOut,
   clearTokens,
@@ -24,6 +23,7 @@ interface Me {
   auth_method: string
   user_id?: string
   role_source?: string
+  must_change_password?: boolean
 }
 
 export const useAuthStore = defineStore('auth', () => {
@@ -62,7 +62,9 @@ export const useAuthStore = defineStore('auth', () => {
     const token = await currentAccessToken()
     if (token) headers.Authorization = `Bearer ${token}`
 
-    const response = await fetch('/api/v1/me', { headers })
+    // same-origin so the session cookie travels. It is httpOnly, so this is the
+    // only way the page can find out whether it has one at all.
+    const response = await fetch('/api/v1/me', { headers, credentials: 'same-origin' })
     if (!response.ok) {
       me.value = null
       role.value = 'viewer'
@@ -82,21 +84,11 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       config.value = await loadAuthConfig()
 
-      // Anonymous development: the core treats every request as admin, so
-      // there is nobody to sign in and no login screen to show.
-      if (config.value.mode === 'anonymous') {
-        await loadMe()
-        return
-      }
-
-      // Only attempt to resume when there is something to resume from.
-      // Calling /me without a credential would be a guaranteed 401 on every
-      // page load, which fills the console and looks like a fault.
-      if (hasResumableSession()) {
-        await loadMe()
-      } else {
-        isAuthenticated.value = false
-      }
+      // Always asked, because a session cookie is httpOnly and therefore
+      // invisible to this code. There is no way to know whether one exists
+      // except to try, and a 401 here is an ordinary answer rather than a
+      // fault.
+      await loadMe()
     } catch (err) {
       error.value = err instanceof Error ? err.message : String(err)
       isAuthenticated.value = false
@@ -109,11 +101,58 @@ export const useAuthStore = defineStore('auth', () => {
     await beginSignIn(returnTo)
   }
 
+  /**
+   * Signs in with a local account.
+   *
+   * Returns the failure message rather than throwing, because every one of them
+   * is meant to be shown to the person typing — and the API deliberately gives
+   * the same message for a wrong password as for an address that does not
+   * exist, so there is nothing here worth interpreting further.
+   */
+  async function signInWithPassword(email: string, password: string): Promise<string | null> {
+    const response = await fetch('/api/v1/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ email, password }),
+    })
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      return body.error || `Sign-in failed with status ${response.status}`
+    }
+
+    me.value = (await response.json()) as Me
+    role.value = me.value.role
+    isAuthenticated.value = true
+    return null
+  }
+
+  /** True when the account is using a password it did not choose. */
+  const mustChangePassword = computed(() => me.value?.must_change_password === true)
+
   async function signOut(): Promise<void> {
+    const wasFederated = me.value?.auth_method === 'bearer'
+
+    // Ends the server-side session and clears the cookie. Done before the
+    // local state is dropped so that a failure here is still visible.
+    await fetch('/api/v1/auth/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+    }).catch(() => undefined)
+
     me.value = null
     role.value = 'viewer'
     isAuthenticated.value = false
-    await oidcSignOut()
+
+    // Only federated sessions go back through the provider. Ending a local
+    // password session there would be a redirect to somebody else's login page
+    // for no reason.
+    if (wasFederated) {
+      await oidcSignOut()
+      return
+    }
+    clearTokens()
   }
 
   /**
@@ -142,9 +181,11 @@ export const useAuthStore = defineStore('auth', () => {
     canWrite,
     isAdmin,
     displayName,
+    mustChangePassword,
     init,
     loadMe,
     signIn,
+    signInWithPassword,
     signOut,
     forgetSession,
   }

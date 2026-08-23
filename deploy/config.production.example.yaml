@@ -20,7 +20,8 @@ auth:
   issuer: "${CERTPILOT_JWT_ISSUER}"
   audience: "authenticated"
   role_claim: "certpilot_role"
-  allow_anonymous: false
+  bootstrap_admins:
+    - "you@example.com"
 
 plugins:
   discovery_mode: "static"

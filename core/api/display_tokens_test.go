@@ -25,6 +25,7 @@ import (
 	"github.com/certpilot/certpilot/pkg/grpckit"
 	"github.com/certpilot/certpilot/pkg/secrets"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // realRouter builds the router the server actually serves.
@@ -43,18 +44,28 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 		t.Fatalf("keyring: %v", err)
 	}
 
-	// Anonymous access on purpose: it makes every bearer-authenticated request
-	// in this test an admin, so what is left blocking a display token is the
-	// display-token middleware and nothing else.
+	// A real administrator, not an anonymous one. Anonymous access used to make
+	// every request here admin for free; it is gone, and these tests are better
+	// for it — they now exercise the same token verification, directory lookup
+	// and role resolution that a deployment does, so what is left blocking a
+	// display token is genuinely the display-token middleware and nothing else.
 	cfg := &config.CoreConfig{
 		Server: config.ServerConfig{Mode: "development", AllowedOrigins: []string{"http://localhost:5173"}},
-		Auth:   config.AuthConfig{RoleClaim: "certpilot_role", AllowAnonymous: true},
+		Auth: config.AuthConfig{
+			RoleClaim:       "certpilot_role",
+			JWTSecret:       apiTestSecret,
+			Issuer:          apiTestIssuer,
+			BootstrapAdmins: []string{apiAdminEmail},
+		},
 	}
 
 	auth, err := middleware.NewAuthenticator(context.Background(), cfg.Auth)
 	if err != nil {
 		t.Fatalf("authenticator: %v", err)
 	}
+	// The same wiring the server does. Without it the role would come from the
+	// token's own claim, which is the behaviour this design exists to replace.
+	auth = auth.WithUserDirectory(st)
 
 	pm := pluginmgr.NewManager(grpckit.TLSConfig{Insecure: true})
 
@@ -66,6 +77,24 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 		notifications.WithSendTimeout(3*time.Second))
 
 	engine := gin.New()
+
+	// Registered before SetupRouter so it runs ahead of the authentication
+	// middleware. Tests build requests without credentials; rather than
+	// weakening the server to accept that, this presents a real administrator's
+	// bearer token — so the request travels the whole verification and
+	// role-resolution path exactly as a deployment would.
+	//
+	// It stands aside for any request that brought its own credential, which is
+	// what keeps the display-token tests below meaningful.
+	engine.Use(func(c *gin.Context) {
+		if c.GetHeader("Authorization") == "" &&
+			c.GetHeader("X-Display-Token") == "" &&
+			c.Query("display_token") == "" {
+			c.Request.Header.Set("Authorization", "Bearer "+apiAdminToken(t))
+		}
+		c.Next()
+	})
+
 	SetupRouter(engine, RouterDeps{
 		Store:         st,
 		PluginMgr:     pm,
@@ -419,4 +448,40 @@ func TestDisplayTokenInQueryStringIsNotMistakenForAFilter(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "search") {
 		t.Fatalf("the 400 did not name the offending parameter: %s", w.Body.String())
 	}
+}
+
+// ── The administrator these tests run as ────────────────────────────────────
+
+const (
+	apiTestSecret = "api-test-shared-secret-that-is-long-enough"
+	apiTestIssuer = "https://idp.api-test.local"
+	apiAdminEmail = "admin@certpilot.test"
+	// A stable subject, deliberately not a uuid: the shape three of the four
+	// providers CertPilot documents actually issue, and the shape that used to
+	// abort every insert into an actor column.
+	apiAdminSubject = "00uAPITESTadmin0001"
+)
+
+// apiAdminToken signs a bearer token for the administrator.
+//
+// The role claim is deliberately absent. The role comes from CertPilot's users
+// table, where bootstrap_admins grants admin on first sign-in; asserting it in
+// the token would test nothing, since the directory ignores it.
+func apiAdminToken(t *testing.T) string {
+	t.Helper()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, &middleware.UserClaims{
+		Email: apiAdminEmail,
+		Name:  "API Test Administrator",
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   apiAdminSubject,
+			Issuer:    apiTestIssuer,
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	})
+	signed, err := token.SignedString([]byte(apiTestSecret))
+	if err != nil {
+		t.Fatalf("sign admin token: %v", err)
+	}
+	return signed
 }

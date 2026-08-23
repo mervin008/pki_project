@@ -1970,6 +1970,10 @@ type User struct {
 	// RoleSource distinguishes a deliberate grant from a default and from a
 	// bootstrap, so a users list can be read without guessing.
 	RoleSource string `json:"role_source"`
+	// MustChangePassword marks a credential the holder did not choose — the
+	// generated one printed at first start. Not a control in itself; it is what
+	// lets the UI insist rather than hope.
+	MustChangePassword bool `json:"must_change_password"`
 
 	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
@@ -2026,3 +2030,60 @@ type UserIdentity struct {
 	Email       string
 	DisplayName string
 }
+
+// Session is a signed-in browser.
+//
+// Rows rather than signed tokens, so that the core holds no key capable of
+// forging one and so a session can be ended the instant an account is
+// suspended. The raw token exists only in the cookie; what is stored is its
+// SHA-256 hash, compared in constant time — the same design as DisplayToken.
+type Session struct {
+	ID     string `json:"id"`
+	UserID string `json:"user_id"`
+	// TokenHash is hex-encoded SHA-256. The raw token is returned once, at
+	// creation, and never again.
+	TokenHash string `json:"-"`
+
+	ExpiresAt time.Time  `json:"expires_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+	LastSeenIP string     `json:"last_seen_ip,omitempty"`
+	UserAgent  string     `json:"user_agent,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// IsUsable reports whether this session may still authenticate a request.
+func (s *Session) IsUsable(now time.Time) bool {
+	return s.RevokedAt == nil && now.Before(s.ExpiresAt)
+}
+
+// LoginOutcome is why a password sign-in did not succeed.
+//
+// The distinctions exist for the audit log and for the operator reading it. The
+// caller is told only that sign-in failed: telling somebody that an address
+// exists but the password was wrong is how an attacker enumerates accounts, and
+// telling them an account is locked tells them their guessing is working.
+type LoginOutcome int
+
+const (
+	LoginOK LoginOutcome = iota
+	LoginNoSuchAccount
+	LoginWrongPassword
+	LoginLockedOut
+	LoginSuspended
+	LoginNoPasswordSet
+)
+
+// LoginLockout is the throttle applied to password sign-in.
+//
+// Held in the database rather than in process memory because the core runs as
+// several replicas behind a load balancer, and an attacker spreading attempts
+// across them would reset an in-memory counter with every request. CertPilot
+// has no rate limiting, so this is the only thing standing between a password
+// endpoint and an unlimited guessing oracle.
+const (
+	MaxFailedLogins = 8
+	LockoutWindow   = 15 * time.Minute
+)

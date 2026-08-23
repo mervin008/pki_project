@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 
 	"github.com/certpilot/certpilot/core/server/middleware"
@@ -34,12 +35,20 @@ func NewSessionHandler(s store.Store, auth config.AuthConfig) *SessionHandler {
 // there is no client secret: the issuer and client id are sent to the provider
 // in a URL the user can read.
 type AuthConfigResponse struct {
-	// Mode is "oidc", "anonymous", or "unconfigured".
-	Mode     string   `json:"mode"`
-	Issuer   string   `json:"issuer,omitempty"`
-	ClientID string   `json:"client_id,omitempty"`
-	Scopes   []string `json:"scopes,omitempty"`
-	Audience string   `json:"audience,omitempty"`
+	// Mode is "oidc" when single sign-on is configured, otherwise "password".
+	// There is no longer an "anonymous" mode: an instance that nobody has to
+	// sign in to was a development convenience that made the authorisation
+	// paths the least exercised code in the system, and it attributed every
+	// action in the audit log to a subject nobody could be asked about.
+	Mode string `json:"mode"`
+	// PasswordLogin is true whenever local accounts can be used, which is
+	// always — single sign-on is offered alongside it, never instead of it, so
+	// that a provider outage does not lock a team out of its own CA hierarchy.
+	PasswordLogin bool     `json:"password_login"`
+	Issuer        string   `json:"issuer,omitempty"`
+	ClientID      string   `json:"client_id,omitempty"`
+	Scopes        []string `json:"scopes,omitempty"`
+	Audience      string   `json:"audience,omitempty"`
 }
 
 // Config handles GET /api/v1/auth/config.
@@ -48,26 +57,20 @@ type AuthConfigResponse struct {
 // credential at all.
 func (h *SessionHandler) Config(c *gin.Context) {
 	switch {
-	case h.auth.AllowAnonymous:
-		// Development. Saying so explicitly is what lets the frontend skip its
-		// login screen rather than presenting one that cannot work.
-		c.JSON(http.StatusOK, AuthConfigResponse{Mode: "anonymous"})
-
 	case h.auth.Issuer != "" && h.auth.ClientID != "":
 		c.JSON(http.StatusOK, AuthConfigResponse{
-			Mode:     "oidc",
-			Issuer:   h.auth.Issuer,
-			ClientID: h.auth.ClientID,
-			Scopes:   h.auth.Scopes,
-			Audience: h.auth.Audience,
+			Mode:          "oidc",
+			PasswordLogin: true,
+			Issuer:        h.auth.Issuer,
+			ClientID:      h.auth.ClientID,
+			Scopes:        h.auth.Scopes,
+			Audience:      h.auth.Audience,
 		})
 
 	default:
-		// Tokens are still verified, but nothing here can start a sign-in. An
-		// API-only deployment is a legitimate configuration; a browser being
-		// told plainly that it cannot log in is better than a login button
-		// that fails at the provider with an unreadable error.
-		c.JSON(http.StatusOK, AuthConfigResponse{Mode: "unconfigured"})
+		// No identity provider configured: local accounts only. This is a
+		// complete, supported configuration rather than a degraded one.
+		c.JSON(http.StatusOK, AuthConfigResponse{Mode: "password", PasswordLogin: true})
 	}
 }
 
@@ -84,6 +87,9 @@ type MeResponse struct {
 	// anonymous development where no user row exists.
 	UserID     string `json:"user_id,omitempty"`
 	RoleSource string `json:"role_source,omitempty"`
+	// MustChangePassword is set for a generated credential the account holder
+	// has not replaced — the one printed at first start.
+	MustChangePassword bool `json:"must_change_password,omitempty"`
 }
 
 // Me handles GET /api/v1/me.
@@ -106,8 +112,46 @@ func (h *SessionHandler) Me(c *gin.Context) {
 		if u, err := h.store.GetUser(c.Request.Context(), resp.UserID); err == nil && u != nil {
 			resp.DisplayName = u.DisplayName
 			resp.RoleSource = u.RoleSource
+			resp.MustChangePassword = u.MustChangePassword
 		}
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// audit records an authentication event.
+//
+// Sign-in and sign-out are exactly the events an incident review reads first,
+// and a failed sign-in is the one that says somebody is trying. Failures are
+// deliberately recorded with their real reason even though the caller is told
+// nothing — the distinction belongs to the operator, not to whoever is guessing.
+func (h *SessionHandler) audit(c *gin.Context, subject, action string, details map[string]any) {
+	if subject == "" {
+		return
+	}
+
+	ip := c.ClientIP()
+	email := c.GetString(middleware.ContextUserEmail)
+
+	encoded := "{}"
+	if len(details) > 0 {
+		if raw, err := json.Marshal(details); err == nil {
+			encoded = string(raw)
+		}
+	}
+
+	entry := &store.AuditLog{
+		Action:     action,
+		EntityType: "session",
+		ActorID:    &subject,
+		IPAddress:  &ip,
+		Details:    encoded,
+	}
+	if email != "" {
+		entry.ActorEmail = &email
+	}
+
+	// Best effort. Failing to write an audit row must not stop somebody
+	// signing out.
+	_ = h.store.CreateAuditLog(c.Request.Context(), entry)
 }

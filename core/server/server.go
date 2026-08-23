@@ -189,6 +189,13 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	// of the provider rather than of the team that owns the CA hierarchy.
 	authenticator = authenticator.WithUserDirectory(st)
 
+	// Before the router is built, so that an instance nobody can sign in to is
+	// reported at start-up rather than discovered at the login screen.
+	if err := bootstrapFirstAdmin(ctx, st, cfg.Auth); err != nil {
+		st.Close()
+		return nil, fmt.Errorf("bootstrap: %w", err)
+	}
+
 	// 6. HTTP router.
 	engine := gin.New()
 	// Not gin.Logger(): it writes the full request target, and display tokens

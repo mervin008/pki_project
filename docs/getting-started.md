@@ -252,8 +252,19 @@ Apply migrations in order from `migrations/`. Two caveats:
 
 ## Authentication
 
-Development uses `auth.allow_anonymous`, which treats every request as admin and
-is refused unless the server is in development mode on a loopback address.
+**Everything requires a sign-in, including local development.** On first start,
+CertPilot creates the account named in `auth.bootstrap_admins`, generates a
+password, and prints it once:
+
+```
+┌─ CertPilot: first run ──────────────────────────
+│   email:    you@example.com
+│   password: cbYF5-RMeJd-q446h-9DG9Y
+└─────────────────────────────────────────────────
+```
+
+`make dev` also writes it to `.certpilot/dev-admin`. There is no default
+password and no anonymous mode.
 
 For anything else, point `auth.jwks_url` at your identity provider — Keycloak,
 Okta, Azure AD, Auth0, Authentik, or Supabase Auth all work. The core then

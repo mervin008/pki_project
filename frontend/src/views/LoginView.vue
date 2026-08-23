@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ShieldCheck, AlertTriangle, LogIn } from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/auth'
 
@@ -9,6 +9,10 @@ const route = useRoute()
 
 const busy = ref(false)
 const failure = ref<string | null>(null)
+
+const email = ref('')
+const password = ref('')
+const router = useRouter()
 
 /** Where the guard wanted the user to go before it sent them here. */
 const returnTo = computed(() => (route.query.next as string) || '/')
@@ -30,6 +34,26 @@ const reason = computed(() => {
 onMounted(async () => {
   if (!auth.config) await auth.init()
 })
+
+async function signInWithPassword() {
+  busy.value = true
+  failure.value = null
+  try {
+    const problem = await auth.signInWithPassword(email.value, password.value)
+    if (problem) {
+      failure.value = problem
+      // Cleared on failure so a wrong value is not silently re-submitted, and
+      // so a shared screen does not keep it.
+      password.value = ''
+      return
+    }
+    await router.replace(returnTo.value)
+  } catch (err) {
+    failure.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    busy.value = false
+  }
+}
 
 async function signIn() {
   busy.value = true
@@ -62,40 +86,50 @@ async function signIn() {
         <span class="label-micro">Asking the API how to sign in</span>
       </div>
 
-      <template v-else-if="auth.mode === 'oidc'">
-        <button class="login-button" :disabled="busy" @click="signIn">
-          <LogIn class="w-4 h-4" />
-          {{ busy ? 'Redirecting…' : 'Sign in with single sign-on' }}
-        </button>
-        <p class="field-help">
-          You will be sent to your organisation's identity provider and returned here.
-        </p>
+      <template v-else>
+        <form class="login-form" @submit.prevent="signInWithPassword">
+          <label class="login-field">
+            <span class="label-micro">Email</span>
+            <input
+              v-model="email"
+              type="email"
+              autocomplete="username"
+              required
+              :disabled="busy"
+              class="login-input"
+            />
+          </label>
+
+          <label class="login-field">
+            <span class="label-micro">Password</span>
+            <input
+              v-model="password"
+              type="password"
+              autocomplete="current-password"
+              required
+              :disabled="busy"
+              class="login-input"
+            />
+          </label>
+
+          <button class="login-button" type="submit" :disabled="busy">
+            <LogIn class="w-4 h-4" />
+            {{ busy ? 'Signing in…' : 'Sign in' }}
+          </button>
+        </form>
+
+        <!-- Offered alongside a password, never instead of it: an identity
+             provider outage must not lock a team out of its own CA hierarchy. -->
+        <template v-if="auth.mode === 'oidc'">
+          <div class="login-divider"><span>or</span></div>
+          <button class="login-button login-button--alt" :disabled="busy" @click="signIn">
+            Single sign-on
+          </button>
+          <p class="field-help">
+            You will be sent to your organisation's identity provider and returned here.
+          </p>
+        </template>
       </template>
-
-      <!-- Explaining what is missing, rather than offering a button that fails
-           at the provider with an error nobody here can interpret. -->
-      <div v-else-if="auth.mode === 'unconfigured'" class="login-notice">
-        <AlertTriangle class="w-4 h-4 shrink-0 sev-warning" />
-        <div>
-          <p class="label-rail sev-warning">Single sign-on is not configured</p>
-          <p class="field-help">
-            This instance verifies tokens but cannot start a sign-in. Set
-            <code>auth.issuer</code> and <code>auth.client_id</code> in the core's configuration.
-          </p>
-        </div>
-      </div>
-
-      <div v-else-if="auth.mode === 'anonymous'" class="login-notice">
-        <AlertTriangle class="w-4 h-4 shrink-0 sev-warning" />
-        <div>
-          <p class="label-rail sev-warning">Anonymous access is enabled</p>
-          <p class="field-help">
-            Every request is treated as admin. This is a development convenience and the core
-            refuses it unless it is bound to a loopback address.
-          </p>
-          <RouterLink to="/" class="login-continue">Continue without signing in</RouterLink>
-        </div>
-      </div>
 
       <div v-if="failure || auth.error" role="alert" class="login-notice login-notice--error">
         <AlertTriangle class="w-4 h-4 shrink-0 sev-critical" />
@@ -153,6 +187,63 @@ async function signIn() {
   color: var(--text-primary);
   border-left: 2px solid var(--signal);
   padding-left: 0.625rem;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.login-input {
+  width: 100%;
+  padding: 0.5rem 0.625rem;
+  background: var(--ink-raised);
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+}
+
+.login-input:focus {
+  outline: none;
+  border-color: var(--signal);
+}
+
+.login-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  color: var(--text-muted);
+  font-size: var(--fs-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.login-divider::before,
+.login-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.login-button--alt {
+  background: transparent;
+  color: var(--text-primary);
+  border: 1px solid var(--line-strong);
+}
+
+.login-button--alt:hover:not(:disabled) {
+  background: var(--ink-hover);
+  filter: none;
 }
 
 .login-button {

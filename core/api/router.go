@@ -89,6 +89,12 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	// sends both to the provider in a URL they can read.
 	engine.GET("/api/v1/auth/config", sessionHandler.Config)
 
+	// Sign-in itself cannot require being signed in. It is rate-limited by the
+	// per-account lockout in the store rather than by middleware, because the
+	// core runs as several replicas and an in-process counter would reset with
+	// every request that landed on a different one.
+	engine.POST("/api/v1/auth/login", sessionHandler.Login)
+
 	// ── The agent API ──
 	//
 	// A separate group with its own authentication, mounted before the human
@@ -132,7 +138,12 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	// that is not a GET and refuses the sensitive read paths outright, so the
 	// read-only property does not depend on every route below getting its role
 	// gate right.
+	// Order matters, and it is the same rule in both cases: an explicit
+	// credential beats an ambient one. A cookie sitting in a browser must never
+	// override a request that presented a token, or the audit log records the
+	// wrong person.
 	v1.Use(middleware.DisplayTokenAuth(deps.Store))
+	v1.Use(middleware.SessionAuth(deps.Store))
 	v1.Use(deps.Auth.Middleware())
 	{
 		// ── Live event stream ──
@@ -145,6 +156,11 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// the one in the token. A frontend that decoded the JWT itself would
 		// keep showing controls for a role the API had stopped honouring.
 		v1.GET("/me", sessionHandler.Me)
+		v1.POST("/auth/logout", sessionHandler.Logout)
+		// Changing a password requires the current one even though the caller
+		// is already authenticated: a session left open on an unattended
+		// machine should not be enough to lock its owner out of their account.
+		v1.POST("/auth/password", sessionHandler.ChangePassword)
 
 		// ── Dashboard ──
 		v1.GET("/dashboard/stats", dashHandler.Stats)

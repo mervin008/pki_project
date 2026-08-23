@@ -111,6 +111,19 @@ reach the database (`pkg/secrets`, envelope encryption, `CPS1` magic). Losing th
 KEK makes every stored secret unrecoverable. The core refuses to start against a
 database without one.
 
+**There is no anonymous mode, including locally.** `auth.allow_anonymous` is
+refused by configuration validation, not ignored. On first start the core
+creates the account in `auth.bootstrap_admins`, generates a password and prints
+it once; `make dev` also writes it to `.certpilot/dev-admin`. The bootstrap
+re-runs whenever **no active account has a password**, which is both the upgrade
+path and the recovery path.
+
+**Browser sessions are rows, not tokens.** An opaque value in an `HttpOnly`,
+`SameSite=Strict` cookie, stored as a SHA-256 hash — so the core holds no key
+that can forge one, and suspending somebody ends their session immediately.
+Sign-in is throttled in the database (8 failures, 15 minutes) because there are
+several replicas and no rate limiting.
+
 **The identity provider says who you are; CertPilot says what you may do.**
 Roles live in the `users` table keyed on `(issuer, subject)`, not in a token
 claim — `app_metadata.certpilot_role` is ignored when a directory is wired in.
@@ -256,10 +269,8 @@ adding a required field makes the whole estate unsaveable.
 
 Documented, not secretly broken. Do not "discover" these as findings.
 
-- **The refresh token is in `localStorage`.** An access token is held in memory
-  only, but surviving a page reload needs something persistent and a page with
-  no backend of its own has no option a script cannot read. The fix is a
-  backend-for-frontend with an httpOnly cookie; that is a deployment change.
+- **The OIDC refresh token is in `localStorage`** — for federated sign-in only.
+  Local password sessions use an httpOnly cookie and are unaffected.
 - **No user-management UI yet.** Roles are stored and enforced, and
   `SetUserRole` / `SetUserStatus` exist in the store, but nothing exposes them —
   changing a role means a SQL update. The Settings → Users screen is the next

@@ -78,9 +78,37 @@ symmetric key that can forge admin tokens.
 - An invalid token is **always** rejected. There is no mode in which a bad token
   falls back to a privileged identity
 
-`auth.allow_anonymous` treats requests with no `Authorization` header as admin.
-It is refused unless the server is in development mode bound to a loopback
-address. A malformed token is still a 401 even when it is enabled.
+There is **no anonymous mode**. `auth.allow_anonymous` was removed, and setting
+it now fails configuration validation rather than being ignored — an operator
+with it set believes their instance is open and would otherwise not learn
+otherwise until somebody was refused.
+
+It was gated to development mode on a loopback address, and the gate held. It
+was still wrong: every local session ran as an unnamed superuser, so the
+authorisation paths were the least exercised code in the system and the audit
+log attributed everything to a subject nobody could be asked about.
+
+### Local accounts
+
+CertPilot holds its own accounts. Passwords are Argon2id (64 MiB, t=3, p=4),
+with the parameters encoded in each hash so the cost can be raised later
+without invalidating existing passwords.
+
+Sessions are **rows, not signed tokens**: an opaque random value, stored only as
+a SHA-256 hash and compared in constant time, carried in an `HttpOnly`,
+`SameSite=Strict` cookie. The core therefore holds no key capable of forging a
+session, and a session can be ended the instant an account is suspended.
+
+Sign-in is throttled per account — 8 failures, then a 15-minute lock — in the
+database rather than in process memory, because the core runs as several
+replicas and an attacker spreading attempts across them would reset an
+in-memory counter with every request. CertPilot has no rate limiting, so this
+is the only thing standing between the password endpoint and an unlimited
+guessing oracle.
+
+Every failure returns the same message. Distinguishing "no such account" from
+"wrong password" is an address oracle, and an unknown address is verified
+against a decoy hash so that the two take the same time.
 
 ### Display tokens
 

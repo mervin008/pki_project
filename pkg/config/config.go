@@ -53,9 +53,19 @@ type AuthConfig struct {
 	// RoleClaim names the claim inside app_metadata carrying the CertPilot
 	// role. Defaults to "certpilot_role".
 	RoleClaim string `yaml:"role_claim"`
-	// AllowAnonymous disables authentication entirely. It is refused unless
-	// the server is in development mode and bound to a loopback address, and
-	// exists so a first-run evaluation does not require an identity provider.
+	// AllowAnonymous is retained only so that setting it fails loudly.
+	//
+	// It used to treat a request with no Authorization header as admin, gated
+	// to development mode on a loopback address. The gate held, but the
+	// feature was still wrong: it meant every local session ran as an unnamed
+	// superuser, so the authorisation paths were the least exercised code in
+	// the system and the audit log attributed everything to a subject nobody
+	// could be asked about. The uuid-subject defect fixed in migration 028
+	// survived for precisely that reason.
+	//
+	// The field stays because silently ignoring it would be worse than
+	// removing it: an operator who has this set believes their instance is
+	// open and would not learn otherwise until somebody was refused.
 	AllowAnonymous bool `yaml:"allow_anonymous"`
 
 	// ClientID is the public client the browser authenticates as, using
@@ -218,13 +228,15 @@ func LoadCoreConfig(path string) (*CoreConfig, error) {
 // These checks exist because the dangerous settings here are all ones that look
 // harmless in a development config and then travel to production unnoticed.
 func (c *CoreConfig) Validate() error {
+	// Refused everywhere, not only in production. There is no mode in which
+	// CertPilot serves an unauthenticated caller any more.
+	if c.Auth.AllowAnonymous {
+		return fmt.Errorf("config: auth.allow_anonymous no longer exists and must be removed. " +
+			"CertPilot now requires a sign-in everywhere, including locally: use a local " +
+			"account, or configure auth.jwks_url for an identity provider")
+	}
+
 	if c.Server.IsProduction() {
-		if c.Auth.AllowAnonymous {
-			return fmt.Errorf("config: auth.allow_anonymous cannot be enabled in production mode")
-		}
-		if c.Auth.JWKSURL == "" && c.Auth.JWTSecret == "" {
-			return fmt.Errorf("config: production mode requires auth.jwks_url or auth.jwt_secret")
-		}
 		if c.Plugins.TLS.Insecure {
 			return fmt.Errorf("config: plugins.tls.insecure cannot be enabled in production mode; " +
 				"the gateway channel carries private keys and CA credentials")
@@ -234,10 +246,6 @@ func (c *CoreConfig) Validate() error {
 				return fmt.Errorf("config: server.allowed_origins cannot contain \"*\" in production mode")
 			}
 		}
-	}
-
-	if c.Auth.AllowAnonymous && !isLoopback(c.Server.Host) {
-		return fmt.Errorf("config: auth.allow_anonymous requires server.host to be a loopback address, got %q", c.Server.Host)
 	}
 
 	return nil

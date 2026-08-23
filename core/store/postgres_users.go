@@ -13,13 +13,15 @@ import (
 // userColumns is the projection every user read shares, so that a column added
 // in one place cannot be forgotten in another.
 const userColumns = `id, issuer, subject, COALESCE(email, ''), COALESCE(display_name, ''),
-	role, status, role_source, last_seen_at, created_at, updated_at`
+	role, status, role_source, COALESCE(must_change_password, false),
+	last_seen_at, created_at, updated_at`
 
 func scanUser(row pgx.Row) (*User, error) {
 	u := &User{}
 	var lastSeen *time.Time
 	err := row.Scan(&u.ID, &u.Issuer, &u.Subject, &u.Email, &u.DisplayName,
-		&u.Role, &u.Status, &u.RoleSource, &lastSeen, &u.CreatedAt, &u.UpdatedAt)
+		&u.Role, &u.Status, &u.RoleSource, &u.MustChangePassword,
+		&lastSeen, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

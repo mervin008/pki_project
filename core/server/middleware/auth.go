@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/certpilot/certpilot/pkg/config"
@@ -44,6 +43,9 @@ const (
 	// Actor columns keep storing the subject: it is what the audit log has
 	// always held, and it survives the users table being rebuilt.
 	ContextUserDBID = "user_db_id"
+	// ContextSessionID identifies the browser session, so signing out can end
+	// this one specifically rather than every session the account holds.
+	ContextSessionID = "session_id"
 )
 
 // identityIssuer prefers the issuer the token asserts.
@@ -67,6 +69,7 @@ const (
 	AuthMethodBearer       = "bearer"
 	AuthMethodAnonymous    = "anonymous"
 	AuthMethodDisplayToken = "display_token"
+	AuthMethodSession      = "session"
 )
 
 // UserClaims represents the claims inside an identity provider's JWT.
@@ -130,10 +133,6 @@ type Authenticator struct {
 	// which is how the middleware tests and any deployment without a store
 	// continue to work.
 	users UserDirectory
-
-	// anonymousWarn ensures the anonymous-access warning is logged once per
-	// process rather than once per request.
-	anonymousWarn sync.Once
 }
 
 // NewAuthenticator builds an Authenticator. When a JWKS URL is configured, its
@@ -152,9 +151,10 @@ func NewAuthenticator(ctx context.Context, cfg config.AuthConfig) (*Authenticato
 		a.cache = cache
 	}
 
-	if a.cache == nil && cfg.JWTSecret == "" && !cfg.AllowAnonymous {
-		return nil, fmt.Errorf("auth: no verification method configured; set auth.jwks_url, auth.jwt_secret, or auth.allow_anonymous")
-	}
+	// A build with neither is still valid: local accounts sign in with a
+	// password and a session cookie, which needs no token verification at all.
+	// What must not happen is a *token* arriving with nothing to check it
+	// against, and Verify refuses that case on its own.
 
 	return a, nil
 }
@@ -184,24 +184,15 @@ func (a *Authenticator) Middleware() gin.HandlerFunc {
 		authHeader := c.GetHeader("Authorization")
 
 		if authHeader == "" {
-			// Anonymous access is a first-run convenience, gated at config
-			// load to development mode on a loopback address. Crucially it
-			// applies only when no token was presented at all — an invalid
-			// token is always a rejection, never a fallback to admin.
-			if a.cfg.AllowAnonymous {
-				a.anonymousWarn.Do(func() {
-					gin.DefaultWriter.Write([]byte(
-						"WARNING: anonymous API access is enabled; every request is treated as admin\n"))
-				})
-				c.Set(ContextUserID, "00000000-0000-0000-0000-000000000001")
-				c.Set(ContextUserEmail, "anonymous@certpilot.local")
-				c.Set(ContextUserRole, RoleAdmin)
-				c.Set(ContextAuthMethod, AuthMethodAnonymous)
-				c.Next()
-				return
-			}
+			// No anonymous fallback. There used to be one, gated to
+			// development mode on a loopback address, and the gate worked —
+			// but running every local session as an unnamed superuser made the
+			// authorisation paths the least exercised code in the system, and
+			// wrote an audit log attributing everything to a subject nobody
+			// could be asked about. Sign in locally instead; it costs one
+			// password and buys a system that is exercised the way it ships.
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "Authorization header required",
+				"error": "this request carried no credential: sign in, or present a bearer token or display token",
 			})
 			return
 		}
