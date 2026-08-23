@@ -255,7 +255,7 @@ const anyLoaded = computed(() => cas.loaded && certs.loaded.value)
 
 .empty-note {
   padding: 1.5rem 0.75rem;
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--text-muted);
   text-align: center;
 }
@@ -271,13 +271,13 @@ const anyLoaded = computed(() => cas.loaded && certs.loaded.value)
   gap: 0.625rem;
   padding: 0.3125rem 0.625rem;
   border-bottom: 1px solid var(--line);
-  font-size: 11px;
+  font-size: var(--fs-small);
 }
 
 .feed-time {
   flex: none;
   width: 6.5rem;
-  font-size: 9px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-muted);

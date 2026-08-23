@@ -74,7 +74,7 @@ const showSpinner = () => props.loading && !props.loaded
 }
 
 .state-error-detail {
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--text-secondary);
   word-break: break-word;
 }

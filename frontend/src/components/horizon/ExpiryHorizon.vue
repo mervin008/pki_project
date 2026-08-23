@@ -121,7 +121,7 @@ const mostUrgent = computed(() => {
 const focus = computed(() => hovered.value ?? mostUrgent.value)
 const isEmpty = computed(() => props.items.length === 0)
 
-const ROW_HEIGHT = 13
+const ROW_HEIGHT = 14
 </script>
 
 <template>
@@ -235,7 +235,7 @@ const ROW_HEIGHT = 13
 .horizon-zone {
   position: absolute;
   top: 0;
-  bottom: 26px;
+  bottom: 30px;
 }
 
 .horizon-zone[data-severity='critical'] {
@@ -257,7 +257,7 @@ const ROW_HEIGHT = 13
 }
 
 .horizon-lane-label {
-  font-size: 9px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--text-muted);
@@ -266,7 +266,7 @@ const ROW_HEIGHT = 13
 
 .horizon-plot {
   position: relative;
-  height: 68px;
+  height: 76px;
 }
 
 /* A mark is a stem rising from the axis with a dot on the end — the axis is
@@ -335,7 +335,7 @@ const ROW_HEIGHT = 13
 
 .horizon-axis {
   position: relative;
-  height: 26px;
+  height: 30px;
   border-top: 1px solid var(--line-strong);
 }
 
@@ -361,7 +361,7 @@ const ROW_HEIGHT = 13
   position: absolute;
   top: 4px;
   left: 3px;
-  font-size: 9px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.1em;
   color: var(--text-muted);
   white-space: nowrap;
@@ -371,15 +371,15 @@ const ROW_HEIGHT = 13
   display: flex;
   align-items: baseline;
   gap: 0.5rem;
-  height: 26px;
+  height: 30px;
   padding: 0.25rem 0;
   border-top: 1px solid var(--line);
-  font-size: 11px;
+  font-size: var(--fs-small);
   min-width: 0;
 }
 
 .horizon-readout-caret {
-  font-size: 8px;
+  font-size: var(--fs-micro);
 }
 
 .horizon-readout-name {
@@ -397,7 +397,7 @@ const ROW_HEIGHT = 13
 .horizon-readout-meta,
 .horizon-readout-hint {
   color: var(--text-muted);
-  font-size: 9px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   white-space: nowrap;

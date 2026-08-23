@@ -219,7 +219,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: stretch;
   gap: 1rem;
-  height: 40px;
+  height: 46px;
   padding-right: 0.75rem;
   background: var(--ink-rail);
   border-bottom: 1px solid var(--line-strong);
@@ -237,11 +237,11 @@ onBeforeUnmount(() => {
 
 .rail-brand-bar {
   width: 3px;
-  height: 16px;
+  height: 18px;
 }
 
 .rail-wordmark {
-  font-size: 11px;
+  font-size: var(--fs-small);
   font-weight: 600;
   letter-spacing: 0.22em;
   text-transform: uppercase;
@@ -264,8 +264,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 0.3rem;
-  padding: 0 0.6rem;
-  font-size: 10px;
+  padding: 0 0.7rem;
+  font-size: var(--fs-label);
   letter-spacing: 0.12em;
   text-transform: uppercase;
   font-weight: 500;
@@ -287,7 +287,7 @@ onBeforeUnmount(() => {
 }
 
 .rail-count {
-  font-size: 9px;
+  font-size: var(--fs-micro);
   font-weight: 700;
 }
 
@@ -300,7 +300,7 @@ onBeforeUnmount(() => {
 }
 
 .rail-clock {
-  font-size: 10px;
+  font-size: var(--fs-label);
   color: var(--text-muted);
   letter-spacing: 0.05em;
 }
@@ -309,7 +309,7 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
-  font-size: 9px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.14em;
   text-transform: uppercase;
   font-weight: 600;
@@ -320,8 +320,8 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   color: var(--text-muted);
   background: none;
   border: 0;
@@ -345,7 +345,7 @@ onBeforeUnmount(() => {
   min-width: 12px;
   height: 12px;
   padding: 0 2px;
-  font-size: 8px;
+  font-size: var(--fs-micro);
   font-weight: 700;
   line-height: 12px;
   text-align: center;
@@ -386,18 +386,18 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: flex-start;
   gap: 0.5rem;
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--text-secondary);
 }
 
 .rail-popover-empty {
   padding: 0.75rem 0.25rem;
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--text-muted);
 }
 
 .rail-role {
-  font-size: 9px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--text-muted);

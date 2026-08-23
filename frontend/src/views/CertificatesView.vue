@@ -455,7 +455,7 @@ const selected = ref<Certificate | null>(null)
             </div>
           </div>
 
-          <label class="flex items-center gap-2 cursor-pointer" style="font-size: 11px">
+          <label class="flex items-center gap-2 cursor-pointer" style="font-size: var(--fs-small)">
             <input v-model="reqForm.auto_renew" type="checkbox" />
             Renew automatically before expiry
           </label>
@@ -484,7 +484,7 @@ const selected = ref<Certificate | null>(null)
 }
 
 .page-sub {
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--text-muted);
   margin-top: 0.25rem;
 }
@@ -494,7 +494,7 @@ const selected = ref<Certificate | null>(null)
   align-items: center;
   gap: 0.5rem;
   padding: 0.375rem 0.625rem;
-  font-size: 11px;
+  font-size: var(--fs-small);
   background: var(--sev-critical-wash);
   border: 1px solid var(--sev-critical);
   border-left-width: 3px;
@@ -515,7 +515,7 @@ const selected = ref<Certificate | null>(null)
   align-items: center;
   gap: 0.4rem;
   padding: 0.3rem 0.625rem;
-  font-size: 9px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.12em;
   text-transform: uppercase;
   font-weight: 600;
@@ -538,7 +538,7 @@ const selected = ref<Certificate | null>(null)
 
 .filter-count {
   font-weight: 700;
-  font-size: 10px;
+  font-size: var(--fs-label);
 }
 
 .filter-search {
@@ -556,7 +556,7 @@ const selected = ref<Certificate | null>(null)
   outline: none;
   color: var(--text-primary);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-small);
   width: 14rem;
 }
 
@@ -604,7 +604,7 @@ const selected = ref<Certificate | null>(null)
 }
 
 .detail-title {
-  font-size: 13px;
+  font-size: var(--fs-body);
   font-weight: 600;
   color: var(--text-primary);
   word-break: break-all;
@@ -614,7 +614,7 @@ const selected = ref<Certificate | null>(null)
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 0.625rem 0.75rem;
-  font-size: 11px;
+  font-size: var(--fs-small);
 }
 
 .detail-wide {
@@ -633,7 +633,7 @@ const selected = ref<Certificate | null>(null)
   gap: 0.5rem;
   padding: 2.5rem 1rem;
   text-align: center;
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--text-muted);
 }
 

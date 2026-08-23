@@ -462,7 +462,7 @@ const worst = computed<Severity>(() => {
 }
 
 .page-sub {
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--text-muted);
   margin-top: 0.25rem;
   max-width: 46rem;
@@ -473,7 +473,7 @@ const worst = computed<Severity>(() => {
   align-items: center;
   gap: 0.5rem;
   padding: 0.375rem 0.625rem;
-  font-size: 11px;
+  font-size: var(--fs-small);
   background: var(--sev-critical-wash);
   border: 1px solid var(--sev-critical);
   border-left-width: 3px;
@@ -493,8 +493,8 @@ const worst = computed<Severity>(() => {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
-  padding: 0.3rem 0.625rem;
-  font-size: 9px;
+  padding: 0.375rem 0.6875rem;
+  font-size: var(--fs-micro);
   letter-spacing: 0.12em;
   text-transform: uppercase;
   font-weight: 600;
@@ -517,7 +517,7 @@ const worst = computed<Severity>(() => {
 
 .filter-count {
   font-weight: 700;
-  font-size: 10px;
+  font-size: var(--fs-label);
 }
 
 .filter-search {
@@ -536,7 +536,7 @@ const worst = computed<Severity>(() => {
   outline: none;
   color: var(--text-primary);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-small);
   width: 11rem;
 }
 
@@ -548,7 +548,7 @@ const worst = computed<Severity>(() => {
    is one object — an ordering — and gaps would say it is many. */
 .ca-row {
   display: grid;
-  grid-template-columns: 3px 4.5rem minmax(0, 1fr) auto;
+  grid-template-columns: 3px 5.75rem minmax(0, 1fr) auto;
   align-items: center;
   column-gap: 0.75rem;
   background: var(--ink-panel);
@@ -569,7 +569,7 @@ const worst = computed<Severity>(() => {
 }
 
 .ca-days-num {
-  font-size: 1.75rem;
+  font-size: 2.125rem;
   line-height: 1;
   font-weight: 500;
   letter-spacing: -0.03em;
@@ -581,7 +581,7 @@ const worst = computed<Severity>(() => {
 }
 
 .ca-name {
-  font-size: 12px;
+  font-size: var(--fs-small);
   font-weight: 600;
   color: var(--text-primary);
   overflow: hidden;
@@ -595,7 +595,7 @@ const worst = computed<Severity>(() => {
   gap: 0.35rem;
   flex-wrap: wrap;
   margin-top: 0.2rem;
-  font-size: 10px;
+  font-size: var(--fs-label);
   color: var(--text-muted);
 }
 
@@ -621,7 +621,7 @@ const worst = computed<Severity>(() => {
 }
 
 .ca-fact-value {
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--text-secondary);
   margin-top: 0.1rem;
 }
@@ -646,7 +646,7 @@ const worst = computed<Severity>(() => {
   padding: 0.4rem 0.5rem;
   background: var(--ink-raised);
   border-left: 2px solid var(--line-strong);
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--text-secondary);
 }
 
@@ -671,7 +671,7 @@ const worst = computed<Severity>(() => {
   gap: 0.5rem;
   padding: 2.5rem 1rem;
   text-align: center;
-  font-size: 11px;
+  font-size: var(--fs-small);
   color: var(--text-muted);
 }
 </style>
