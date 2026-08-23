@@ -1,247 +1,594 @@
-/* CertPilot Modern Dark Design System */
+@import "tailwindcss";
+@plugin "daisyui";
 
+/*
+ * CertPilot looks like an instrument, not a website.
+ *
+ * The three rules everything below follows:
+ *
+ * 1. COLOUR MEANS SEVERITY. Warm colour — red, amber — appears only where
+ *    something needs a person. A cool signal blue marks what is interactive or
+ *    alive. Nothing else in the interface is coloured at all. A product whose
+ *    job is to make one expiring CA impossible to miss cannot spend red on a
+ *    primary button, and every generic admin theme does exactly that.
+ *
+ * 2. TIME IS THE ORGANISING DIMENSION. Every object here is dying on a clock.
+ *    Monospace and tabular numerals throughout, so a column of days-remaining
+ *    is scannable as a column rather than as prose.
+ *
+ * 3. SHARP EDGES, TIGHT DENSITY. A PKI team runs thousands of certificates. A
+ *    grid of airy rounded cards gives a CA with 20 days left the same visual
+ *    weight as one with 3,650, which is the one thing this screen must never do.
+ */
+
+/* ── Themes ──────────────────────────────────────────────────────────────────
+ *
+ * Named `dark` and `light` so they replace daisyUI's built-ins outright. The
+ * views not yet converted still use daisyUI's `btn`, `card` and `badge`, and
+ * retheming underneath them means they follow this palette instead of sitting
+ * on the page in stock purple. They are still due a rewrite; this stops them
+ * looking like a different product in the meantime.
+ */
+@plugin "daisyui/theme" {
+  name: "dark";
+  default: true;
+  prefersdark: true;
+  color-scheme: dark;
+
+  --color-base-100: #0b0d10;
+  --color-base-200: #07080a;
+  --color-base-300: #1c2126;
+  --color-base-content: #e8ecef;
+
+  /* Primary is the cool signal, never a severity. */
+  --color-primary: #5ac8fa;
+  --color-primary-content: #04121a;
+  --color-secondary: #8a93a0;
+  --color-secondary-content: #0b0d10;
+  --color-accent: #5ac8fa;
+  --color-accent-content: #04121a;
+  --color-neutral: #1c2126;
+  --color-neutral-content: #939ca6;
+  --color-info: #5ac8fa;
+  --color-info-content: #04121a;
+  --color-success: #58a06f;
+  --color-success-content: #04140b;
+  --color-warning: #ffa726;
+  --color-warning-content: #1a0f00;
+  --color-error: #ff4d3d;
+  --color-error-content: #1a0402;
+
+  /* Consoles do not have rounded corners. This single line does more to break
+     the generated-template look than any colour choice. */
+  --radius-selector: 2px;
+  --radius-field: 2px;
+  --radius-box: 2px;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+@plugin "daisyui/theme" {
+  name: "light";
+  prefersdark: false;
+  color-scheme: light;
+
+  --color-base-100: #ffffff;
+  --color-base-200: #f4f5f6;
+  --color-base-300: #d9dde1;
+  --color-base-content: #14181c;
+
+  --color-primary: #0069c2;
+  --color-primary-content: #ffffff;
+  --color-secondary: #55606b;
+  --color-secondary-content: #ffffff;
+  --color-accent: #0069c2;
+  --color-accent-content: #ffffff;
+  --color-neutral: #d9dde1;
+  --color-neutral-content: #4a545e;
+  --color-info: #0069c2;
+  --color-info-content: #ffffff;
+  --color-success: #3f7a56;
+  --color-success-content: #ffffff;
+  --color-warning: #a35c00;
+  --color-warning-content: #ffffff;
+  --color-error: #c22219;
+  --color-error-content: #ffffff;
+
+  --radius-selector: 2px;
+  --radius-field: 2px;
+  --radius-box: 2px;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+/* ── Tokens ──────────────────────────────────────────────────────────────────
+ *
+ * The design system proper. Components read these, never raw hex, so a palette
+ * change is one edit and the theme toggle carries it everywhere.
+ */
+:root,
+[data-theme="dark"] {
+  --ink-page: #07080a;
+  --ink-panel: #0b0d10;
+  --ink-rail: #101317;
+  --ink-raised: #131820;
+  --ink-hover: #161c24;
+
+  --line: #1c2126;
+  --line-strong: #2b333b;
+
+  --text-primary: #e8ecef;
+  --text-secondary: #939ca6;
+  --text-muted: #626b74;
+
+  --sev-critical: #ff4d3d;
+  --sev-warning: #ffa726;
+  /*
+   * Muted on purpose.
+   *
+   * At full saturation, healthy green is the loudest thing on a screen where
+   * 1,990 of 2,000 certificates are fine — and the ten that are not disappear
+   * into it. Quiet enough to recede in bulk, distinct enough that HEALTHY is
+   * still tellable from UNASSESSED, which is a difference a PKI team acts on.
+   */
+  --sev-ok: #58a06f;
+  --sev-unknown: #6b7480;
+
+  /* Interactive and alive. Cool, so it can never be confused with a warning —
+     the warm/cool split is what lets severity read pre-attentively. */
+  --signal: #5ac8fa;
+
+  --sev-critical-wash: rgb(255 77 61 / 0.055);
+  --sev-warning-wash: rgb(255 167 38 / 0.04);
+  --grid-line: rgb(255 255 255 / 0.035);
+}
+
+[data-theme="light"] {
+  --ink-page: #f4f5f6;
+  --ink-panel: #ffffff;
+  --ink-rail: #ffffff;
+  --ink-raised: #f7f8f9;
+  --ink-hover: #eef0f2;
+
+  --line: #dfe3e7;
+  --line-strong: #c3cad1;
+
+  --text-primary: #14181c;
+  --text-secondary: #55606b;
+  --text-muted: #7b8590;
+
+  --sev-critical: #c22219;
+  --sev-warning: #a35c00;
+  --sev-ok: #3f7a56;
+  --sev-unknown: #7b8590;
+
+  --signal: #0069c2;
+
+  --sev-critical-wash: rgb(194 34 25 / 0.07);
+  --sev-warning-wash: rgb(163 92 0 / 0.06);
+  --grid-line: rgb(0 0 0 / 0.03);
+}
+
+/* Legacy aliases. The stale-surface treatment and the wall display were written
+   against these names before the token layer existed. */
 :root {
-  --bg-primary: #090d16;
-  --bg-secondary: #0f172a;
-  --bg-card: rgba(15, 23, 42, 0.75);
-  --bg-card-hover: rgba(30, 41, 59, 0.8);
-  --bg-input: #1e293b;
-  --border-subtle: rgba(51, 65, 85, 0.5);
-  --border-focus: #6366f1;
-
-  --text-primary: #f8fafc;
-  --text-secondary: #94a3b8;
-  --text-muted: #64748b;
-
-  --accent-primary: #6366f1;
-  --accent-primary-hover: #4f46e5;
-  --accent-gradient: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #d946ef 100%);
-  --accent-glow: rgba(99, 102, 241, 0.25);
-
-  --color-healthy: #10b981;
-  --color-healthy-bg: rgba(16, 185, 129, 0.12);
-  --color-warning: #f59e0b;
-  --color-warning-bg: rgba(245, 158, 11, 0.12);
-  --color-critical: #f43f5e;
-  --color-critical-bg: rgba(244, 63, 94, 0.12);
-  --color-info: #0ea5e9;
-  --color-info-bg: rgba(14, 165, 233, 0.12);
-
-  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'JetBrains Mono', monospace;
-
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 16px;
-  --radius-xl: 24px;
+  --severity-critical: var(--sev-critical);
+  --severity-warning: var(--sev-warning);
+  --severity-ok: var(--sev-ok);
+  --severity-unknown: var(--sev-unknown);
 }
 
-* {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  /*
+   * Monospace is the primary face, not an accent.
+   *
+   * This interface is almost entirely serials, fingerprints, distinguished
+   * names, dates and day counts. Setting them in a proportional face costs the
+   * one property that matters — a column of numbers that line up — and is the
+   * single loudest signal that a dashboard was assembled from a template.
+   * System stacks only: no network fetch, nothing to fail offline, and SF Mono
+   * on the Macs this team actually uses.
+   */
+  :root {
+  /*
+   * Type scale.
+   *
+   * The first cut of this design chased density and ended up at 9px labels and
+   * a 13px body — legible in a screenshot, not legible on a real screen from a
+   * normal seating distance, which is the only test that counts for a surface
+   * meant to be left running on a wall.
+   *
+   * Named by role rather than by size, and referenced everywhere instead of
+   * hard-coded, so the whole interface rescales from these four lines.
+   */
+  --fs-micro: 11px;   /* tracked uppercase labels under a figure */
+  --fs-label: 12px;   /* panel headers, nav, chips */
+  --fs-small: 13px;   /* secondary text, table cells, metadata */
+  --fs-body: 14px;    /* the default */
+
+    --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "Cascadia Mono",
+      "Roboto Mono", Consolas, monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+  }
+
+  html {
+    background: var(--ink-page);
+  }
+
+  body {
+    font-family: var(--font-mono);
+    font-size: var(--fs-body);
+    line-height: 1.5;
+    background: var(--ink-page);
+    color: var(--text-primary);
+    -webkit-font-smoothing: antialiased;
+    /* Every number in this product is a quantity to be compared with the number
+       above it. None of them may ever be proportionally spaced. */
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Prose — help text, empty states, error explanations. The only place a
+     proportional face earns its keep. */
+  .prose-ui {
+    font-family: var(--font-sans);
+    letter-spacing: 0;
+  }
+
+  ::selection {
+    background: var(--signal);
+    color: var(--ink-page);
+  }
+
+  :focus-visible {
+    outline: 1px solid var(--signal);
+    outline-offset: 1px;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--ink-page);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--line-strong);
+    border: 2px solid var(--ink-page);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
+  }
 }
 
-body {
-  font-family: var(--font-sans);
-  background-color: var(--bg-primary);
-  color: var(--text-primary);
-  min-height: 100vh;
-  overflow-x: hidden;
-  background-image: 
-    radial-gradient(at 10% 10%, rgba(99, 102, 241, 0.08) 0px, transparent 50%),
-    radial-gradient(at 90% 90%, rgba(217, 70, 239, 0.05) 0px, transparent 50%);
-}
+@layer components {
+  /* ── Typographic scale ──────────────────────────────────────────────────
+   *
+   * Small, tracked, uppercase labels; large tabular readouts. The contrast
+   * between the two is what makes a console legible at a glance — there is no
+   * middle register competing for attention.
+   */
+  .label-micro {
+    font-size: var(--fs-micro);
+    line-height: 1.2;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    font-weight: 500;
+  }
 
-/* Glassmorphism Cards */
-.glass-panel {
-  background: var(--bg-card);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-lg);
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-}
+  .label-rail {
+    font-size: var(--fs-label);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    font-weight: 600;
+  }
 
-.glass-panel:hover {
-  border-color: rgba(99, 102, 241, 0.3);
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
-}
+  .readout {
+    font-size: 2.25rem;
+    line-height: 1;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    color: var(--text-primary);
+  }
 
-/* Status Badges */
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border-radius: 9999px;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
+  .readout-lg {
+    font-size: 3.5rem;
+    line-height: 0.95;
+    font-weight: 500;
+    letter-spacing: -0.03em;
+  }
 
-.badge-healthy {
-  background: var(--color-healthy-bg);
-  color: var(--color-healthy);
-  border: 1px solid rgba(16, 185, 129, 0.25);
-}
+  /* ── Severity ───────────────────────────────────────────────────────────
+   * One definition. lib/severity.ts decides *which* severity applies; these
+   * decide what each one looks like.
+   */
+  /*
+   * Tripled deliberately, to raise specificity to (0,3,0).
+   *
+   * A single class is (0,1,0) and loses to `.tbl tbody td` and to any scoped
+   * component rule, both of which are (0,1,2) or higher. The symptom is not
+   * cosmetic: a remaining-days cell rendered in the ordinary text colour on a
+   * certificate with two days left, so the one number the reader is scanning
+   * for lost the only thing marking it as urgent. Severity colour is the
+   * load-bearing signal in this interface and has to win wherever it is
+   * applied, without every consumer remembering to out-specify it.
+   */
+  .sev-critical.sev-critical.sev-critical { color: var(--sev-critical); }
+  .sev-warning.sev-warning.sev-warning    { color: var(--sev-warning); }
+  .sev-ok.sev-ok.sev-ok                   { color: var(--sev-ok); }
+  .sev-unknown.sev-unknown.sev-unknown    { color: var(--sev-unknown); }
 
-.badge-warning {
-  background: var(--color-warning-bg);
-  color: var(--color-warning);
-  border: 1px solid rgba(245, 158, 11, 0.25);
-}
+  .sev-bg-critical { background: var(--sev-critical); }
+  .sev-bg-warning  { background: var(--sev-warning); }
+  .sev-bg-ok       { background: var(--sev-ok); }
+  .sev-bg-unknown  { background: var(--sev-unknown); }
 
-.badge-critical {
-  background: var(--color-critical-bg);
-  color: var(--color-critical);
-  border: 1px solid rgba(244, 63, 94, 0.25);
-}
+  /*
+   * The severity chip.
+   *
+   * Deliberately not a pill. Rounded pills read as decoration; a squared block
+   * with a leading bar reads as a state a machine reported.
+   */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.125rem 0.4375rem 0.125rem 0.3125rem;
+    font-size: var(--fs-micro);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    font-weight: 600;
+    border: 1px solid currentColor;
+    border-left-width: 3px;
+    white-space: nowrap;
+  }
 
-.badge-info {
-  background: var(--color-info-bg);
-  color: var(--color-info);
-  border: 1px solid rgba(14, 165, 233, 0.25);
-}
+  .dot {
+    width: 7px;
+    height: 7px;
+    flex: none;
+    border-radius: 50%;
+  }
 
-/* Primary Button */
-.btn-primary {
-  background: var(--accent-gradient);
-  color: #ffffff;
-  font-weight: 600;
-  font-size: 14px;
-  padding: 10px 18px;
-  border-radius: var(--radius-md);
-  border: none;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  transition: all 0.2s ease;
-  box-shadow: 0 4px 14px var(--accent-glow);
-}
+  /* ── Panel ──────────────────────────────────────────────────────────────
+   * The only container. No cards, no shadows, no radius — a bordered region
+   * with a labelled header rail, the way an instrument groups a readout.
+   */
+  .panel {
+    background: var(--ink-panel);
+    border: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
 
-.btn-primary:hover {
-  opacity: 0.95;
-  transform: translateY(-1px);
-  box-shadow: 0 6px 20px var(--accent-glow);
-}
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 0.875rem;
+    background: var(--ink-rail);
+    border-bottom: 1px solid var(--line);
+    min-height: 38px;
+  }
 
-.btn-secondary {
-  background: var(--bg-input);
-  color: var(--text-primary);
-  font-weight: 500;
-  font-size: 14px;
-  padding: 10px 18px;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-subtle);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  transition: all 0.2s ease;
-}
+  .panel-body {
+    padding: 0.75rem;
+    min-width: 0;
+  }
 
-.btn-secondary:hover {
-  background: var(--bg-card-hover);
-  border-color: var(--text-muted);
-}
+  .panel-body-flush {
+    padding: 0;
+    min-width: 0;
+  }
 
-/* Form Inputs */
-.input-field {
-  width: 100%;
-  background: var(--bg-input);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  padding: 10px 14px;
-  color: var(--text-primary);
-  font-size: 14px;
-  outline: none;
-  transition: border-color 0.2s ease;
-}
+  /* ── Table ──────────────────────────────────────────────────────────────
+   * Dense by intent. Row height is set so a 27-inch screen shows forty
+   * certificates, because a PKI team's real question is "which of these
+   * thousands" and pagination is a poor substitute for seeing them.
+   */
+  .tbl {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--fs-small);
+  }
 
-.input-field:focus {
-  border-color: var(--accent-primary);
-  box-shadow: 0 0 0 2px var(--accent-glow);
-}
+  .tbl thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--ink-rail);
+    border-bottom: 1px solid var(--line);
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    font-size: var(--fs-micro);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    font-weight: 500;
+    white-space: nowrap;
+    user-select: none;
+  }
 
-/* Tables */
-.table-container {
-  width: 100%;
-  overflow-x: auto;
-  border-radius: var(--radius-lg);
-  border: 1px solid var(--border-subtle);
-  background: var(--bg-card);
-}
+  .tbl tbody {
+    color: var(--text-secondary);
+  }
 
-table {
-  width: 100%;
-  border-collapse: collapse;
-  text-align: left;
-  font-size: 14px;
-}
+  .tbl tbody td {
+    padding: 0.4375rem 0.75rem;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
 
-th {
-  padding: 14px 18px;
-  background: rgba(15, 23, 42, 0.9);
-  color: var(--text-muted);
-  font-weight: 600;
-  text-transform: uppercase;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  border-bottom: 1px solid var(--border-subtle);
-}
+  .tbl tbody tr:hover td {
+    background: var(--ink-hover);
+  }
 
-td {
-  padding: 14px 18px;
-  border-bottom: 1px solid rgba(51, 65, 85, 0.3);
-  color: var(--text-primary);
-}
+  .tbl tbody tr[data-selected="true"] td {
+    background: var(--ink-raised);
+  }
 
-tr:hover td {
-  background: rgba(30, 41, 59, 0.4);
-}
+  .tbl .cell-primary {
+    color: var(--text-primary);
+  }
 
-/* Modal Backdrop */
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.7);
-  backdrop-filter: blur(8px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-  padding: 20px;
-}
+  .tbl .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
 
-.modal-content {
-  background: #0f172a;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-xl);
-  width: 100%;
-  max-width: 620px;
-  max-height: 90vh;
-  overflow-y: auto;
-  padding: 28px;
-  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-}
+  /*
+   * The severity rail down the left of a row.
+   *
+   * A three-pixel bar rather than a tinted row: tinting the whole row for every
+   * warning turns the table into a wash of colour and the criticals stop
+   * standing out, which defeats the purpose.
+   */
+  .tbl .rail {
+    width: 3px;
+    padding: 0;
+    border-bottom: 1px solid var(--line);
+  }
 
-/* Custom Scrollbar */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
+  /* ── Interactive ────────────────────────────────────────────────────────── */
+  .btn-console {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.3125rem 0.6875rem;
+    font-size: var(--fs-label);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--line-strong);
+    cursor: pointer;
+    transition: color 0.1s, border-color 0.1s, background 0.1s;
+  }
 
-::-webkit-scrollbar-track {
-  background: transparent;
-}
+  .btn-console:hover:not(:disabled) {
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+    background: var(--ink-hover);
+  }
 
-::-webkit-scrollbar-thumb {
-  background: rgba(100, 116, 139, 0.3);
-  border-radius: 4px;
-}
+  .btn-console:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
 
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(100, 116, 139, 0.5);
+  .btn-console[data-variant="signal"] {
+    color: var(--signal);
+    border-color: color-mix(in srgb, var(--signal) 45%, transparent);
+  }
+
+  .btn-console[data-variant="signal"]:hover:not(:disabled) {
+    color: var(--signal);
+    border-color: var(--signal);
+    background: color-mix(in srgb, var(--signal) 10%, transparent);
+  }
+
+  .input-console {
+    background: var(--ink-page);
+    border: 1px solid var(--line-strong);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: var(--fs-small);
+    padding: 0.375rem 0.5rem;
+  }
+
+  .input-console::placeholder {
+    color: var(--text-muted);
+  }
+
+  .input-console:focus {
+    outline: none;
+    border-color: var(--signal);
+  }
+
+  /* ── Grid substrate ─────────────────────────────────────────────────────
+   * A faint ruled ground behind the horizon. Barely visible and entirely the
+   * point: it reads as measured space rather than as a blank div.
+   */
+  .substrate {
+    background-image: linear-gradient(var(--grid-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+
+  /* ── Degraded states ────────────────────────────────────────────────────
+   *
+   * The failure this product exists to prevent is a CA expiring while everyone
+   * believed they were watching. A dashboard that keeps showing confident green
+   * after it has stopped receiving data manufactures exactly that belief, so
+   * when the feed dies the surface stops looking like a live readout.
+   */
+  .surface-stale {
+    filter: grayscale(0.9) opacity(0.55);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .surface-stale {
+      transition: none;
+    }
+  }
+
+  /*
+   * The wall display's dead-feed band. Nobody is standing in front of a
+   * corridor screen, so the only thing that draws a glance is movement. A
+   * static red band is read as part of the design within a day.
+   */
+  .wall-alarm {
+    animation: wall-alarm-pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes wall-alarm-pulse {
+    0%,
+    100% {
+      box-shadow: inset 0 0 0 0 rgb(0 0 0 / 0.25);
+    }
+    50% {
+      box-shadow: inset 0 0 80px 0 rgb(0 0 0 / 0.25);
+    }
+  }
+
+  /* Someone who cannot tolerate the movement still has to be told the feed is
+     dead, so the animation becomes a permanent inset rather than nothing. */
+  @media (prefers-reduced-motion: reduce) {
+    .wall-alarm {
+      animation: none;
+      box-shadow: inset 0 0 80px 0 rgb(0 0 0 / 0.25);
+    }
+  }
+
+  /* A slow breath for the live indicator. Fast enough to read as alive,
+     slow enough to ignore. */
+  .breathe {
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+
+  @keyframes breathe {
+    0%,
+    100% { opacity: 1; }
+    50%  { opacity: 0.35; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .breathe {
+      animation: none;
+    }
+  }
 }

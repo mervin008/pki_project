@@ -1,0 +1,28 @@
+# A throwaway PostgreSQL for the store conformance suite.
+#
+#   docker compose -f deploy/plain-postgres/docker-compose.yml up -d
+#   make test-store
+#
+# Nothing here is meant to hold data. The suite creates a database per test and
+# drops it afterwards, so this container exists only to be a server those
+# databases can live in for a few seconds.
+services:
+  postgres:
+    # Pinned. An unpinned major version means the suite silently starts testing
+    # a different database than the one anybody deploys, and finds out during a
+    # release.
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: conformance
+      POSTGRES_DB: postgres
+    ports:
+      - "55432:5432"
+    # No volume, deliberately: a suite that leaves state behind is a suite whose
+    # failures depend on what ran before it.
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

@@ -1,25 +1,66 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useApi } from '@/composables/useApi'
-import { 
-  ShieldCheck, 
-  Plus, 
-  RefreshCw, 
-  GitFork, 
-  Activity, 
-  AlertTriangle,
-  X,
-  CheckCircle2,
-  Trash2
+import { useCasStore } from '@/stores/cas'
+import DataState from '@/components/common/DataState.vue'
+import {
+  ShieldCheck, Plus, ChevronDown, ChevronRight, Lock, Server, Stamp,
+  RotateCw, CircleCheck, CircleX,
 } from 'lucide-vue-next'
+import {
+  caSeverity, severityBadge, severityBorder, severityText, statusLabel,
+} from '@/lib/severity'
+import { formatDate, formatDateTime, formatDays, truncate } from '@/lib/format'
+import type { CaAuthority } from '@/lib/types'
 
 const api = useApi()
-const cas = ref<any[]>([])
-const tree = ref<any[]>([])
-const loading = ref(true)
-const showRegisterModal = ref(false)
 
-const newCA = ref({
+// Shared with the dashboard and kept current by the event stream, so a CA that
+// goes critical while this page is open reorders itself without a reload — and
+// the two pages cannot show different states of the same estate.
+const cas = useCasStore()
+
+const authorities = computed(() => cas.authorities)
+// Most urgent first — an expiring issuing CA takes down everything it signed,
+// so it must never be below the fold.
+const byUrgency = computed(() => cas.byUrgency)
+
+const rootCount = computed(() => cas.countByType.ROOT ?? 0)
+const intermediateCount = computed(() => cas.countByType.INTERMEDIATE ?? 0)
+const issuingCount = computed(() => cas.countByType.ISSUING ?? 0)
+
+// Re-validate on entry. The store usually already holds live data, so this only
+// matters when the stream never came up.
+onMounted(() => {
+  if (!cas.loaded) void cas.refresh()
+})
+
+const expandedCa = ref<string | null>(null)
+function toggleExpand(id: string) {
+  expandedCa.value = expandedCa.value === id ? null : id
+}
+
+function typeIcon(type: string) {
+  switch (type) {
+    case 'ROOT': return Lock
+    case 'INTERMEDIATE': return Server
+    case 'ISSUING': return Stamp
+    default: return ShieldCheck
+  }
+}
+
+// ── Import ────────────────────────────────────────────────
+// CertPilot manages CAs; it does not generate them. The API registers an
+// existing authority from its certificate, so this is an import form.
+//
+// The previous form collected common name, organization, key size and validity
+// years as though CertPilot would mint the CA — and never sent the
+// `certificate_pem` the endpoint requires, so every submission was rejected.
+const showImport = ref(false)
+const importing = ref(false)
+const importError = ref<string | null>(null)
+
+const blankForm = () => ({
   name: '',
   certificate_pem: '',
   parent_ca_id: '',
@@ -27,281 +68,296 @@ const newCA = ref({
   ocsp_responder_url: '',
   notes: '',
 })
+const form = ref(blankForm())
 
-const submitting = ref(false)
-const errorMessage = ref('')
+const parentOptions = computed(() =>
+  authorities.value.filter((ca) => ca.ca_type === 'ROOT' || ca.ca_type === 'INTERMEDIATE'),
+)
 
-async function loadCAs() {
-  loading.value = true
+async function importCA() {
+  importing.value = true
+  importError.value = null
   try {
-    const [casRes, treeRes] = await Promise.all([
-      api.get<any>('/api/v1/pki/authorities').catch(() => ({ data: [] })),
-      api.get<any>('/api/v1/pki/tree').catch(() => ({ data: [] })),
-    ])
-    cas.value = casRes.data || []
-    tree.value = treeRes.data || []
+    await api.post('/api/v1/pki/authorities', {
+      name: form.value.name,
+      certificate_pem: form.value.certificate_pem,
+      parent_ca_id: form.value.parent_ca_id || null,
+      crl_distribution_url: form.value.crl_distribution_url || undefined,
+      ocsp_responder_url: form.value.ocsp_responder_url || undefined,
+      notes: form.value.notes || undefined,
+    })
+    showImport.value = false
+    form.value = blankForm()
+    await cas.refresh()
+  } catch (err) {
+    // Surfaced in the modal rather than an alert() the operator cannot copy.
+    importError.value = err instanceof Error ? err.message : String(err)
   } finally {
-    loading.value = false
+    importing.value = false
   }
 }
 
-async function triggerHealthCheck(id: string) {
-  try {
-    await api.post(`/api/v1/pki/authorities/${id}/check`)
-    await loadCAs()
-  } catch (err: any) {
-    alert('Health check failed: ' + err.message)
-  }
-}
+// ── On-demand health check ────────────────────────────────
+const checking = ref<string | null>(null)
+const checkError = ref<string | null>(null)
 
-async function deleteCA(id: string) {
-  if (!confirm('Are you sure you want to unregister this CA authority?')) return
+async function checkNow(ca: CaAuthority) {
+  checking.value = ca.id
+  checkError.value = null
   try {
-    await api.delete(`/api/v1/pki/authorities/${id}`)
-    await loadCAs()
-  } catch (err: any) {
-    alert('Failed to delete CA: ' + err.message)
-  }
-}
-
-async function submitCA() {
-  submitting.value = true
-  errorMessage.value = ''
-  try {
-    const payload = {
-      ...newCA.value,
-      parent_ca_id: newCA.value.parent_ca_id ? newCA.value.parent_ca_id : undefined,
-    }
-    await api.post('/api/v1/pki/authorities', payload)
-    showRegisterModal.value = false
-    newCA.value = {
-      name: '',
-      certificate_pem: '',
-      parent_ca_id: '',
-      crl_distribution_url: '',
-      ocsp_responder_url: '',
-      notes: '',
-    }
-    await loadCAs()
-  } catch (err: any) {
-    errorMessage.value = err.message
+    await api.post(`/api/v1/pki/authorities/${ca.id}/check`)
+    await cas.refresh()
+  } catch (err) {
+    checkError.value = err instanceof Error ? err.message : String(err)
   } finally {
-    submitting.value = false
+    checking.value = null
   }
 }
-
-onMounted(() => {
-  loadCAs()
-})
 </script>
 
 <template>
-  <div class="space-y-8">
-    <!-- Header -->
-    <div class="flex items-center justify-between">
-      <div>
-        <h2 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2.5">
-          <ShieldCheck class="w-7 h-7 text-indigo-400" />
-          PKI & Certificate Authority Management
-        </h2>
-        <p class="text-sm text-slate-400 mt-1">
-          Monitor Root and Intermediate CAs, inspect trust hierarchies, track validity expiration, and verify CRL/OCSP freshness.
-        </p>
-      </div>
-
-      <div class="flex items-center gap-3">
-        <button @click="loadCAs" class="btn-secondary">
-          <RefreshCw class="w-4 h-4" :class="{ 'animate-spin': loading }" />
+  <div class="space-y-6">
+    <div class="flex items-center justify-between gap-4 flex-wrap">
+      <p class="text-sm text-base-content/60">
+        Certificate authorities under management, most urgent first
+      </p>
+      <div class="flex items-center gap-2">
+        <button class="btn btn-ghost btn-sm gap-1.5" :disabled="cas.loading" @click="cas.refresh()">
+          <RotateCw class="w-3.5 h-3.5" :class="cas.loading && 'animate-spin'" />
           Refresh
         </button>
-        <button @click="showRegisterModal = true" class="btn-primary">
-          <Plus class="w-4 h-4" />
-          Register CA Authority
+        <button class="btn btn-primary btn-sm gap-2" @click="showImport = true">
+          <Plus class="w-4 h-4" /> Import CA
         </button>
       </div>
     </div>
 
-    <!-- Trust Chain Tree Visualization -->
-    <div class="glass-panel p-6 space-y-4">
-      <div class="flex items-center justify-between border-b border-slate-800/80 pb-4">
-        <div class="flex items-center gap-2">
-          <GitFork class="w-5 h-5 text-indigo-400" />
-          <h3 class="text-base font-semibold text-white">Trust Chain Hierarchy</h3>
-        </div>
-        <span class="text-xs text-slate-400">Root &rarr; Intermediate &rarr; Issuing CAs</span>
-      </div>
-
-      <div v-if="tree.length === 0" class="py-6 text-center text-sm text-slate-400">
-        No hierarchy chains constructed yet. Register a Root CA and its intermediate subordinates below.
-      </div>
-
-      <div v-else class="space-y-4 pt-2">
-        <div v-for="node in tree" :key="node.authority.id" class="p-4 rounded-xl bg-slate-900/60 border border-slate-800">
-          <div class="flex items-center justify-between">
-            <div class="flex items-center gap-3">
-              <div class="w-3 h-3 rounded-full bg-emerald-500"></div>
-              <div>
-                <span class="font-bold text-white text-sm">{{ node.authority.name }}</span>
-                <span class="text-xs text-slate-400 ml-2 font-mono">({{ node.authority.ca_type }})</span>
-              </div>
-            </div>
-            <div class="text-xs font-mono text-emerald-400 font-bold">
-              {{ node.authority.days_remaining }} days left
-            </div>
-          </div>
-
-          <!-- Children Intermediates -->
-          <div v-if="node.children && node.children.length > 0" class="mt-4 pl-6 border-l-2 border-indigo-500/30 space-y-3">
-            <div v-for="child in node.children" :key="child.authority.id" class="p-3 rounded-lg bg-slate-950/60 border border-slate-800 flex items-center justify-between">
-              <div class="flex items-center gap-2.5">
-                <div class="w-2.5 h-2.5 rounded-full bg-indigo-400"></div>
-                <div>
-                  <span class="font-semibold text-slate-200 text-xs">{{ child.authority.name }}</span>
-                  <span class="text-[11px] text-slate-400 ml-2 font-mono">({{ child.authority.ca_type }})</span>
-                </div>
-              </div>
-              <div class="text-xs font-mono text-indigo-300 font-medium">
-                {{ child.authority.days_remaining }}d remaining
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
+    <div v-if="checkError" role="alert" class="alert alert-error">
+      <CircleX class="w-5 h-5 shrink-0" />
+      <span class="text-sm">{{ checkError }}</span>
     </div>
 
-    <!-- CA Authorities Inventory Table -->
-    <div class="space-y-4">
-      <h3 class="text-base font-semibold text-white">All Monitored Certificate Authorities</h3>
+    <DataState
+      :loading="cas.loading"
+      :error="cas.error"
+      :loaded="cas.loaded"
+      @retry="cas.refresh()"
+    >
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
+          <div class="stat-title text-xs">Total CAs</div>
+          <div class="stat-value text-xl tabular-nums">{{ authorities.length }}</div>
+        </div>
+        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
+          <div class="stat-title text-xs">Root</div>
+          <div class="stat-value text-xl tabular-nums">{{ rootCount }}</div>
+        </div>
+        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
+          <div class="stat-title text-xs">Intermediate</div>
+          <div class="stat-value text-xl tabular-nums">{{ intermediateCount }}</div>
+        </div>
+        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
+          <div class="stat-title text-xs">Issuing</div>
+          <div class="stat-value text-xl tabular-nums">{{ issuingCount }}</div>
+        </div>
+      </div>
 
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>CA Name & Type</th>
-              <th>Subject DN</th>
-              <th>Algorithm</th>
-              <th>Validity Remaining</th>
-              <th>Status</th>
-              <th>CRL / OCSP</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-if="cas.length === 0">
-              <td colspan="7" class="text-center py-8 text-slate-400">
-                No CA authorities recorded yet. Click "Register CA Authority" above.
-              </td>
-            </tr>
-            <tr v-for="ca in cas" :key="ca.id">
-              <td>
-                <div class="font-semibold text-white">{{ ca.name }}</div>
-                <div class="text-xs text-slate-400 font-mono">{{ ca.ca_type }} CA</div>
-              </td>
-              <td class="font-mono text-xs text-slate-300 max-w-xs truncate" :title="ca.subject_dn">
-                {{ ca.subject_dn }}
-              </td>
-              <td class="font-mono text-xs text-slate-400">
-                {{ ca.key_type }} {{ ca.key_size }}
-              </td>
-              <td>
-                <div class="font-mono font-bold text-xs" :class="ca.days_remaining <= 30 ? 'text-rose-400' : ca.days_remaining <= 180 ? 'text-amber-400' : 'text-emerald-400'">
-                  {{ ca.days_remaining }} days
+      <div v-if="byUrgency.length" class="space-y-3">
+        <div
+          v-for="ca in byUrgency"
+          :key="ca.id"
+          class="card bg-base-100 border border-base-300 border-l-4"
+          :class="severityBorder(caSeverity(ca.status))"
+        >
+          <div class="card-body p-4">
+            <div
+              class="flex items-center justify-between gap-3 cursor-pointer"
+              role="button"
+              tabindex="0"
+              @click="toggleExpand(ca.id)"
+              @keydown.enter="toggleExpand(ca.id)"
+              @keydown.space.prevent="toggleExpand(ca.id)"
+            >
+              <div class="flex items-center gap-3 min-w-0">
+                <div class="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
+                  <component :is="typeIcon(ca.ca_type)" class="w-4 h-4 text-primary" />
                 </div>
-                <div class="text-[11px] text-slate-400">Expires {{ new Date(ca.not_after).toLocaleDateString() }}</div>
-              </td>
-              <td>
-                <span class="badge" :class="ca.status === 'HEALTHY' ? 'badge-healthy' : ca.status === 'WARNING' ? 'badge-warning' : 'badge-critical'">
-                  {{ ca.status }}
+                <div class="min-w-0">
+                  <div class="font-bold text-sm truncate">{{ ca.name }}</div>
+                  <div class="text-[11px] text-base-content/60 truncate">
+                    {{ statusLabel(ca.ca_type) }} · {{ ca.key_type }}<template v-if="ca.key_size">-{{ ca.key_size }}</template>
+                  </div>
+                </div>
+              </div>
+              <div class="flex items-center gap-3 shrink-0">
+                <span
+                  class="text-xs font-mono tabular-nums"
+                  :class="severityText(caSeverity(ca.status))"
+                >
+                  {{ formatDays(ca.days_remaining) }}
                 </span>
-              </td>
-              <td class="text-xs">
-                <div class="flex items-center gap-1.5" :class="ca.is_crl_fresh ? 'text-emerald-400' : 'text-slate-400'">
-                  <span>CRL: {{ ca.is_crl_fresh ? 'Fresh' : 'Unknown' }}</span>
-                </div>
-                <div class="flex items-center gap-1.5" :class="ca.is_ocsp_responsive ? 'text-emerald-400' : 'text-slate-400'">
-                  <span>OCSP: {{ ca.is_ocsp_responsive ? 'Online' : 'Unknown' }}</span>
-                </div>
-              </td>
-              <td>
-                <div class="flex items-center gap-2">
-                  <button @click="triggerHealthCheck(ca.id)" class="p-1.5 text-slate-400 hover:text-indigo-300 hover:bg-slate-800 rounded transition-colors" title="Check Health Now">
-                    <Activity class="w-4 h-4" />
-                  </button>
-                  <button @click="deleteCA(ca.id)" class="p-1.5 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded transition-colors" title="Delete CA">
-                    <Trash2 class="w-4 h-4" />
-                  </button>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
+                <span class="badge badge-sm" :class="severityBadge(caSeverity(ca.status))">
+                  {{ statusLabel(ca.status) }}
+                </span>
+                <ChevronDown v-if="expandedCa === ca.id" class="w-4 h-4 opacity-50" />
+                <ChevronRight v-else class="w-4 h-4 opacity-50" />
+              </div>
+            </div>
 
-    <!-- Register CA Authority Modal -->
-    <div v-if="showRegisterModal" class="modal-backdrop">
-      <div class="modal-content">
-        <div class="flex items-center justify-between border-b border-slate-800 pb-4 mb-6">
-          <h3 class="text-lg font-bold text-white">Register Certificate Authority</h3>
-          <button @click="showRegisterModal = false" class="text-slate-400 hover:text-white">
-            <X class="w-5 h-5" />
+            <div v-if="expandedCa === ca.id" class="mt-4 pt-4 border-t border-base-300 space-y-4">
+              <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+                <div>
+                  <div class="text-base-content/60 mb-1">Expires</div>
+                  <div class="font-mono">{{ formatDate(ca.not_after) }}</div>
+                </div>
+                <div>
+                  <div class="text-base-content/60 mb-1">Certificates issued</div>
+                  <div class="font-bold tabular-nums">{{ ca.certificates_issued_count }}</div>
+                </div>
+                <div>
+                  <div class="text-base-content/60 mb-1">CRL</div>
+                  <div v-if="ca.crl_distribution_url" class="flex items-center gap-1">
+                    <CircleCheck v-if="ca.is_crl_fresh" class="w-3.5 h-3.5 text-success" />
+                    <CircleX v-else class="w-3.5 h-3.5 text-error" />
+                    <span>{{ ca.is_crl_fresh ? 'Fresh' : 'Stale' }}</span>
+                  </div>
+                  <div v-else class="opacity-60">Not published</div>
+                </div>
+                <div>
+                  <div class="text-base-content/60 mb-1">Last checked</div>
+                  <div class="font-mono">{{ formatDateTime(ca.crl_last_checked) }}</div>
+                </div>
+                <div class="col-span-2">
+                  <div class="text-base-content/60 mb-1">Subject</div>
+                  <div class="font-mono break-all">{{ truncate(ca.subject_dn, 72) }}</div>
+                </div>
+                <div class="col-span-2">
+                  <div class="text-base-content/60 mb-1">Issuer</div>
+                  <div class="font-mono break-all">{{ truncate(ca.issuer_dn, 72) }}</div>
+                </div>
+                <div class="col-span-2 md:col-span-4">
+                  <div class="text-base-content/60 mb-1">SHA-256 fingerprint</div>
+                  <div class="font-mono text-[10px] break-all">{{ ca.fingerprint_sha256 }}</div>
+                </div>
+              </div>
+
+              <div class="flex items-center gap-2">
+                <button
+                  class="btn btn-outline btn-xs gap-1.5"
+                  :disabled="checking === ca.id"
+                  @click.stop="checkNow(ca)"
+                >
+                  <RotateCw class="w-3 h-3" :class="checking === ca.id && 'animate-spin'" />
+                  Check now
+                </button>
+                <span v-if="ca.last_alert_sent_at" class="text-[11px] opacity-60">
+                  Last alert at the {{ ca.last_alert_threshold }}-day threshold,
+                  {{ formatDateTime(ca.last_alert_sent_at) }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="card bg-base-100 border border-base-300">
+        <div class="card-body items-center text-center py-12">
+          <ShieldCheck class="w-10 h-10 opacity-30" />
+          <h3 class="font-bold text-sm">No certificate authorities yet</h3>
+          <p class="text-xs opacity-60 max-w-sm">
+            Import a CA certificate to start monitoring its expiry, CRL freshness, and the
+            certificates it issues.
+          </p>
+          <button class="btn btn-primary btn-sm gap-2 mt-2" @click="showImport = true">
+            <Plus class="w-4 h-4" /> Import CA
           </button>
         </div>
+      </div>
+    </DataState>
 
-        <div v-if="errorMessage" class="mb-4 p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs">
-          {{ errorMessage }}
+    <!-- Import modal -->
+    <dialog class="modal" :class="{ 'modal-open': showImport }">
+      <div class="modal-box max-w-lg">
+        <h3 class="text-base font-bold mb-1">Import certificate authority</h3>
+        <p class="text-xs opacity-60 mb-4">
+          CertPilot monitors existing CAs rather than generating them. Paste the authority's
+          certificate; subject, validity, key details and revocation URLs are read from it.
+        </p>
+
+        <div v-if="importError" role="alert" class="alert alert-error mb-3">
+          <CircleX class="w-4 h-4 shrink-0" />
+          <span class="text-xs break-words">{{ importError }}</span>
         </div>
 
-        <form @submit.prevent="submitCA" class="space-y-4">
-          <div>
-            <label class="block text-xs font-semibold text-slate-300 mb-1.5">Authority Name</label>
-            <input v-model="newCA.name" class="input-field" placeholder="e.g. Corporate Root CA 2026" required />
+        <form class="space-y-3" @submit.prevent="importCA">
+          <div class="form-control">
+            <label class="label" for="ca-name"><span class="label-text text-xs">Name</span></label>
+            <input
+              id="ca-name" v-model="form.name" type="text" required
+              placeholder="e.g. Corporate Issuing CA"
+              class="input input-bordered input-sm"
+            />
           </div>
 
-          <div>
-            <label class="block text-xs font-semibold text-slate-300 mb-1.5">CA Certificate (PEM Format)</label>
-            <textarea 
-              v-model="newCA.certificate_pem" 
-              class="input-field font-mono text-xs h-36" 
-              placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----" 
-              required
+          <div class="form-control">
+            <label class="label" for="ca-pem">
+              <span class="label-text text-xs">Certificate (PEM)</span>
+            </label>
+            <textarea
+              id="ca-pem" v-model="form.certificate_pem" required rows="6"
+              placeholder="-----BEGIN CERTIFICATE-----&#10;…&#10;-----END CERTIFICATE-----"
+              class="textarea textarea-bordered textarea-sm font-mono text-[11px]"
             ></textarea>
           </div>
 
-          <div>
-            <label class="block text-xs font-semibold text-slate-300 mb-1.5">Parent CA (Optional - for Intermediate CAs)</label>
-            <select v-model="newCA.parent_ca_id" class="input-field">
-              <option value="">None (Top-Level Root CA)</option>
-              <option v-for="ca in cas" :key="ca.id" :value="ca.id">{{ ca.name }} ({{ ca.ca_type }})</option>
+          <div class="form-control">
+            <label class="label" for="ca-parent">
+              <span class="label-text text-xs">Parent CA</span>
+              <span class="label-text-alt text-[10px] opacity-60">Leave empty for a root</span>
+            </label>
+            <select id="ca-parent" v-model="form.parent_ca_id" class="select select-bordered select-sm">
+              <option value="">None — this is a root</option>
+              <option v-for="p in parentOptions" :key="p.id" :value="p.id">{{ p.name }}</option>
             </select>
           </div>
 
-          <div class="grid grid-cols-2 gap-4">
-            <div>
-              <label class="block text-xs font-semibold text-slate-300 mb-1.5">CRL Distribution URL</label>
-              <input v-model="newCA.crl_distribution_url" class="input-field text-xs font-mono" placeholder="http://crl.example.com/ca.crl" />
+          <details class="collapse collapse-arrow border border-base-300 rounded-lg">
+            <summary class="collapse-title text-xs font-medium py-2 min-h-0">
+              Revocation endpoints and notes
+            </summary>
+            <div class="collapse-content space-y-3">
+              <p class="text-[11px] opacity-60">
+                Read from the certificate when left empty.
+              </p>
+              <input
+                v-model="form.crl_distribution_url" type="url" placeholder="CRL distribution URL"
+                class="input input-bordered input-sm w-full"
+              />
+              <input
+                v-model="form.ocsp_responder_url" type="url" placeholder="OCSP responder URL"
+                class="input input-bordered input-sm w-full"
+              />
+              <textarea
+                v-model="form.notes" rows="2" placeholder="Notes"
+                class="textarea textarea-bordered textarea-sm w-full"
+              ></textarea>
             </div>
-            <div>
-              <label class="block text-xs font-semibold text-slate-300 mb-1.5">OCSP Responder URL</label>
-              <input v-model="newCA.ocsp_responder_url" class="input-field text-xs font-mono" placeholder="http://ocsp.example.com" />
-            </div>
-          </div>
+          </details>
 
-          <div>
-            <label class="block text-xs font-semibold text-slate-300 mb-1.5">Notes & Scope</label>
-            <input v-model="newCA.notes" class="input-field" placeholder="Internal issuance for production Kubernetes clusters" />
-          </div>
-
-          <div class="flex items-center justify-end gap-3 pt-4 border-t border-slate-800">
-            <button type="button" @click="showRegisterModal = false" class="btn-secondary">
+          <div class="modal-action">
+            <button type="button" class="btn btn-ghost btn-sm" @click="showImport = false">
               Cancel
             </button>
-            <button type="submit" class="btn-primary" :disabled="submitting">
-              {{ submitting ? 'Registering...' : 'Register CA' }}
+            <button type="submit" class="btn btn-primary btn-sm" :disabled="importing">
+              <span v-if="importing" class="loading loading-spinner loading-xs"></span>
+              Import
             </button>
           </div>
         </form>
       </div>
-    </div>
+      <form method="dialog" class="modal-backdrop" @click="showImport = false">
+        <button>close</button>
+      </form>
+    </dialog>
   </div>
 </template>

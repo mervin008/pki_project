@@ -7,9 +7,12 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/certpilot/certpilot/core/engine/deploy"
+	"github.com/certpilot/certpilot/core/events"
 	"github.com/certpilot/certpilot/core/pluginmgr"
 	"github.com/certpilot/certpilot/core/store"
 	providerv1 "github.com/certpilot/certpilot/pkg/pb/provider/v1"
+	"github.com/certpilot/certpilot/pkg/secrets"
 	"github.com/certpilot/certpilot/pkg/x509util"
 )
 
@@ -17,17 +20,27 @@ import (
 type Executor struct {
 	store     store.Store
 	pluginMgr *pluginmgr.Manager
+	keyring   *secrets.Keyring
+	broker    *events.Broker
 }
 
-// NewExecutor creates a new renewal executor.
-func NewExecutor(s store.Store, pm *pluginmgr.Manager) *Executor {
+// NewExecutor creates a new renewal executor. The broker may be nil, in which
+// case no events are published.
+func NewExecutor(s store.Store, pm *pluginmgr.Manager, kr *secrets.Keyring, broker *events.Broker) *Executor {
 	return &Executor{
 		store:     s,
 		pluginMgr: pm,
+		keyring:   kr,
+		broker:    broker,
 	}
 }
 
-// RenewCertificate executes a certificate renewal through the assigned CA account gateway.
+// RenewCertificate executes a certificate renewal through the assigned CA
+// account gateway.
+//
+// A renewal is only complete when the new certificate and the key that matches
+// it are both persisted. Storing one without the other produces a record that
+// looks healthy on a dashboard and cannot terminate TLS.
 func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.Certificate, error) {
 	cert, err := e.store.GetCertificate(ctx, certID)
 	if err != nil {
@@ -43,14 +56,19 @@ func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.
 		return nil, fmt.Errorf("failed to fetch CA account: %w", err)
 	}
 
-	// Find the gateway plugin
 	gw, err := e.pluginMgr.GetGateway(caAccount.Name)
 	if err != nil {
-		// Try by provider type
+		// Fall back to matching by provider type, for deployments that run one
+		// shared gateway per protocol rather than one per account.
 		gw, err = e.pluginMgr.GetGateway(caAccount.ProviderType)
 		if err != nil {
-			return nil, fmt.Errorf("gateway for CA account %s not connected: %w", caAccount.Name, err)
+			return nil, fmt.Errorf("gateway for CA account %s is not connected: %w", caAccount.Name, err)
 		}
+	}
+
+	providerConfig, err := e.decryptCAConfig(caAccount)
+	if err != nil {
+		return nil, err
 	}
 
 	slog.Info("executing certificate renewal",
@@ -61,14 +79,16 @@ func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.
 
 	now := time.Now()
 	cert.LastRenewalAttempt = &now
+	// Captured before anything overwrites it: this is what the endpoints are
+	// expected to stop serving.
+	previousFingerprint := cert.FingerprintSHA256
 
-	// Build renew request
 	renewReq := &providerv1.RenewCertificateRequest{
 		ProviderCertificateId: cert.SerialNumber,
 		Domains:               append([]string{cert.CommonName}, cert.SANs...),
 		KeyType:               cert.KeyType,
 		KeySize:               int32(cert.KeySize),
-		ProviderConfig:        caAccount.ConfigEncrypted,
+		ProviderConfig:        providerConfig,
 	}
 	if cert.CertificatePEM != nil {
 		renewReq.CurrentCertificatePem = []byte(*cert.CertificatePEM)
@@ -76,49 +96,49 @@ func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.
 
 	resp, err := gw.Client.RenewCertificate(ctx, renewReq)
 	if err != nil {
-		errMsg := err.Error()
-		cert.RenewalError = &errMsg
-		cert.Status = "RENEWAL_FAILED"
-		_ = e.store.UpdateCertificate(ctx, cert)
-
-		// Audit failure
-		_ = e.store.CreateAuditLog(ctx, &store.AuditLog{
-			Action:     "cert.renewal_failed",
-			EntityType: "certificate",
-			EntityID:   &cert.ID,
-			Details:    fmt.Sprintf(`{"error": %q, "cn": %q}`, errMsg, cert.CommonName),
-		})
-
-		return nil, fmt.Errorf("gateway renewal failed: %w", err)
+		return nil, e.recordFailure(ctx, cert, err)
 	}
 
-	// Renewal succeeded — update cert details
-	if resp.Certificate != nil {
-		certPEM := string(resp.Certificate.CertificatePem)
-		cert.CertificatePEM = &certPEM
-		if len(resp.Certificate.ChainPem) > 0 {
-			chainPEM := string(resp.Certificate.ChainPem)
-			cert.ChainPEM = &chainPEM
-		}
-
-		if resp.Certificate.NotBefore != nil {
-			nb := resp.Certificate.NotBefore.AsTime()
-			cert.NotBefore = &nb
-		}
-		if resp.Certificate.NotAfter != nil {
-			na := resp.Certificate.NotAfter.AsTime()
-			cert.NotAfter = &na
-			cert.DaysRemaining = int(time.Until(na).Hours() / 24)
-		}
-		if resp.Certificate.SerialNumber != "" {
-			cert.SerialNumber = resp.Certificate.SerialNumber
-		}
-
-		// Re-compute SHA256 fingerprint if PEM updated
-		if info, err := x509util.ParseCertificatePEM(resp.Certificate.CertificatePem); err == nil {
-			cert.FingerprintSHA256 = info.FingerprintSHA256
-		}
+	if resp.Certificate == nil || len(resp.Certificate.CertificatePem) == 0 {
+		return nil, e.recordFailure(ctx, cert, fmt.Errorf("gateway reported success but returned no certificate"))
 	}
+
+	// Parse before persisting. A gateway that returns something that is not a
+	// certificate must not be able to overwrite a working record with it.
+	info, err := x509util.ParseCertificatePEM(resp.Certificate.CertificatePem)
+	if err != nil {
+		return nil, e.recordFailure(ctx, cert,
+			fmt.Errorf("gateway returned data that is not a valid X.509 certificate: %w", err))
+	}
+
+	// Seal the rotated key before anything else is written. Renewal normally
+	// rotates the key, and dropping the new key here is what previously left
+	// the stored certificate and key mismatched after every renewal.
+	if len(resp.Certificate.PrivateKeyPem) > 0 {
+		sealed, err := e.keyring.Encrypt(resp.Certificate.PrivateKeyPem, secrets.ContextCertificatePrivKey)
+		if err != nil {
+			return nil, e.recordFailure(ctx, cert,
+				fmt.Errorf("failed to encrypt the renewed private key, refusing to store it in the clear: %w", err))
+		}
+		cert.PrivateKeyEncrypted = &sealed
+	}
+
+	certPEM := string(resp.Certificate.CertificatePem)
+	cert.CertificatePEM = &certPEM
+	if len(resp.Certificate.ChainPem) > 0 {
+		chainPEM := string(resp.Certificate.ChainPem)
+		cert.ChainPEM = &chainPEM
+	}
+
+	notBefore, notAfter := info.NotBefore, info.NotAfter
+	cert.NotBefore = &notBefore
+	cert.NotAfter = &notAfter
+	cert.DaysRemaining = info.DaysRemaining
+	cert.SerialNumber = info.SerialNumber
+	cert.IssuerDN = info.IssuerDN
+	cert.FingerprintSHA256 = info.FingerprintSHA256
+	cert.KeyType = info.KeyType
+	cert.KeySize = info.KeySize
 
 	cert.Status = "ISSUED"
 	cert.RenewalError = nil
@@ -128,19 +148,131 @@ func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.
 		return nil, fmt.Errorf("failed to save renewed certificate: %w", err)
 	}
 
-	// Audit success
+	// A renewal is not done when the certificate is stored. It is done when the
+	// thing serving it is serving it.
+	//
+	// This is where that stops being somebody else's job. Deployments are
+	// enqueued directly rather than driven off the cert.renewed event published
+	// below: the broker drops the oldest event on a slow consumer, which is the
+	// right policy for a wall display and precisely the wrong one here — a
+	// dropped event would be a certificate that renewed and silently never
+	// deployed, which is the failure this phase exists to prevent, produced by
+	// the machinery meant to prevent it.
+	//
+	// A failure here is not fatal to the renewal, which has already happened.
+	// It is loud, because the certificate is now newer than the thing serving
+	// it and nothing is scheduled to fix that.
+	rollout, deployErr := deploy.EnqueueFor(ctx, e.store, cert, store.DeployReasonRenewal, nil, nil)
+	if deployErr != nil {
+		slog.Error("a certificate was renewed and its deployments could not be queued",
+			"cert_id", cert.ID, "common_name", cert.CommonName, "error", deployErr)
+	} else if rollout.Total() > 0 {
+		slog.Info("queued deployments for a renewed certificate",
+			"common_name", cert.CommonName, "queued", rollout.Queued,
+			"already_queued", rollout.Already, "switched_off", rollout.Skipped,
+			"not_automatic", rollout.OptedOut)
+	}
+
+	// Written through the narrow verification writer rather than as fields on
+	// the row above. UpdateCertificate has an explicit column list, and adding
+	// to the model without adding to that list drops the value in silence —
+	// which is exactly what happened the first time this was written, and the
+	// in-memory store could not show it because it stores whole structs.
+	verifyAt := time.Now().Add(VerifyGrace)
+	if err := e.store.UpdateCertificateVerification(ctx, cert.ID, store.VerificationUpdate{
+		State:               store.VerificationPending,
+		CheckedAt:           time.Now(),
+		VerifyAfter:         &verifyAt,
+		Attempts:            0,
+		PreviousFingerprint: previousFingerprint,
+	}); err != nil {
+		// Not fatal to the renewal, which has already happened and been stored.
+		// But it does mean nothing will check that this reached the server, so
+		// it is said loudly rather than logged at debug.
+		slog.Error("a certificate was renewed but its deployment check could not be scheduled",
+			"cert_id", cert.ID, "error", err)
+	}
+
 	_ = e.store.CreateAuditLog(ctx, &store.AuditLog{
 		Action:     "cert.renewed",
 		EntityType: "certificate",
 		EntityID:   &cert.ID,
-		Details:    fmt.Sprintf(`{"cn": %q, "serial": %q, "days_remaining": %d}`, cert.CommonName, cert.SerialNumber, cert.DaysRemaining),
+		Details: fmt.Sprintf(`{"cn": %q, "serial": %q, "not_after": %q, "renewal_count": %d}`,
+			cert.CommonName, cert.SerialNumber, notAfter.Format(time.RFC3339), cert.RenewalCount),
+	})
+
+	e.broker.Publish(events.Event{
+		Topic:    events.TopicCertRenewed,
+		Severity: events.SeverityInfo,
+		EntityID: cert.ID,
+		Payload: map[string]any{
+			"common_name":    cert.CommonName,
+			"serial_number":  cert.SerialNumber,
+			"days_remaining": cert.DaysRemaining,
+			"not_after":      notAfter.Format(time.RFC3339),
+			"renewal_count":  cert.RenewalCount,
+		},
 	})
 
 	slog.Info("certificate renewed successfully",
 		"cert_id", cert.ID,
 		"common_name", cert.CommonName,
+		"serial", cert.SerialNumber,
 		"days_remaining", cert.DaysRemaining,
 	)
 
 	return cert, nil
+}
+
+// recordFailure marks a renewal as failed, audits it, and returns the error to
+// propagate.
+func (e *Executor) recordFailure(ctx context.Context, cert *store.Certificate, cause error) error {
+	errMsg := cause.Error()
+	cert.RenewalError = &errMsg
+	cert.Status = "RENEWAL_FAILED"
+
+	if err := e.store.UpdateCertificate(ctx, cert); err != nil {
+		slog.Error("failed to record renewal failure", "cert_id", cert.ID, "error", err)
+	}
+
+	_ = e.store.CreateAuditLog(ctx, &store.AuditLog{
+		Action:     "cert.renewal_failed",
+		EntityType: "certificate",
+		EntityID:   &cert.ID,
+		Details:    fmt.Sprintf(`{"error": %q, "cn": %q}`, errMsg, cert.CommonName),
+	})
+
+	// Deliberately does not publish.
+	//
+	// A failed renewal is still a certificate on its way to expiry with nobody
+	// watching, but this function is now one attempt among many rather than the
+	// whole story. The queue owns the alert and raises it once, when a failure
+	// stops being a blip — announcing here would put a CRITICAL message in the
+	// channel every few minutes for a fortnight, and a channel people mute
+	// takes the CA expiry alerts sharing it along too.
+	return fmt.Errorf("renewal failed for %s: %w", cert.CommonName, cause)
+}
+
+func (e *Executor) decryptCAConfig(acc *store.CAAccount) (string, error) {
+	return decryptCAConfig(e.keyring, acc)
+}
+
+// decryptCAConfig opens a CA account's sealed configuration.
+//
+// Shared by the executor and the renewal information poller: both have to hand
+// the same provider config to the same gateway, and two copies of this would be
+// two places for the pre-encryption fallback below to drift.
+func decryptCAConfig(keyring *secrets.Keyring, acc *store.CAAccount) (string, error) {
+	if acc.ConfigEncrypted == "" {
+		return "", nil
+	}
+	// Accounts written before encryption existed are stored as plaintext JSON.
+	if !secrets.IsEnvelope(acc.ConfigEncrypted) {
+		return acc.ConfigEncrypted, nil
+	}
+	plaintext, err := keyring.DecryptString(acc.ConfigEncrypted, secrets.ContextCAAccountConfig)
+	if err != nil {
+		return "", fmt.Errorf("failed to decrypt the configuration for CA account %q: %w", acc.Name, err)
+	}
+	return plaintext, nil
 }

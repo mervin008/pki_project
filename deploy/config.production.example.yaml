@@ -1,0 +1,60 @@
+# CertPilot core, production. Copy to deploy/config.production.yaml and edit.
+#
+# Paths here are inside the container, as mounted by docker-compose.yml.
+# Secrets are not in this file: CERTPILOT_KEK and CERTPILOT_DB_URL come from
+# the environment, and ${VAR} is expanded when the file is loaded.
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  # Refuses anonymous access, an insecure gateway channel, a wildcard origin,
+  # a missing auth method, and a missing database. See docs/configuration.md.
+  mode: "production"
+  allowed_origins:
+    - "https://certpilot.example.com"
+
+auth:
+  # Verifies asymmetric signatures against published keys, so the core holds
+  # nothing capable of minting a token. Any OIDC provider.
+  jwks_url: "${CERTPILOT_JWKS_URL}"
+  issuer: "${CERTPILOT_JWT_ISSUER}"
+  audience: "authenticated"
+  role_claim: "certpilot_role"
+  allow_anonymous: false
+
+plugins:
+  discovery_mode: "static"
+  # The gateway channel carries CSRs, private keys and CA credentials, so it is
+  # authenticated in both directions. In production, issue these from your own
+  # internal CA rather than using `make dev-certs` output.
+  tls:
+    cert_file: "/app/pki/core.pem"
+    key_file: "/app/pki/core-key.pem"
+    ca_file: "/app/pki/ca.pem"
+    insecure: false
+  gateways:
+    - name: "letsencrypt"
+      addr: "gateway-acme:9092"
+      type: "acme"
+      # The name in the gateway's certificate, which is the compose service
+      # name rather than the host this file is edited on.
+      server_name: "localhost"
+
+    - name: "vault"
+      addr: "gateway-vault:9093"
+      type: "vault"
+      server_name: "localhost"
+
+pki:
+  ca_health_check_interval: 360
+  crl_ocsp_check_interval: 60
+
+renewal:
+  scan_interval: 60
+  default_lead_days: 30
+  retry_backoff: [60, 240, 720, 1440]
+
+logging:
+  level: "info"
+  # Structured, for anything that ingests logs.
+  format: "json"

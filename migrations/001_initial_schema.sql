@@ -244,6 +244,37 @@ alter table public.discovery_scans enable row level security;
 alter table public.discovery_results enable row level security;
 
 -- 11. Define RLS Policies
+--
+-- PostgreSQL has no `create policy if not exists`, and every other statement in
+-- this file is idempotent. Without this the file can only ever be applied to a
+-- virgin database: rerunning it against one where the schema already exists
+-- fails on the first policy, rolls the whole script back, and reports a problem
+-- that has nothing to do with what the operator was trying to change.
+--
+-- So this file is treated as the source of truth for the policies on the tables
+-- it defines: whatever is there is dropped, and the declarations below are
+-- reinstated. A policy added by hand outside this file will not survive a
+-- rerun, which is the intended behaviour — the alternative is a database whose
+-- access rules cannot be reproduced from the repository.
+do $$
+declare
+  pol record;
+begin
+  for pol in
+    select policyname, tablename
+    from pg_policies
+    where schemaname = 'public'
+      and tablename in (
+        'ca_authorities', 'ca_accounts', 'certificates', 'deployment_targets',
+        'policies', 'notification_channels', 'audit_logs',
+        'discovery_scans', 'discovery_results'
+      )
+  loop
+    execute format('drop policy %I on public.%I', pol.policyname, pol.tablename);
+  end loop;
+end
+$$;
+
 create policy "certificates_select" on public.certificates for select to authenticated using (true);
 create policy "certificates_insert" on public.certificates for insert to authenticated with check (public.get_user_role() in ('admin', 'operator'));
 create policy "certificates_update" on public.certificates for update to authenticated using (public.get_user_role() in ('admin', 'operator')) with check (public.get_user_role() in ('admin', 'operator'));

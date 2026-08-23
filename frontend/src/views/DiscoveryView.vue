@@ -1,129 +1,477 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+/**
+ * Discovery — deliberately plain, pending the frontend redesign.
+ *
+ * The one thing this view must get right is which row is the finding. A scan of
+ * a real estate returns mostly certificates the team issued itself; the rows
+ * that justify having run it are the ones nobody knew about. So results are
+ * sorted with UNMANAGED first and the verdict is the first column, not a badge
+ * tucked at the end.
+ *
+ * It previously sent `target` where the API expects `host`/`targets`, and read
+ * `results.subject`, `results.protocol` and `results.cipher`, none of which the
+ * backend has ever returned — so every field rendered as an em dash and the
+ * scan itself 400'd.
+ */
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useApi } from '@/composables/useApi'
-import { 
-  Radar, 
-  Search, 
-  Download, 
-  CheckCircle2, 
-  AlertCircle,
-  Globe,
-  Lock
-} from 'lucide-vue-next'
+import type {
+  DiscoveryResult,
+  DiscoveryScanResponse,
+  DiscoverySchedule,
+  DiscoveryScheduleList,
+} from '@/lib/types'
+import { AlertTriangle, CalendarClock, CheckCircle, Radar, Search, Trash2 } from 'lucide-vue-next'
 
 const api = useApi()
-const host = ref('google.com')
-const port = ref(443)
+const targetInput = ref('')
+const port = ref('443')
 const scanning = ref(false)
-const scanResult = ref<any>(null)
 const scanError = ref('')
+const response = ref<DiscoveryScanResponse | null>(null)
+const importing = ref<string | null>(null)
+const importMessage = ref('')
+const cancelling = ref(false)
+
+/** A wide scan runs in the background; the response says so via scan.status. */
+const running = computed(() => response.value?.scan.status === 'RUNNING')
+let pollTimer: ReturnType<typeof setTimeout> | null = null
+
+onUnmounted(stopPolling)
+
+function stopPolling() {
+  if (pollTimer) {
+    clearTimeout(pollTimer)
+    pollTimer = null
+  }
+}
+
+/**
+ * Poll a background run until it stops.
+ *
+ * Deliberately not driven off the event stream. Progress is published there,
+ * but this view is opened to watch one specific scan, and a poll that keeps
+ * working when the stream is down is the version that does not leave someone
+ * staring at a run they cannot see the end of.
+ */
+function pollScan(id: string) {
+  stopPolling()
+  pollTimer = setTimeout(async () => {
+    try {
+      const res = await api.get<DiscoveryScanResponse>(`/api/v1/discovery/scans/${id}`)
+      response.value = res
+      if (res.scan.status === 'RUNNING') {
+        pollScan(id)
+      } else {
+        scanning.value = false
+      }
+    } catch (err: any) {
+      scanError.value = err.message || 'Lost track of the scan'
+      scanning.value = false
+    }
+  }, 2000)
+}
+
+async function cancelScan() {
+  const id = response.value?.scan.id
+  if (!id) return
+  cancelling.value = true
+  try {
+    await api.post(`/api/v1/discovery/scans/${id}/cancel`)
+  } catch (err: any) {
+    scanError.value = err.message || 'Cancel failed'
+  } finally {
+    cancelling.value = false
+  }
+}
+
+/** Split on commas, spaces, and newlines so a pasted list works. */
+const targets = computed(() =>
+  targetInput.value
+    .split(/[\s,]+/)
+    .map((t) => t.trim())
+    .filter(Boolean),
+)
+
+/** Unmanaged first, then unreachable, then the rest. */
+const results = computed<DiscoveryResult[]>(() => {
+  const order = { UNMANAGED: 0, UNREACHABLE: 1, MANAGED: 2 } as const
+  return [...(response.value?.data ?? [])].sort(
+    (a, b) => order[a.management_state] - order[b.management_state],
+  )
+})
 
 async function runScan() {
+  if (targets.value.length === 0) return
   scanning.value = true
   scanError.value = ''
-  scanResult.value = null
+  importMessage.value = ''
+  response.value = null
+  stopPolling()
   try {
-    const res = await api.post<any>('/api/v1/discovery/scan', {
-      host: host.value,
-      port: port.value,
+    const res = await api.post<DiscoveryScanResponse>('/api/v1/discovery/scan', {
+      targets: targets.value,
+      port: parseInt(port.value) || 443,
     })
-    scanResult.value = res
+    response.value = res
+    if (res.scan.status === 'RUNNING') {
+      pollScan(res.scan.id)
+      return // stays "scanning" until the run stops
+    }
   } catch (err: any) {
-    scanError.value = err.message
+    scanError.value = err.message || 'Scan failed'
+  }
+  scanning.value = false
+}
+
+async function importResult(result: DiscoveryResult) {
+  importing.value = result.id
+  importMessage.value = ''
+  try {
+    const res = await api.post<{ message: string }>('/api/v1/discovery/import', {
+      result_id: result.id,
+    })
+    importMessage.value = res.message
+    result.is_imported = true
+    result.management_state = 'MANAGED'
+  } catch (err: any) {
+    scanError.value = err.message || 'Import failed'
   } finally {
-    scanning.value = false
+    importing.value = null
+  }
+}
+
+function verdictClass(state: DiscoveryResult['management_state']) {
+  switch (state) {
+    case 'UNMANAGED':
+      return 'badge-warning'
+    case 'UNREACHABLE':
+      return 'badge-ghost'
+    default:
+      return 'badge-success'
+  }
+}
+
+function severityClass(severity: string) {
+  switch (severity) {
+    case 'CRITICAL':
+      return 'text-error'
+    case 'WARNING':
+      return 'text-warning'
+    default:
+      return 'text-base-content/60'
+  }
+}
+
+function formatDate(d?: string) {
+  if (!d) return '—'
+  return new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+}
+
+function formatWhen(d?: string | null) {
+  if (!d) return 'never'
+  return new Date(d).toLocaleString('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+// ── Schedules ─────────────────────────────────────────────
+//
+// Discovery run once is a snapshot. Run on a schedule it is monitoring, which
+// is the only version that catches an endpoint someone stood up last Tuesday.
+
+const schedules = ref<DiscoverySchedule[]>([])
+const scheduleError = ref('')
+const newSchedule = ref({ name: '', targets: '', interval_minutes: 1440 })
+const savingSchedule = ref(false)
+
+onMounted(loadSchedules)
+
+async function loadSchedules() {
+  try {
+    const res = await api.get<DiscoveryScheduleList>('/api/v1/discovery/schedules')
+    schedules.value = res.data
+  } catch (err: any) {
+    scheduleError.value = err.message || 'Could not load schedules'
+  }
+}
+
+async function createSchedule() {
+  savingSchedule.value = true
+  scheduleError.value = ''
+  try {
+    await api.post('/api/v1/discovery/schedules', {
+      name: newSchedule.value.name,
+      targets: newSchedule.value.targets.split(/[\s,]+/).filter(Boolean),
+      interval_minutes: Number(newSchedule.value.interval_minutes),
+    })
+    newSchedule.value = { name: '', targets: '', interval_minutes: 1440 }
+    await loadSchedules()
+  } catch (err: any) {
+    scheduleError.value = err.message || 'Could not save the schedule'
+  } finally {
+    savingSchedule.value = false
+  }
+}
+
+async function runSchedule(schedule: DiscoverySchedule) {
+  try {
+    const res = await api.post<DiscoveryScanResponse>(
+      `/api/v1/discovery/schedules/${schedule.id}/run`,
+    )
+    response.value = res
+    scanning.value = true
+    pollScan(res.scan.id)
+  } catch (err: any) {
+    scheduleError.value = err.message || 'Could not run the schedule'
+  }
+}
+
+async function deleteSchedule(schedule: DiscoverySchedule) {
+  try {
+    await api.delete(`/api/v1/discovery/schedules/${schedule.id}`)
+    await loadSchedules()
+  } catch (err: any) {
+    scheduleError.value = err.message || 'Could not delete the schedule'
   }
 }
 </script>
 
 <template>
-  <div class="space-y-8">
-    <!-- Header -->
-    <div>
-      <h2 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2.5">
-        <Radar class="w-7 h-7 text-indigo-400" />
-        Certificate Discovery & Network Scanner
-      </h2>
-      <p class="text-sm text-slate-400 mt-1">
-        Probe network endpoints via TLS handshake to discover unmanaged, rogue, or shadow certificates across your infrastructure.
-      </p>
-    </div>
+  <div class="space-y-6">
+    <p class="text-sm text-base-content/60">
+      Scan endpoints and find the certificates nobody told CertPilot about.
+    </p>
 
-    <!-- Scan Bar -->
-    <div class="glass-panel p-6">
-      <form @submit.prevent="runScan" class="flex flex-col md:flex-row items-end gap-4">
-        <div class="flex-1 w-full">
-          <label class="block text-xs font-semibold text-slate-300 mb-1.5">Target Hostname or IP</label>
-          <div class="relative">
-            <Globe class="w-4 h-4 absolute left-3.5 top-3.5 text-slate-400" />
-            <input v-model="host" class="input-field pl-10 font-mono text-sm" placeholder="app.internal.corp or 10.0.0.1" required />
+    <div class="card bg-base-100 border border-base-300">
+      <div class="card-body p-5">
+        <h2 class="card-title text-sm font-bold mb-3">
+          <Radar class="w-4 h-4 text-primary" /> Scan endpoints
+        </h2>
+        <form @submit.prevent="runScan" class="flex items-end gap-3">
+          <div class="form-control flex-1">
+            <label class="label">
+              <span class="label-text text-xs">Hosts — one or many, separated by spaces or commas</span>
+            </label>
+            <input
+              v-model="targetInput"
+              type="text"
+              placeholder="example.com, 10.0.0.0/24, 10.0.0.4-40:8443"
+              class="input input-bordered input-sm"
+              required
+            />
           </div>
-        </div>
-
-        <div class="w-full md:w-36">
-          <label class="block text-xs font-semibold text-slate-300 mb-1.5">TLS Port</label>
-          <input v-model.number="port" type="number" class="input-field font-mono text-sm" placeholder="443" required />
-        </div>
-
-        <button type="submit" class="btn-primary w-full md:w-auto h-[42px] px-6" :disabled="scanning">
-          <Search class="w-4 h-4" :class="{ 'animate-spin': scanning }" />
-          {{ scanning ? 'Scanning Handshake...' : 'Scan Endpoint' }}
-        </button>
-      </form>
-    </div>
-
-    <!-- Error state -->
-    <div v-if="scanError" class="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-sm flex items-center gap-3">
-      <AlertCircle class="w-5 h-5 flex-shrink-0" />
-      <span>Scan failed: {{ scanError }}</span>
-    </div>
-
-    <!-- Scan Results Card -->
-    <div v-if="scanResult" class="space-y-4">
-      <h3 class="text-base font-semibold text-white flex items-center gap-2">
-        <Lock class="w-4 h-4 text-emerald-400" />
-        Discovered Certificate Details
-      </h3>
-
-      <div v-if="scanResult.error" class="glass-panel p-6 text-rose-400 text-sm">
-        Remote host failed TLS handshake: {{ scanResult.error }}
+          <div class="form-control w-24">
+            <label class="label"><span class="label-text text-xs">Default port</span></label>
+            <input v-model="port" type="number" class="input input-bordered input-sm" />
+          </div>
+          <button type="submit" class="btn btn-primary btn-sm gap-2" :disabled="scanning">
+            <span v-if="scanning" class="loading loading-spinner loading-xs"></span>
+            <Search v-else class="w-3.5 h-3.5" />
+            Scan {{ targets.length || '' }}
+          </button>
+        </form>
       </div>
+    </div>
 
-      <div v-else-if="scanResult.certificate" class="glass-panel p-6 space-y-6">
-        <div class="flex items-start justify-between">
-          <div>
-            <div class="text-xl font-bold text-white">{{ scanResult.certificate.common_name }}</div>
-            <div class="text-xs text-slate-400 font-mono mt-1">
-              {{ scanResult.host }}:{{ scanResult.port }} &bull; Fingerprint: {{ scanResult.certificate.fingerprint_sha256 }}
+    <!-- Schedules. A scan run once is a snapshot; this is the version that
+         catches an endpoint somebody stood up last Tuesday. -->
+    <div class="card bg-base-100 border border-base-300">
+      <div class="card-body p-5">
+        <h2 class="card-title text-sm font-bold mb-3">
+          <CalendarClock class="w-4 h-4 text-primary" /> Scheduled scans
+        </h2>
+
+        <div v-if="schedules.length" class="space-y-2 mb-4">
+          <div
+            v-for="schedule in schedules"
+            :key="schedule.id"
+            class="flex items-center justify-between gap-3 text-xs border border-base-200 rounded-lg p-3"
+          >
+            <div class="min-w-0">
+              <div class="flex items-center gap-2">
+                <span class="font-medium">{{ schedule.name }}</span>
+                <span v-if="!schedule.is_enabled" class="badge badge-ghost badge-xs">disabled</span>
+              </div>
+              <div class="font-mono text-base-content/60 truncate">
+                {{ schedule.targets.join(', ') }} · every
+                {{ schedule.interval_minutes }} min
+              </div>
+              <div class="text-base-content/60">
+                last run {{ formatWhen(schedule.last_run_at) }} · next
+                {{ formatWhen(schedule.next_run_at) }}
+              </div>
+              <!-- A schedule that fails every night and is never read is worse
+                   than none: it is the appearance of coverage. -->
+              <div v-if="schedule.last_error" class="text-error mt-1">
+                last run did not happen: {{ schedule.last_error }}
+              </div>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+              <button class="btn btn-xs btn-outline" @click="runSchedule(schedule)">Run now</button>
+              <button class="btn btn-xs btn-ghost text-error" @click="deleteSchedule(schedule)">
+                <Trash2 class="w-3 h-3" />
+              </button>
             </div>
           </div>
-          <span class="badge" :class="scanResult.certificate.days_remaining <= 30 ? 'badge-warning' : 'badge-healthy'">
-            {{ scanResult.certificate.days_remaining }} days left
-          </span>
         </div>
+        <p v-else class="text-xs text-base-content/60 mb-4">
+          Nothing is being scanned on a schedule, so anything that appears between manual scans
+          goes unnoticed.
+        </p>
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 p-4 rounded-xl bg-slate-900/60 border border-slate-800 text-xs">
-          <div>
-            <span class="text-slate-400 block mb-1">Issuer DN</span>
-            <span class="text-slate-200 font-mono break-all">{{ scanResult.certificate.issuer_dn }}</span>
+        <form @submit.prevent="createSchedule" class="flex items-end gap-3">
+          <div class="form-control w-40">
+            <label class="label"><span class="label-text text-xs">Name</span></label>
+            <input v-model="newSchedule.name" class="input input-bordered input-sm" required />
           </div>
-          <div>
-            <span class="text-slate-400 block mb-1">Key Algorithm</span>
-            <span class="text-slate-200 font-mono">{{ scanResult.certificate.key_type }} ({{ scanResult.certificate.key_size }} bits)</span>
+          <div class="form-control flex-1">
+            <label class="label"><span class="label-text text-xs">Targets</span></label>
+            <input
+              v-model="newSchedule.targets"
+              class="input input-bordered input-sm"
+              placeholder="10.0.0.0/24"
+              required
+            />
           </div>
-          <div>
-            <span class="text-slate-400 block mb-1">Expiration Date</span>
-            <span class="text-slate-200 font-mono">{{ new Date(scanResult.certificate.not_after).toLocaleString() }}</span>
+          <div class="form-control w-28">
+            <label class="label"><span class="label-text text-xs">Every (min)</span></label>
+            <input
+              v-model="newSchedule.interval_minutes"
+              type="number"
+              class="input input-bordered input-sm"
+            />
           </div>
+          <button type="submit" class="btn btn-sm" :disabled="savingSchedule">Add</button>
+        </form>
+
+        <div v-if="scheduleError" role="alert" class="alert alert-error mt-3">
+          <AlertTriangle class="w-4 h-4" />
+          <span class="text-sm">{{ scheduleError }}</span>
         </div>
+      </div>
+    </div>
 
-        <div v-if="scanResult.certificate.sans && scanResult.certificate.sans.length > 0">
-          <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-2">Subject Alternative Names</span>
-          <div class="flex flex-wrap gap-2">
-            <span v-for="san in scanResult.certificate.sans" :key="san" class="px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 font-mono text-xs border border-slate-700">
-              {{ san }}
-            </span>
+    <div v-if="scanError" role="alert" class="alert alert-error">
+      <AlertTriangle class="w-4 h-4" />
+      <span class="text-sm">{{ scanError }}</span>
+    </div>
+
+    <div v-if="importMessage" role="status" class="alert alert-info">
+      <CheckCircle class="w-4 h-4" />
+      <span class="text-sm">{{ importMessage }}</span>
+    </div>
+
+    <div v-if="response" class="space-y-4">
+      <!-- The summary, not the counts, because zero unmanaged and zero
+           reachable look identical as numbers and mean opposite things. -->
+      <div class="card bg-base-100 border border-base-300">
+        <div class="card-body p-5 gap-2">
+          <div class="flex items-start justify-between gap-3">
+            <div>
+              <p class="text-sm font-medium">{{ response.summary }}</p>
+              <p class="text-xs text-base-content/60 font-mono mt-1">
+                {{ response.scan.results_count }}<span v-if="response.target_count">
+                  of {{ response.target_count }}</span> scanned ·
+                {{ response.scan.unmanaged_count }} unmanaged ·
+                {{ response.scan.managed_count }} managed ·
+                {{ response.scan.unreachable_count }} unreachable
+              </p>
+            </div>
+            <button
+              v-if="running"
+              class="btn btn-xs btn-outline btn-error"
+              :disabled="cancelling"
+              @click="cancelScan"
+            >
+              <span v-if="cancelling" class="loading loading-spinner loading-xs"></span>
+              Stop scan
+            </button>
           </div>
+          <progress
+            v-if="running && response.target_count"
+            class="progress progress-primary w-full"
+            :value="response.scan.results_count"
+            :max="response.target_count"
+          ></progress>
+        </div>
+      </div>
+
+      <div
+        v-for="result in results"
+        :key="result.id"
+        class="card bg-base-100 border border-base-300"
+      >
+        <div class="card-body p-5 gap-3">
+          <div class="flex items-center justify-between gap-3">
+            <div class="flex items-center gap-3">
+              <span class="badge badge-sm" :class="verdictClass(result.management_state)">
+                {{ result.management_state }}
+              </span>
+              <span class="font-mono text-sm">{{ result.host }}:{{ result.port }}</span>
+              <span class="text-xs text-base-content/60">{{ result.common_name || '—' }}</span>
+            </div>
+            <button
+              v-if="result.management_state === 'UNMANAGED' && result.reachable"
+              class="btn btn-xs btn-outline"
+              :disabled="importing === result.id"
+              @click="importResult(result)"
+            >
+              <span v-if="importing === result.id" class="loading loading-spinner loading-xs"></span>
+              Import
+            </button>
+          </div>
+
+          <p v-if="!result.reachable" class="text-xs font-mono text-base-content/60">
+            {{ result.error }}
+          </p>
+
+          <div v-else class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+            <div>
+              <div class="text-base-content/60">Trust</div>
+              <div class="font-mono">{{ result.trust_state }}</div>
+            </div>
+            <div>
+              <div class="text-base-content/60">Expires</div>
+              <div class="font-mono">{{ formatDate(result.not_after) }}</div>
+            </div>
+            <div>
+              <div class="text-base-content/60">Issuer</div>
+              <div class="font-mono truncate">{{ result.issuer_dn || '—' }}</div>
+            </div>
+            <div>
+              <div class="text-base-content/60">Key</div>
+              <div class="font-mono">{{ result.key_type }}-{{ result.key_size }}</div>
+            </div>
+            <div>
+              <div class="text-base-content/60">TLS</div>
+              <div class="font-mono">{{ result.tls_version || '—' }}</div>
+            </div>
+            <div>
+              <div class="text-base-content/60">Cipher</div>
+              <div class="font-mono truncate">{{ result.cipher_suite || '—' }}</div>
+            </div>
+            <div>
+              <div class="text-base-content/60">Key exchange</div>
+              <div class="font-mono truncate">{{ result.key_exchange || '—' }}</div>
+            </div>
+            <div>
+              <div class="text-base-content/60">Chain sent</div>
+              <div class="font-mono">{{ result.chain_length }}</div>
+            </div>
+          </div>
+
+          <ul v-if="result.findings.length" class="space-y-1 text-xs">
+            <li v-for="finding in result.findings" :key="finding.code" class="flex gap-2">
+              <span class="font-mono shrink-0" :class="severityClass(finding.severity)">
+                {{ finding.code }}
+              </span>
+              <span class="text-base-content/70">{{ finding.detail }}</span>
+            </li>
+          </ul>
         </div>
       </div>
     </div>
