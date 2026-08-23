@@ -28,6 +28,24 @@ type Store interface {
 	// ArchiveMetadataField retires a field without deleting it, so the values
 	// certificates already hold keep something that can label them.
 	ArchiveMetadataField(ctx context.Context, id string) error
+
+	// ── Users ───────────────────────────────────────────────────────────────
+	//
+	// ResolveUser is called on every authenticated request, so it both reads
+	// and writes: a subject with no row is given one, which is what makes a
+	// first sign-in work without an invitation step. It returns the stored
+	// user, whose role is the one that governs the request — the token's own
+	// role claim is not consulted.
+	ResolveUser(ctx context.Context, identity UserIdentity, bootstrapAdmins []string) (*User, error)
+	GetUser(ctx context.Context, id string) (*User, error)
+	ListUsers(ctx context.Context) ([]*User, error)
+	// SetUserRole and SetUserStatus are the administrative half, kept separate
+	// from ResolveUser so that a sign-in can never change a role.
+	SetUserRole(ctx context.Context, id, role string) (*User, error)
+	SetUserStatus(ctx context.Context, id, status string) (*User, error)
+	// TouchUser records that a subject was seen, without the cost of a write
+	// on every single request. See the postgres implementation.
+	TouchUser(ctx context.Context, id string, seenAt time.Time) error
 	DeleteCertificate(ctx context.Context, id string) error
 	GetCertificatesDueForRenewal(ctx context.Context, leadDays int) ([]*Certificate, error)
 	// GetCertificatePrivateKey reads the sealed private key for one

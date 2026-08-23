@@ -12,6 +12,9 @@ import (
 
 	"github.com/certpilot/certpilot/pkg/config"
 	"github.com/gin-gonic/gin"
+	"log/slog"
+
+	"github.com/certpilot/certpilot/core/store"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/lestrrat-go/httprc/v3"
 	"github.com/lestrrat-go/jwx/v3/jwk"
@@ -36,7 +39,28 @@ const (
 	// attributed to a corridor screen means something different from one
 	// attributed to a person.
 	ContextAuthMethod = "auth_method"
+	// ContextUserDBID is the primary key of the row in CertPilot's users
+	// table, as distinct from ContextUserID which is the provider's subject.
+	// Actor columns keep storing the subject: it is what the audit log has
+	// always held, and it survives the users table being rebuilt.
+	ContextUserDBID = "user_db_id"
 )
+
+// identityIssuer prefers the issuer the token asserts.
+//
+// A legacy HS256 token need not carry one, and there is no JWKS to infer it
+// from, so the configured issuer stands in. The constant last resort keeps a
+// subject from being stored against an empty issuer, where it would collide
+// with every other provider's subjects.
+func identityIssuer(claims *UserClaims, configured string) string {
+	if iss, err := claims.GetIssuer(); err == nil && iss != "" {
+		return iss
+	}
+	if configured != "" {
+		return configured
+	}
+	return "legacy-shared-secret"
+}
 
 // Authentication methods recorded in ContextAuthMethod.
 const (
@@ -47,9 +71,22 @@ const (
 
 // UserClaims represents the claims inside an identity provider's JWT.
 type UserClaims struct {
-	Email       string         `json:"email"`
-	AppMetadata map[string]any `json:"app_metadata"`
+	Email string `json:"email"`
+	// Name and PreferredUsername are the OIDC profile claims that let a users
+	// list show a person rather than an opaque subject. Both are optional, and
+	// a provider configured without the profile scope sends neither.
+	Name              string         `json:"name"`
+	PreferredUsername string         `json:"preferred_username"`
+	AppMetadata       map[string]any `json:"app_metadata"`
 	jwt.RegisteredClaims
+}
+
+// DisplayName is the friendliest label the token offers, or empty.
+func (c *UserClaims) DisplayName() string {
+	if c.Name != "" {
+		return c.Name
+	}
+	return c.PreferredUsername
 }
 
 // Role returns the RBAC role from app_metadata, defaulting to viewer.
@@ -72,10 +109,27 @@ func (c *UserClaims) Role(claimName string) string {
 	return RoleViewer
 }
 
+// UserDirectory is the slice of the store the authenticator needs.
+//
+// Narrow on purpose: this middleware runs on every request and should be able
+// to look a user up and record that they were seen, and nothing else. Handing
+// it the whole Store would let a future edit here change a role during a
+// sign-in, which is exactly what must never happen.
+type UserDirectory interface {
+	ResolveUser(ctx context.Context, identity store.UserIdentity, bootstrapAdmins []string) (*store.User, error)
+	TouchUser(ctx context.Context, id string, seenAt time.Time) error
+}
+
 // Authenticator verifies bearer tokens.
 type Authenticator struct {
 	cfg   config.AuthConfig
 	cache *jwk.Cache
+
+	// users resolves a verified token's subject to the role CertPilot holds
+	// for that person. When nil the role falls back to the token's own claim,
+	// which is how the middleware tests and any deployment without a store
+	// continue to work.
+	users UserDirectory
 
 	// anonymousWarn ensures the anonymous-access warning is logged once per
 	// process rather than once per request.
@@ -103,6 +157,16 @@ func NewAuthenticator(ctx context.Context, cfg config.AuthConfig) (*Authenticato
 	}
 
 	return a, nil
+}
+
+// WithUserDirectory makes CertPilot's own users table the authority on role.
+//
+// Separate from the constructor because the authenticator is built before the
+// store is opened, and because the middleware package's own tests exercise
+// token verification with no database at all.
+func (a *Authenticator) WithUserDirectory(dir UserDirectory) *Authenticator {
+	a.users = dir
+	return a
 }
 
 // Middleware returns the Gin handler that authenticates each request.
@@ -162,8 +226,58 @@ func (a *Authenticator) Middleware() gin.HandlerFunc {
 
 		c.Set(ContextUserID, claims.Subject)
 		c.Set(ContextUserEmail, claims.Email)
-		c.Set(ContextUserRole, claims.Role(a.cfg.RoleClaim))
 		c.Set(ContextAuthMethod, AuthMethodBearer)
+
+		if a.users == nil {
+			// No directory configured: the token's own claim is the only
+			// available answer.
+			c.Set(ContextUserRole, claims.Role(a.cfg.RoleClaim))
+			c.Next()
+			return
+		}
+
+		user, err := a.users.ResolveUser(c.Request.Context(), store.UserIdentity{
+			// The issuer from the token, not from configuration. A subject is
+			// unique only within the issuer that minted it, and taking the
+			// issuer from config would merge two providers' users if an
+			// operator ever pointed the core at a second one.
+			Issuer:      identityIssuer(claims, a.cfg.Issuer),
+			Subject:     claims.Subject,
+			Email:       claims.Email,
+			DisplayName: claims.DisplayName(),
+		}, a.cfg.BootstrapAdmins)
+		if err != nil {
+			// Fail closed. A role that cannot be established is not a role,
+			// and defaulting to viewer here would silently strip an operator
+			// mid-incident rather than telling them the lookup broke.
+			slog.Error("could not resolve the signed-in user", "error", err, "subject", claims.Subject)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+				"error": "your identity could not be resolved against CertPilot's user directory, " +
+					"so no role could be established for this request",
+			})
+			return
+		}
+
+		if !user.IsActive() {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error": "this account is suspended in CertPilot; the identity provider still " +
+					"accepts it, so sign-in succeeds and every request is refused here",
+			})
+			return
+		}
+
+		c.Set(ContextUserRole, user.Role)
+		c.Set(ContextUserDBID, user.ID)
+		if user.Email != "" {
+			c.Set(ContextUserEmail, user.Email)
+		}
+
+		// Best effort: being unable to record a timestamp is not a reason to
+		// refuse a request that is otherwise fully authorised.
+		if err := a.users.TouchUser(c.Request.Context(), user.ID, time.Now()); err != nil {
+			slog.Warn("could not record last-seen", "error", err, "user_id", user.ID)
+		}
+
 		c.Next()
 	}
 }

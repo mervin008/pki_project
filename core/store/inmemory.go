@@ -32,6 +32,7 @@ type MemoryStore struct {
 	policies       map[string]*Policy
 	displayTokens  map[string]*DisplayToken
 	metadataFields map[string]*MetadataField
+	users          map[string]*User
 	notifChannels  map[string]*NotificationChannel
 	// acks is append-only, newest last. Who acknowledged what and when is the
 	// record an incident review reads, so an acknowledgement is never
@@ -225,6 +226,7 @@ func NewMemoryStore() *MemoryStore {
 		targets:        make(map[string]*DeploymentTarget),
 		policies:       map[string]*Policy{polID: policy1},
 		metadataFields: map[string]*MetadataField{},
+		users:          map[string]*User{},
 		// Deliberately empty. Every other map here carries sample data so a
 		// first run has something to render, but a seeded credential is a
 		// credential someone forgets to remove.

@@ -1,6 +1,6 @@
 {
   "source": "core/api/router.go",
-  "route_count": 109,
+  "route_count": 111,
   "roles": [
     "viewer",
     "auditor",
@@ -22,7 +22,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "The fourth place certificates hide: a file on a disk, behind two firewalls, that no scan, no transparency log, and no cloud API will ever mention. Reading is open to any authenticated user \u2014 it carries paths and permissions, never key material.",
-      "source_line": 298
+      "source_line": 312
     },
     {
       "method": "GET",
@@ -33,7 +33,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "Enrolment tokens are admin throughout, including the list. The hash is useless on its own, but a list of live tokens is a map of which doors are currently open.",
-      "source_line": 316
+      "source_line": 330
     },
     {
       "method": "POST",
@@ -44,7 +44,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 317
+      "source_line": 331
     },
     {
       "method": "DELETE",
@@ -55,7 +55,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 318
+      "source_line": 332
     },
     {
       "method": "GET",
@@ -66,7 +66,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "What a host may ask for. Readable by any authenticated user \u2014 a grant is a statement of policy and holds no secret \u2014 and written by an operator, because it decides what the organisation's CA will sign on a machine's say-so.",
-      "source_line": 309
+      "source_line": 323
     },
     {
       "method": "POST",
@@ -77,7 +77,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 310
+      "source_line": 324
     },
     {
       "method": "DELETE",
@@ -88,7 +88,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 311
+      "source_line": 325
     },
     {
       "method": "GET",
@@ -99,7 +99,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "Where the fleet has put its certificates. `?attention=true` returns the two rows nothing else in this system can produce: a destination that failed on the far side of every firewall, and a host configured to install a certificate that does not exist.",
-      "source_line": 303
+      "source_line": 317
     },
     {
       "method": "POST",
@@ -110,7 +110,7 @@
       "min_role": null,
       "display_token": false,
       "note": "The point of the agent: the host generated the key, and sends only a request. CertPilot signs what an operator granted this host and never holds a private key it could lose or be compelled to produce.",
-      "source_line": 108
+      "source_line": 116
     },
     {
       "method": "POST",
@@ -121,7 +121,7 @@
       "min_role": null,
       "display_token": false,
       "note": "The inversion that makes an agent a deployment target. Every other target is deployed to by a core worker opening a connection; a host behind two firewalls claims the job itself, off the same queue, with the same lease and the same retry curve.",
-      "source_line": 117
+      "source_line": 125
     },
     {
       "method": "POST",
@@ -132,7 +132,7 @@
       "min_role": null,
       "display_token": false,
       "note": "",
-      "source_line": 118
+      "source_line": 126
     },
     {
       "method": "POST",
@@ -143,7 +143,7 @@
       "min_role": null,
       "display_token": false,
       "note": "Enrolment is the one agent call that is not signed, because the agent has no identity yet \u2014 this is the request that gives it one. It is authenticated by a one-use enrolment token instead.",
-      "source_line": 97
+      "source_line": 105
     },
     {
       "method": "POST",
@@ -154,7 +154,7 @@
       "min_role": null,
       "display_token": false,
       "note": "",
-      "source_line": 100
+      "source_line": 108
     },
     {
       "method": "POST",
@@ -165,7 +165,7 @@
       "min_role": null,
       "display_token": false,
       "note": "Where the host put them, and what happened when it did. Reported upwards only: there is deliberately no route by which this core can tell a host which files to write or what command to run.",
-      "source_line": 112
+      "source_line": 120
     },
     {
       "method": "POST",
@@ -176,7 +176,7 @@
       "min_role": null,
       "display_token": false,
       "note": "What is on the host. Certificates as PEM plus the facts only a process on the machine can see; no field a private key could arrive in.",
-      "source_line": 104
+      "source_line": 112
     },
     {
       "method": "GET",
@@ -187,7 +187,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "The fleet, for people. Reading is open to any authenticated user: an agent row carries a public key and a last-seen time, and who is watching the estate is not a secret.",
-      "source_line": 288
+      "source_line": 302
     },
     {
       "method": "DELETE",
@@ -198,7 +198,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 292
+      "source_line": 306
     },
     {
       "method": "GET",
@@ -209,7 +209,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 289
+      "source_line": 303
     },
     {
       "method": "POST",
@@ -220,7 +220,18 @@
       "min_role": "admin",
       "display_token": false,
       "note": "Revoking is admin: it withdraws a credential that can act on a host.",
-      "source_line": 291
+      "source_line": 305
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/auth/config",
+      "section": "Sign-in discovery",
+      "handler": "sessionHandler.Config",
+      "auth": "none",
+      "min_role": null,
+      "display_token": false,
+      "note": "Public, and necessarily so: this is what a browser reads before it holds any credential. It carries the issuer and client id, which are public by construction in authorization code with PKCE \u2014 the user's own browser sends both to the provider in a URL they can read.",
+      "source_line": 71
     },
     {
       "method": "GET",
@@ -231,7 +242,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 174
+      "source_line": 188
     },
     {
       "method": "POST",
@@ -242,7 +253,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 175
+      "source_line": 189
     },
     {
       "method": "DELETE",
@@ -253,7 +264,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 177
+      "source_line": 191
     },
     {
       "method": "POST",
@@ -264,7 +275,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 176
+      "source_line": 190
     },
     {
       "method": "PUT",
@@ -275,7 +286,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "Narrow on purpose: the only field on a CA account that can change without re-validating the configuration through the gateway.",
-      "source_line": 180
+      "source_line": 194
     },
     {
       "method": "GET",
@@ -286,7 +297,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 141
+      "source_line": 155
     },
     {
       "method": "POST",
@@ -297,7 +308,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 142
+      "source_line": 156
     },
     {
       "method": "DELETE",
@@ -308,7 +319,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 151
+      "source_line": 165
     },
     {
       "method": "GET",
@@ -319,7 +330,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 143
+      "source_line": 157
     },
     {
       "method": "PATCH",
@@ -330,7 +341,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "The only mutable part of a certificate: the decisions people record about it, not the facts the CA established.",
-      "source_line": 146
+      "source_line": 160
     },
     {
       "method": "POST",
@@ -341,7 +352,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "Install it now. Queues rather than deploys: a certificate on eight targets is eight outbound calls that may each need a reload, and a synchronous handler would be cut off partway with half an estate updated and no way to say which half.",
-      "source_line": 270
+      "source_line": 284
     },
     {
       "method": "GET",
@@ -352,7 +363,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "Exporting a private key is admin-only and audited: it is the one operation that removes a secret from the system's custody.",
-      "source_line": 150
+      "source_line": 164
     },
     {
       "method": "POST",
@@ -363,7 +374,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 147
+      "source_line": 161
     },
     {
       "method": "POST",
@@ -374,7 +385,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "Ask the CA now what it thinks about one certificate. Reaching out to somebody else's CA is an action, not a read.",
-      "source_line": 241
+      "source_line": 255
     },
     {
       "method": "GET",
@@ -385,7 +396,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "Where one certificate goes. Bound and unbound at operator, because a binding is a standing instruction to write to somebody's machine.",
-      "source_line": 263
+      "source_line": 277
     },
     {
       "method": "POST",
@@ -396,7 +407,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 264
+      "source_line": 278
     },
     {
       "method": "DELETE",
@@ -407,7 +418,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 265
+      "source_line": 279
     },
     {
       "method": "POST",
@@ -418,7 +429,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "Check now whether a renewal actually reached the servers it was for.",
-      "source_line": 243
+      "source_line": 257
     },
     {
       "method": "GET",
@@ -429,7 +440,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 227
+      "source_line": 241
     },
     {
       "method": "GET",
@@ -440,7 +451,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "The third place certificates hide: stored rather than served, in an account a scan has no address for. Reading is open to any authenticated user \u2014 the list never carries the sealed credentials.",
-      "source_line": 220
+      "source_line": 234
     },
     {
       "method": "POST",
@@ -451,7 +462,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 221
+      "source_line": 235
     },
     {
       "method": "DELETE",
@@ -462,7 +473,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 223
+      "source_line": 237
     },
     {
       "method": "PUT",
@@ -473,7 +484,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 222
+      "source_line": 236
     },
     {
       "method": "POST",
@@ -484,7 +495,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "Reaching out to somebody else's account with stored credentials is an action, not a read, which is why it is a POST and gated at operator.",
-      "source_line": 226
+      "source_line": 240
     },
     {
       "method": "POST",
@@ -495,7 +506,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 228
+      "source_line": 242
     },
     {
       "method": "GET",
@@ -506,7 +517,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 214
+      "source_line": 228
     },
     {
       "method": "GET",
@@ -517,7 +528,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "The half of discovery a network scan cannot reach: what has been issued in your name, whether or not it was ever deployed.",
-      "source_line": 209
+      "source_line": 223
     },
     {
       "method": "POST",
@@ -528,7 +539,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 210
+      "source_line": 224
     },
     {
       "method": "DELETE",
@@ -539,7 +550,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 212
+      "source_line": 226
     },
     {
       "method": "PUT",
@@ -550,7 +561,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 211
+      "source_line": 225
     },
     {
       "method": "POST",
@@ -561,7 +572,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 213
+      "source_line": 227
     },
     {
       "method": "GET",
@@ -572,7 +583,7 @@
       "min_role": "viewer",
       "display_token": false,
       "note": "",
-      "source_line": 138
+      "source_line": 152
     },
     {
       "method": "GET",
@@ -583,7 +594,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 137
+      "source_line": 151
     },
     {
       "method": "GET",
@@ -594,7 +605,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 136
+      "source_line": 150
     },
     {
       "method": "GET",
@@ -605,7 +616,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "The other half of renewal. Everything above this line observes; this changes something that is already carrying traffic, which is why every write here is operator or admin and every one is audited.  Reading is open to any authenticated user: the target list carries names, types, and whether a target receives private keys \u2014 never the sealed credentials themselves.",
-      "source_line": 253
+      "source_line": 267
     },
     {
       "method": "POST",
@@ -616,7 +627,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 254
+      "source_line": 268
     },
     {
       "method": "DELETE",
@@ -627,7 +638,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "Admin to delete: removing a target silently stops every certificate bound to it from being deployed anywhere, and renewals carry on looking healthy.",
-      "source_line": 259
+      "source_line": 273
     },
     {
       "method": "PUT",
@@ -638,7 +649,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 255
+      "source_line": 269
     },
     {
       "method": "GET",
@@ -649,7 +660,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 280
+      "source_line": 294
     },
     {
       "method": "DELETE",
@@ -660,7 +671,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 282
+      "source_line": 296
     },
     {
       "method": "GET",
@@ -671,7 +682,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 281
+      "source_line": 295
     },
     {
       "method": "POST",
@@ -682,7 +693,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 188
+      "source_line": 202
     },
     {
       "method": "GET",
@@ -693,7 +704,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 196
+      "source_line": 210
     },
     {
       "method": "POST",
@@ -704,7 +715,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "Scanning is operator, not viewer: it opens connections to third-party infrastructure from CertPilot's address, which is an action taken in the organisation's name rather than a read of its own state.",
-      "source_line": 187
+      "source_line": 201
     },
     {
       "method": "GET",
@@ -715,7 +726,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "Reading what past scans found is open to any authenticated user. It is estate state, the same as the CA list.",
-      "source_line": 191
+      "source_line": 205
     },
     {
       "method": "GET",
@@ -726,7 +737,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 192
+      "source_line": 206
     },
     {
       "method": "POST",
@@ -737,7 +748,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "Stopping a scan is an operator action for the same reason starting one is: it changes what CertPilot is doing to somebody else's network.",
-      "source_line": 195
+      "source_line": 209
     },
     {
       "method": "GET",
@@ -748,7 +759,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "Schedules. Reading is open to any authenticated user; writing is operator, because a schedule is a standing instruction to connect to somebody else's network on a timer.",
-      "source_line": 200
+      "source_line": 214
     },
     {
       "method": "POST",
@@ -759,7 +770,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 201
+      "source_line": 215
     },
     {
       "method": "DELETE",
@@ -770,7 +781,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 203
+      "source_line": 217
     },
     {
       "method": "PUT",
@@ -781,7 +792,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 202
+      "source_line": 216
     },
     {
       "method": "POST",
@@ -792,7 +803,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 204
+      "source_line": 218
     },
     {
       "method": "GET",
@@ -803,7 +814,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "Admin-only throughout: minting a credential that authenticates to the API is an administrative act even though what it grants is read-only.",
-      "source_line": 324
+      "source_line": 338
     },
     {
       "method": "POST",
@@ -814,7 +825,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 325
+      "source_line": 339
     },
     {
       "method": "DELETE",
@@ -825,7 +836,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 326
+      "source_line": 340
     },
     {
       "method": "GET",
@@ -836,7 +847,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "Any authenticated reader may watch; the stream carries CA and certificate state, never secrets or actor identity.",
-      "source_line": 133
+      "source_line": 141
     },
     {
       "method": "GET",
@@ -847,7 +858,18 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 181
+      "source_line": 195
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/me",
+      "section": "The caller's own identity",
+      "handler": "sessionHandler.Me",
+      "auth": "bearer",
+      "min_role": "viewer",
+      "display_token": true,
+      "note": "The role reported here is the one from CertPilot's users table, not the one in the token. A frontend that decoded the JWT itself would keep showing controls for a role the API had stopped honouring.",
+      "source_line": 147
     },
     {
       "method": "GET",
@@ -858,7 +880,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "Readable by anyone, because a viewer needs the labels to make sense of the values on a certificate. Defining them is admin-only: a required field changes what everyone else has to supply to get a certificate.",
-      "source_line": 346
+      "source_line": 360
     },
     {
       "method": "POST",
@@ -869,7 +891,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 347
+      "source_line": 361
     },
     {
       "method": "DELETE",
@@ -880,7 +902,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 349
+      "source_line": 363
     },
     {
       "method": "PUT",
@@ -891,7 +913,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 348
+      "source_line": 362
     },
     {
       "method": "GET",
@@ -902,7 +924,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "Reading is open to any authenticated user: the list carries names, types, and thresholds, never the sealed credentials. Writing is operator, deletion admin \u2014 removing a channel silently stops alerts reaching whoever depended on it.",
-      "source_line": 333
+      "source_line": 347
     },
     {
       "method": "POST",
@@ -913,7 +935,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 334
+      "source_line": 348
     },
     {
       "method": "DELETE",
@@ -924,7 +946,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 336
+      "source_line": 350
     },
     {
       "method": "PUT",
@@ -935,7 +957,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 335
+      "source_line": 349
     },
     {
       "method": "POST",
@@ -946,7 +968,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "Sending a real alert to a real destination is an action, not a read, which is why it is a POST and gated at operator.",
-      "source_line": 339
+      "source_line": 353
     },
     {
       "method": "GET",
@@ -957,7 +979,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 154
+      "source_line": 168
     },
     {
       "method": "POST",
@@ -968,7 +990,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 155
+      "source_line": 169
     },
     {
       "method": "DELETE",
@@ -979,7 +1001,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 164
+      "source_line": 178
     },
     {
       "method": "GET",
@@ -990,7 +1012,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 161
+      "source_line": 175
     },
     {
       "method": "DELETE",
@@ -1001,7 +1023,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 169
+      "source_line": 183
     },
     {
       "method": "POST",
@@ -1012,7 +1034,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "Acknowledgement is an operator action: it is a statement that a human has looked, and it needs a human's name against it.",
-      "source_line": 168
+      "source_line": 182
     },
     {
       "method": "GET",
@@ -1023,7 +1045,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 170
+      "source_line": 184
     },
     {
       "method": "GET",
@@ -1034,7 +1056,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 162
+      "source_line": 176
     },
     {
       "method": "POST",
@@ -1045,7 +1067,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 163
+      "source_line": 177
     },
     {
       "method": "PUT",
@@ -1056,7 +1078,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 171
+      "source_line": 185
     },
     {
       "method": "POST",
@@ -1067,7 +1089,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "Before the :id routes. Gin matches a static segment ahead of a parameter at the same position, and registering it after would still work \u2014 but reading it after would suggest an authority called \"import\", which is the kind of thing somebody eventually tries.",
-      "source_line": 160
+      "source_line": 174
     },
     {
       "method": "GET",
@@ -1078,7 +1100,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 165
+      "source_line": 179
     },
     {
       "method": "GET",
@@ -1089,7 +1111,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 352
+      "source_line": 366
     },
     {
       "method": "POST",
@@ -1100,7 +1122,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 354
+      "source_line": 368
     },
     {
       "method": "DELETE",
@@ -1111,7 +1133,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "",
-      "source_line": 356
+      "source_line": 370
     },
     {
       "method": "GET",
@@ -1122,7 +1144,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 353
+      "source_line": 367
     },
     {
       "method": "PUT",
@@ -1133,7 +1155,7 @@
       "min_role": "operator",
       "display_token": false,
       "note": "",
-      "source_line": 355
+      "source_line": 369
     },
     {
       "method": "GET",
@@ -1144,7 +1166,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "Cryptographic posture. The ordering of this section is the argument it makes: what is losing something today, then what needs a plan.",
-      "source_line": 274
+      "source_line": 288
     },
     {
       "method": "GET",
@@ -1155,7 +1177,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "CycloneDX 1.6, because the point of a CBOM is that something other than CertPilot reads it.",
-      "source_line": 278
+      "source_line": 292
     },
     {
       "method": "GET",
@@ -1166,7 +1188,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 275
+      "source_line": 289
     },
     {
       "method": "GET",
@@ -1177,7 +1199,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "Renewal is the only part of this system that changes the world, so what it is about to do is readable rather than inferred from logs.",
-      "source_line": 233
+      "source_line": 247
     },
     {
       "method": "DELETE",
@@ -1188,7 +1210,7 @@
       "min_role": "admin",
       "display_token": false,
       "note": "Cancelling stops a renewal somebody asked for. Admin, because the certificate then goes back to expiring on its own with nothing scheduled to stop it.",
-      "source_line": 238
+      "source_line": 252
     },
     {
       "method": "GET",
@@ -1199,7 +1221,7 @@
       "min_role": "viewer",
       "display_token": true,
       "note": "",
-      "source_line": 234
+      "source_line": 248
     },
     {
       "method": "GET",

@@ -57,6 +57,34 @@ type AuthConfig struct {
 	// the server is in development mode and bound to a loopback address, and
 	// exists so a first-run evaluation does not require an identity provider.
 	AllowAnonymous bool `yaml:"allow_anonymous"`
+
+	// ClientID is the public client the browser authenticates as, using
+	// authorization code with PKCE. There is deliberately no client secret: a
+	// single-page application cannot keep one, and a secret shipped to a
+	// browser is a secret published.
+	//
+	// The core serves this to the frontend from /auth/config rather than the
+	// frontend carrying its own build-time copy. One instance is then
+	// described by one file, and an operator cannot rebuild the UI against a
+	// provider the API does not accept — a mismatch that presents as a
+	// successful login followed by 401 on every request.
+	ClientID string `yaml:"client_id"`
+
+	// Scopes requested at authorization. openid is always sent; profile and
+	// email are what populate a user's name and address here.
+	Scopes []string `yaml:"scopes"`
+
+	// BootstrapAdmins are email addresses promoted to admin the first time
+	// they sign in.
+	//
+	// Somebody has to be able to grant the first role, and every alternative
+	// is worse. "First sign-in wins" hands the estate to whoever reaches the
+	// URL first, which on an instance that is reachable before it is announced
+	// is not necessarily anyone you know. Naming the addresses makes the grant
+	// deliberate, reviewable in the same file as everything else, and safe to
+	// leave in place: it is matched only when the user has no row yet, so it
+	// cannot silently restore an admin somebody deliberately demoted.
+	BootstrapAdmins []string `yaml:"bootstrap_admins"`
 }
 
 // SupabaseConfig holds Supabase connection details.
@@ -166,6 +194,11 @@ func LoadCoreConfig(path string) (*CoreConfig, error) {
 	}
 	if cfg.Auth.RoleClaim == "" {
 		cfg.Auth.RoleClaim = "certpilot_role"
+	}
+	if len(cfg.Auth.Scopes) == 0 {
+		// openid is what makes it an OIDC request at all; the other two are
+		// what let a users list show a name instead of an opaque subject.
+		cfg.Auth.Scopes = []string{"openid", "profile", "email"}
 	}
 	// Supabase publishes its JWKS at a predictable path, so a project URL is
 	// enough to prefer asymmetric verification over the shared secret.

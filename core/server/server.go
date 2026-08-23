@@ -183,6 +183,11 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		st.Close()
 		return nil, err
 	}
+	// The identity provider says who somebody is; CertPilot says what they may
+	// do. Without this the role falls back to whatever claim the token carries,
+	// which puts every promotion and demotion in the hands of an administrator
+	// of the provider rather than of the team that owns the CA hierarchy.
+	authenticator = authenticator.WithUserDirectory(st)
 
 	// 6. HTTP router.
 	engine := gin.New()

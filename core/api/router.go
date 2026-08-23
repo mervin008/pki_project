@@ -80,6 +80,14 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	cloudHandler := NewCloudHandler(deps.Store, deps.CloudEngine, deps.Keyring)
 	deployHandler := NewDeploymentHandler(deps.Store, deps.Keyring)
 	postureHandler := NewPostureHandler(deps.Store, posture.ToolVersion)
+	sessionHandler := NewSessionHandler(deps.Store, deps.Config.Auth)
+
+	// ── Sign-in discovery ──
+	// Public, and necessarily so: this is what a browser reads before it holds
+	// any credential. It carries the issuer and client id, which are public by
+	// construction in authorization code with PKCE — the user's own browser
+	// sends both to the provider in a URL they can read.
+	engine.GET("/api/v1/auth/config", sessionHandler.Config)
 
 	// ── The agent API ──
 	//
@@ -131,6 +139,12 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// Any authenticated reader may watch; the stream carries CA and
 		// certificate state, never secrets or actor identity.
 		v1.GET("/events", eventsHandler.Stream)
+
+		// ── The caller's own identity ──
+		// The role reported here is the one from CertPilot's users table, not
+		// the one in the token. A frontend that decoded the JWT itself would
+		// keep showing controls for a role the API had stopped honouring.
+		v1.GET("/me", sessionHandler.Me)
 
 		// ── Dashboard ──
 		v1.GET("/dashboard/stats", dashHandler.Stats)

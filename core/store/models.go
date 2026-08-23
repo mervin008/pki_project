@@ -1946,3 +1946,83 @@ func (f *MetadataField) HasOption(value string) bool {
 	}
 	return false
 }
+
+// User is CertPilot's own record of a person who has signed in.
+//
+// The identity provider remains the authority on who somebody is; this is the
+// authority on what they may do here. Roles used to come from a claim on the
+// token, which meant that promoting a colleague required an administrator of
+// the identity provider and took effect only when that person's token next
+// refreshed — the wrong ownership for a team that runs the CA hierarchy but
+// rarely runs Okta.
+type User struct {
+	ID string `json:"id"`
+	// Issuer and Subject together are the identity. A subject is unique only
+	// within the issuer that minted it, so neither half means anything alone.
+	Issuer  string `json:"issuer"`
+	Subject string `json:"subject"`
+
+	Email       string `json:"email,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+
+	Role   string `json:"role"`
+	Status string `json:"status"`
+	// RoleSource distinguishes a deliberate grant from a default and from a
+	// bootstrap, so a users list can be read without guessing.
+	RoleSource string `json:"role_source"`
+
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// RBAC roles, in ascending order of privilege.
+//
+// Declared here as well as in core/server/middleware because middleware
+// imports this package and the dependency cannot run the other way. The three
+// definitions that must agree are these constants, middleware.Role*, and the
+// CHECK constraint on users.role in migration 028 — a Go constant a CHECK
+// refuses is the oldest defect class in this store, and it fails at runtime on
+// the write, not at compile time.
+const (
+	RoleViewer   = "viewer"
+	RoleAuditor  = "auditor"
+	RoleOperator = "operator"
+	RoleAdmin    = "admin"
+)
+
+// ValidRole reports whether a role is one the store will accept, so a handler
+// can refuse a bad value with a message instead of surfacing a CHECK violation.
+func ValidRole(role string) bool {
+	switch role {
+	case RoleViewer, RoleAuditor, RoleOperator, RoleAdmin:
+		return true
+	}
+	return false
+}
+
+// User status values. Suspension is not deletion: removing the row would
+// orphan every audit entry attributed to that subject.
+const (
+	UserStatusActive    = "ACTIVE"
+	UserStatusSuspended = "SUSPENDED"
+)
+
+// How a user came to hold the role they hold.
+const (
+	RoleSourceDefault   = "DEFAULT"
+	RoleSourceBootstrap = "BOOTSTRAP"
+	RoleSourceAssigned  = "ASSIGNED"
+)
+
+// IsActive reports whether this user may act at all.
+func (u *User) IsActive() bool { return u.Status == UserStatusActive }
+
+// UserIdentity is what an authenticated request knows about its caller before
+// the store has been consulted.
+type UserIdentity struct {
+	Issuer      string
+	Subject     string
+	Email       string
+	DisplayName string
+}
