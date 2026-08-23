@@ -12,6 +12,7 @@ import LoginView from '@/views/LoginView.vue'
 import AuthCallbackView from '@/views/AuthCallbackView.vue'
 import { DISPLAY_TOKEN_PARAM, captureDisplayToken } from '@/lib/displayToken'
 import { useAuthStore } from '@/stores/auth'
+import { hasResumableSession } from '@/lib/oidc'
 
 declare module 'vue-router' {
   interface RouteMeta {
@@ -120,7 +121,14 @@ router.beforeEach(async (to) => {
   // `next` is carried so that a link into a deep page survives the round trip
   // through the identity provider. Losing it is how a paged operator ends up on
   // the dashboard hunting for the CA they were sent to look at.
-  return { name: 'login', query: { next: to.fullPath, reason: 'expired' }, replace: true }
+  //
+  // "Your session ended" is only true if there was one. Saying it to somebody
+  // opening CertPilot for the first time describes something that never
+  // happened, and invites them to go looking for the fault.
+  const query: Record<string, string> = { next: to.fullPath }
+  if (hasResumableSession()) query.reason = 'expired'
+
+  return { name: 'login', query, replace: true }
 })
 
 router.afterEach((to) => {
