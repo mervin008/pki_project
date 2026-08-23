@@ -19,6 +19,16 @@ func unexpectedQuery(c *gin.Context, allowed ...string) string {
 	for _, name := range allowed {
 		known[name] = true
 	}
+	// display_token is a credential, not a filter. A wall display that cannot
+	// set headers presents it in the query string — which is the whole reason
+	// the query form exists — and this guard was rejecting it as an unknown
+	// filter, so `GET /certificates?display_token=...` was a 400 for exactly
+	// the client the parameter was added for.
+	//
+	// Exempted here rather than in each caller's allow-list because the next
+	// endpoint to adopt this guard would otherwise reintroduce the same bug,
+	// and would do so silently: the failure only appears for kiosk clients.
+	known["display_token"] = true
 	for name := range c.Request.URL.Query() {
 		if !known[name] {
 			return name

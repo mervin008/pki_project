@@ -380,3 +380,43 @@ func TestDuplicateDisplayTokenNameIsRejected(t *testing.T) {
 		t.Fatal("a second token was created with a name already in use — revocation becomes guesswork")
 	}
 }
+
+// TestDisplayTokenInQueryStringIsNotMistakenForAFilter guards a bug that made
+// the query-string form useless on the one endpoint that validates its filters.
+//
+// GET /certificates refuses unknown query parameters, so that a script asking
+// for a filter the handler does not read is told rather than silently handed
+// the whole estate. But a display token presented the only way EventSource can
+// present one — in the query string — looked exactly like an unknown filter,
+// and the endpoint returned 400 to precisely the client the parameter exists
+// for. The exemption lives in unexpectedQuery so that the next endpoint to
+// adopt the guard does not reintroduce it.
+func TestDisplayTokenInQueryStringIsNotMistakenForAFilter(t *testing.T) {
+	r, _ := realRouter(t)
+	raw, _ := mintToken(t, r, "corridor-screen", 0)
+
+	for _, path := range []string{
+		"/api/v1/certificates?display_token=" + raw,
+		"/api/v1/certificates?status=ISSUED&display_token=" + raw,
+	} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200 — the credential was read as a filter: %s",
+				path, w.Code, w.Body.String())
+		}
+	}
+
+	// The guard itself must still work, or the fix above would have disabled
+	// the protection it was carved out of.
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet,
+		"/api/v1/certificates?search=anything&display_token="+raw, nil))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("an unknown filter alongside a display token = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "search") {
+		t.Fatalf("the 400 did not name the offending parameter: %s", w.Body.String())
+	}
+}

@@ -50,6 +50,13 @@ Six Go modules in a workspace (`go.work`, Go 1.26.6) plus a Vue frontend.
 | `migrations/` | 27 numbered `.sql` files, applied by `certpilot-core --migrate` |
 | `docs/` | Written, current, and worth reading |
 
+**The API reference is published as a separate site** from
+[`mervin008/certpilot-docs`](https://github.com/mervin008/certpilot-docs)
+(VitePress, GitHub Pages). Its endpoint tables are *generated* from
+`core/api/router.go` by `scripts/extract-routes.py` into `docs/routes.json`,
+which CI checks for staleness — so **run `make routes` after adding a route**.
+`docs/api-reference.md` stays here as the deeper per-resource guide.
+
 `core/engine/` holds the ten background engines: `pki` (CA health and issuer
 import), `renewal`, `discovery`, `ctlog`, `cloudsync`, `deploy`, `fleet`,
 `notifications`, `policy`, `posture`. They are started by `core/server` and
@@ -67,6 +74,7 @@ make seed     # fill a running instance with a realistic estate; idempotent
 make test     # all six modules
 make lint     # gofmt + go vet + staticcheck
 make migrate  # apply outstanding migrations (never run automatically)
+make routes   # regenerate docs/routes.json after changing the router
 make help     # the rest
 ```
 

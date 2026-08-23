@@ -1,4 +1,4 @@
-.PHONY: test-store all build build-core build-agent build-gateways test test-frontend test-coverage lint proto proto-lint \
+.PHONY: test-store all build build-core build-agent build-gateways test test-frontend test-coverage lint proto proto-lint routes \
         dev dev-certs generate-kek run-core run-gateway-selfsigned run-gateway-acme run-gateway-vault run-frontend \
         clean help
 
@@ -85,6 +85,11 @@ dev:
 ## every certificate. Idempotent, and deletes nothing.
 seed:
 	./scripts/seed-demo.sh
+
+## Regenerate docs/routes.json from the router. The documentation site is built
+## from it, so it is checked in CI — a new route with a stale inventory fails.
+routes:
+	python3 scripts/extract-routes.py docs/routes.json
 
 run-core:
 	$(GO) run ./core/cmd/ --config=config.dev.yaml
@@ -220,6 +225,9 @@ help:
 	@echo "  make run-gateway-acme        ACME gateway          :9092"
 	@echo "  make run-gateway-vault       Vault PKI gateway     :9093"
 	@echo "  make run-frontend            Vue frontend          :3000"
+	@echo ""
+	@echo "Docs"
+	@echo "  make routes                  Regenerate docs/routes.json from the router"
 	@echo ""
 	@echo "Check"
 	@echo "  make test                    Run all tests"

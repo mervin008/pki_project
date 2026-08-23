@@ -57,7 +57,8 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	engine.Use(middleware.SecurityHeaders())
 	engine.Use(middleware.CORS(deps.Config.Server.AllowedOrigins))
 
-	// Health endpoint (public, and deliberately says nothing about internals).
+	// ── Health ──
+	// Public, and deliberately says nothing about internals.
 	engine.GET("/healthz", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok", "service": "certpilot-core"})
 	})
@@ -290,9 +291,6 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/agents/:id/revoke", middleware.RequireRole(middleware.RoleAdmin), agentHandler.RevokeAgent)
 		v1.DELETE("/agents/:id", middleware.RequireRole(middleware.RoleAdmin), agentHandler.DeleteAgent)
 
-		// Enrolment tokens are admin throughout, including the list. The hash
-		// is useless on its own, but a list of live tokens is a map of which
-		// doors are currently open.
 		// The fourth place certificates hide: a file on a disk, behind two
 		// firewalls, that no scan, no transparency log, and no cloud API will
 		// ever mention. Reading is open to any authenticated user — it carries
@@ -312,6 +310,9 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/agent-grants", middleware.RequireRole(middleware.RoleOperator), agentHandler.CreateGrant)
 		v1.DELETE("/agent-grants/:id", middleware.RequireRole(middleware.RoleOperator), agentHandler.RevokeGrant)
 
+		// Enrolment tokens are admin throughout, including the list. The hash
+		// is useless on its own, but a list of live tokens is a map of which
+		// doors are currently open.
 		v1.GET("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.ListEnrolTokens)
 		v1.POST("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.CreateEnrolToken)
 		v1.DELETE("/agent-enrol-tokens/:id", middleware.RequireRole(middleware.RoleAdmin), agentHandler.RevokeEnrolToken)
@@ -337,7 +338,6 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// which is why it is a POST and gated at operator.
 		v1.POST("/notification-channels/:id/test", middleware.RequireRole(middleware.RoleOperator), notifHandler.Test)
 
-		// ── Policies ──
 		// ── Custom metadata fields ──
 		//
 		// Readable by anyone, because a viewer needs the labels to make sense of
@@ -348,6 +348,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.PUT("/metadata-fields/:id", middleware.RequireRole(middleware.RoleAdmin), metadataHandler.Update)
 		v1.DELETE("/metadata-fields/:id", middleware.RequireRole(middleware.RoleAdmin), metadataHandler.Archive)
 
+		// ── Policies ──
 		v1.GET("/policies", policyHandler.List)
 		v1.GET("/policies/:id", policyHandler.Get)
 		v1.POST("/policies", middleware.RequireRole(middleware.RoleOperator), policyHandler.Create)
