@@ -37,9 +37,20 @@ export const useAuthStore = defineStore('auth', () => {
   const loading = ref(true)
   const error = ref<string | null>(null)
 
-  const mode = computed(() => config.value?.mode ?? 'unconfigured')
-  /** True when this instance expects people to sign in at all. */
-  const isAuthEnabled = computed(() => mode.value === 'oidc')
+  const mode = computed(() => config.value?.mode ?? 'password')
+
+  /**
+   * Whether this instance expects people to sign in.
+   *
+   * Always true. It is kept as a name rather than deleted because it reads at
+   * the call sites, and because the honest answer changed: it used to be false
+   * for anonymous development, which is what hid the sign-out control and left
+   * the console with no way out of a session.
+   */
+  const isAuthEnabled = computed(() => true)
+
+  /** True when single sign-on is offered in addition to a password. */
+  const hasSSO = computed(() => mode.value === 'oidc')
   const isAuthenticated = ref(false)
 
   const canWrite = computed(() => WRITE_ROLES.includes(role.value))
@@ -177,6 +188,7 @@ export const useAuthStore = defineStore('auth', () => {
     error,
     mode,
     isAuthEnabled,
+    hasSSO,
     isAuthenticated,
     canWrite,
     isAdmin,

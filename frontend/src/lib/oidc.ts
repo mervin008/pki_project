@@ -30,7 +30,10 @@
  */
 
 export interface AuthConfig {
-  mode: 'oidc' | 'anonymous' | 'unconfigured'
+  // 'password' when only local accounts are configured, 'oidc' when single
+  // sign-on is offered as well. There is no anonymous mode.
+  mode: 'oidc' | 'password'
+  password_login?: boolean
   issuer?: string
   client_id?: string
   scopes?: string[]

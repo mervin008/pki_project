@@ -29,13 +29,12 @@ const route = useRoute()
 const alerts = useAlertsStore()
 const auth = useAuthStore()
 
-// Names the mode as well as the person, because "admin" means something very
-// different when it came from anonymous development than when it came from a
-// deliberate grant.
+// Names the person and the role together. A screen showing a name but not a
+// role invites somebody to attempt an action their session cannot perform and
+// read the refusal as a fault.
 const identityTitle = computed(() => {
-  if (auth.mode === 'anonymous') return 'Anonymous access — every request is treated as admin'
   if (!auth.isAuthenticated) return 'Not signed in'
-  return `${auth.displayName} · ${auth.role}`
+  return `${auth.displayName} · ${auth.role} · click to sign out`
 })
 const cas = useCasStore()
 const theme = useThemeStore()
@@ -225,13 +224,17 @@ onBeforeUnmount(() => {
         <span v-if="auth.me?.email" class="rail-who">{{ auth.me.email }}</span>
       </div>
 
+      <!-- Labelled, not an icon alone. Signing out of a console that can export
+           private keys is not a control to make somebody hunt for, and an
+           unlabelled glyph in a row of unlabelled glyphs is exactly that. -->
       <button
-        v-if="auth.isAuthEnabled && auth.isAuthenticated"
-        class="rail-icon"
+        v-if="auth.isAuthenticated"
+        class="rail-signout"
         title="Sign out"
         @click="auth.signOut()"
       >
         <LogOut class="w-3.5 h-3.5" />
+        <span>Sign out</span>
       </button>
     </div>
   </header>
@@ -417,6 +420,30 @@ onBeforeUnmount(() => {
   padding: 0.75rem 0.25rem;
   font-size: var(--fs-small);
   color: var(--text-muted);
+}
+
+.rail-signout {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0 0.5rem;
+  height: 22px;
+  align-self: center;
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  color: var(--text-secondary);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.rail-signout:hover {
+  background: var(--ink-hover);
+  color: var(--text-primary);
+  border-color: var(--text-muted);
 }
 
 .rail-identity {

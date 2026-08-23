@@ -86,9 +86,8 @@ export const router = createRouter({
  *
  * **Not** gating `/display` on holding a token. The core decides whether a
  * credential is valid, and a client-side check could only guess: it would block
- * anonymous local evaluation, which the core permits on loopback, while giving a
- * revoked token a friendlier error than the honest one the server returns. The
- * view renders the server's rejection instead.
+ * a revoked token a friendlier error than the honest one the server returns.
+ * The view renders the server's rejection instead.
  */
 router.beforeEach(async (to) => {
   const raw = to.query[DISPLAY_TOKEN_PARAM]
@@ -111,11 +110,11 @@ router.beforeEach(async (to) => {
   // click in the application.
   if (!auth.config) await auth.init()
 
-  // Anonymous development, or a build with no sign-in configured: there is no
-  // session to require, and demanding one would lock an evaluator out of an
-  // instance the core is perfectly willing to serve.
-  if (auth.mode !== 'oidc') return true
-
+  // No exception for any mode. This check used to stand aside when the core
+  // reported "anonymous", and that reading survived the removal of anonymous
+  // access — leaving every instance open in the browser while the API refused
+  // each request, so the console rendered as a wall of "this request carried no
+  // credential" instead of a sign-in page.
   if (auth.isAuthenticated) return true
 
   // `next` is carried so that a link into a deep page survives the round trip

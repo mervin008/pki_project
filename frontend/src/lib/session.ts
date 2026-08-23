@@ -14,9 +14,16 @@ import { hasDisplayToken } from '@/lib/displayToken'
 let redirecting = false
 
 export function onUnauthorized(): void {
-  // A wall display authenticates with a kiosk token and has no session to
-  // renew. Sending it to a sign-in page would replace the loud, honest failure
-  // the display is designed to show with a screen nobody is standing at.
+  const current = router.currentRoute.value
+
+  // Keyed on the route, not on whether a display token happens to be present.
+  //
+  // A wall screen with no token configured yet is exactly the case that must
+  // not redirect: it has nobody standing at it to sign in, and the whole design
+  // of that page is to fail loudly and visibly rather than to navigate
+  // somewhere quieter. Checking for the token instead of the route sent a
+  // brand-new display to a login form it could never complete.
+  if (current.meta.public) return
   if (hasDisplayToken()) return
 
   if (redirecting) return
@@ -24,20 +31,9 @@ export function onUnauthorized(): void {
 
   const auth = useAuthStore()
 
-  // Anonymous development returns 401 for other reasons entirely, and there is
-  // no sign-in to send anybody to.
-  if (auth.mode !== 'oidc') {
-    redirecting = false
-    return
-  }
-
+  // Every mode has a sign-in to send somebody to now. There is no longer a
+  // configuration in which a 401 is expected and unactionable.
   auth.forgetSession()
-
-  const current = router.currentRoute.value
-  if (current.name === 'login') {
-    redirecting = false
-    return
-  }
 
   void router
     .replace({ name: 'login', query: { next: current.fullPath, reason: 'expired' } })

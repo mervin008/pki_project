@@ -17,7 +17,7 @@ import type { StreamEvent, StreamSnapshot } from '@/lib/types'
  * ## Why fetch, and not EventSource
  *
  * `EventSource` cannot set request headers, so it cannot carry the operator's
- * bearer token; it would authenticate only in anonymous development mode or
+ * bearer token; it would authenticate only through a session cookie or
  * with a kiosk token in the query string. Its reconnect is also fixed-interval
  * and uncontrollable beyond the server's `retry:` directive, so the
  * exponential backoff this needs would mean fighting the built-in behaviour
