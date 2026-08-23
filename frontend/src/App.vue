@@ -6,8 +6,7 @@ import { useThemeStore } from '@/stores/theme'
 import { useCasStore } from '@/stores/cas'
 import { useAlertsStore } from '@/stores/alerts'
 import { useEventStream } from '@/composables/useEventStream'
-import Sidebar from '@/components/layout/Sidebar.vue'
-import TopBar from '@/components/layout/TopBar.vue'
+import CommandRail from '@/components/layout/CommandRail.vue'
 import StreamStatusBanner from '@/components/common/StreamStatusBanner.vue'
 
 const authStore = useAuthStore()
@@ -53,14 +52,14 @@ const showChrome = computed(() => route.meta.chrome !== false)
 <template>
   <router-view v-if="!showChrome" />
 
-  <div v-else class="flex min-h-screen bg-base-200">
-    <Sidebar />
-    <div class="flex-1 flex flex-col min-w-0">
-      <TopBar />
-      <StreamStatusBanner />
-      <main class="flex-1 p-6 overflow-y-auto transition-all" :class="{ 'surface-stale': surfaceIsStale }">
-        <router-view />
-      </main>
-    </div>
+  <div v-else class="flex flex-col h-screen">
+    <CommandRail />
+    <StreamStatusBanner />
+    <main
+      class="flex-1 min-h-0 overflow-y-auto p-3 transition-all"
+      :class="{ 'surface-stale': surfaceIsStale }"
+    >
+      <router-view />
+    </main>
   </div>
 </template>

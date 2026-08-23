@@ -81,8 +81,83 @@ export function severityFromDays(days: number | null | undefined): Severity {
   return 'ok'
 }
 
+/**
+ * How urgent a certificate actually is.
+ *
+ * `status` alone is not enough, and relying on it is a real defect rather than a
+ * cosmetic one: the core leaves a certificate `ISSUED` until a renewal sweep
+ * moves it, so a certificate two days from expiry reports `ISSUED` and renders
+ * as healthy — while `/dashboard/stats` counts it under `expiring_soon_certs` in
+ * the very same response. The dashboard contradicting its own totals is exactly
+ * the failure this product exists to prevent.
+ *
+ * The threshold is the certificate's own `renewal_lead_days`, not a number
+ * invented here. Inside its renewal window and still not renewed is a fact about
+ * that certificate's configuration; past `not_after` is a fact about time.
+ */
+export function certUrgency(cert: {
+  status: string
+  days_remaining: number
+  renewal_lead_days?: number
+}): Severity {
+  if (cert.days_remaining < 0) return 'critical'
+
+  const fromStatus = certSeverity(cert.status)
+  const lead = cert.renewal_lead_days && cert.renewal_lead_days > 0 ? cert.renewal_lead_days : 30
+
+  let fromClock: Severity = 'ok'
+  if (cert.days_remaining <= Math.ceil(lead / 3)) fromClock = 'critical'
+  else if (cert.days_remaining <= lead) fromClock = 'warning'
+
+  // Whichever is worse. A REVOKED certificate with a year left is still
+  // critical, and an ISSUED one with two days left is too.
+  return compareSeverity(fromStatus, fromClock) <= 0 ? fromStatus : fromClock
+}
+
 export function compareSeverity(a: Severity, b: Severity): number {
   return SEVERITY_RANK[a] - SEVERITY_RANK[b]
+}
+
+/**
+ * Console class for a severity, for the converted views.
+ *
+ * These resolve to the `--sev-*` tokens in main.css. The daisyUI helpers below
+ * are what the not-yet-converted views still use; both read the same palette,
+ * so the two halves of the app agree about what critical looks like while the
+ * conversion is in progress.
+ */
+export function sevClass(severity: Severity): string {
+  return `sev-${severity}`
+}
+
+/** Background variant, for dots, rails and horizon marks. */
+export function sevBg(severity: Severity): string {
+  return `sev-bg-${severity}`
+}
+
+/** The CSS custom property holding a severity's colour. */
+export function sevVar(severity: Severity): string {
+  return `var(--sev-${severity})`
+}
+
+/**
+ * Short uppercase label for a chip.
+ *
+ * "CRIT" rather than "Critical": in a column of chips the eye is matching
+ * shapes, and four characters at four different severities are told apart
+ * faster than nine.
+ */
+export function sevLabel(severity: Severity): string {
+  switch (severity) {
+    case 'critical':
+      return 'CRIT'
+    case 'warning':
+      return 'WARN'
+    case 'ok':
+      return 'OK'
+    default:
+      return 'UNKN'
+  }
 }
 
 /** daisyUI badge class for a severity. */
@@ -125,6 +200,29 @@ export function severityBorder(severity: Severity): string {
     default:
       return 'border-base-300'
   }
+}
+
+/**
+ * What to call a certificate's state, given that urgency and status can differ.
+ *
+ * `certUrgency` colours a certificate two days from expiry as critical while its
+ * stored status is still `ISSUED`, which produced a red chip reading "ISSUED" —
+ * the colour saying one thing and the word another, on the single element whose
+ * job is to say what is wrong. When the clock is what made it urgent, the label
+ * has to say so.
+ */
+export function certStateLabel(cert: {
+  status: string
+  days_remaining: number
+  renewal_lead_days?: number
+}): string {
+  if (cert.days_remaining < 0) return 'Expired'
+  const stated = certSeverity(cert.status)
+  const actual = certUrgency(cert)
+  // Only override when the clock is the thing that raised it. A REVOKED
+  // certificate stays REVOKED — that is the more important fact.
+  if (actual !== stated && compareSeverity(actual, stated) < 0) return 'Expiring'
+  return statusLabel(cert.status)
 }
 
 /** Turns SCREAMING_SNAKE into Title Case for display. */

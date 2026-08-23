@@ -3,11 +3,13 @@ import { computed, ref } from 'vue'
 import { useApi } from '@/composables/useApi'
 import { useAsyncData } from '@/composables/useAsyncData'
 import DataState from '@/components/common/DataState.vue'
+import PanelBox from '@/components/ui/PanelBox.vue'
+import SevChip from '@/components/ui/SevChip.vue'
 import {
   Plus, Search, RotateCw, Eye, CircleX, ShieldCheck,
 } from 'lucide-vue-next'
 import {
-  certSeverity, compareSeverity, severityBadge, severityText, statusLabel,
+  certStateLabel, certUrgency, compareSeverity, sevBg, sevClass,
 } from '@/lib/severity'
 import { formatDate, formatDaysShort, truncate } from '@/lib/format'
 import type { CaAccount, Certificate, ListResponse } from '@/lib/types'
@@ -41,11 +43,11 @@ const filtered = computed(() => {
         c.sans?.some((san) => san.toLowerCase().includes(q)) ||
         (c.serial_number ?? '').toLowerCase().includes(q)
       const matchesStatus =
-        filterStatus.value === 'all' || certSeverity(c.status) === filterStatus.value
+        filterStatus.value === 'all' || certUrgency(c) === filterStatus.value
       return matchesSearch && matchesStatus
     })
     .sort((a, b) => {
-      const bySeverity = compareSeverity(certSeverity(a.status), certSeverity(b.status))
+      const bySeverity = compareSeverity(certUrgency(a), certUrgency(b))
       return bySeverity !== 0 ? bySeverity : a.days_remaining - b.days_remaining
     })
 })
@@ -54,9 +56,9 @@ const counts = computed(() => {
   const all = certificates.value
   return {
     all: all.length,
-    ok: all.filter((c) => certSeverity(c.status) === 'ok').length,
-    warning: all.filter((c) => certSeverity(c.status) === 'warning').length,
-    critical: all.filter((c) => certSeverity(c.status) === 'critical').length,
+    ok: all.filter((c) => certUrgency(c) === 'ok').length,
+    warning: all.filter((c) => certUrgency(c) === 'warning').length,
+    critical: all.filter((c) => certUrgency(c) === 'critical').length,
   }
 })
 
@@ -135,24 +137,32 @@ async function renewCert(cert: Certificate) {
 const selected = ref<Certificate | null>(null)
 </script>
 
+
 <template>
-  <div class="space-y-6">
-    <div class="flex items-center justify-between gap-4 flex-wrap">
-      <p class="text-sm text-base-content/60">Managed certificates, most urgent first</p>
-      <div class="flex items-center gap-2">
-        <button class="btn btn-ghost btn-sm gap-1.5" :disabled="certs.loading.value" @click="certs.refresh()">
-          <RotateCw class="w-3.5 h-3.5" :class="certs.loading.value && 'animate-spin'" />
+  <div class="flex flex-col gap-3 min-w-0">
+    <div class="page-head">
+      <div class="min-w-0">
+        <h1 class="label-rail">Certificate inventory</h1>
+        <p class="page-sub prose-ui">Managed certificates, most urgent first.</p>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <button
+          class="btn-console"
+          :disabled="certs.loading.value"
+          @click="certs.refresh()"
+        >
+          <RotateCw class="w-3 h-3" :class="certs.loading.value && 'animate-spin'" />
           Refresh
         </button>
-        <button class="btn btn-primary btn-sm gap-2" @click="showRequest = true">
-          <Plus class="w-4 h-4" /> Request certificate
+        <button class="btn-console" data-variant="signal" @click="showRequest = true">
+          <Plus class="w-3 h-3" /> Request
         </button>
       </div>
     </div>
 
-    <div v-if="actionError" role="alert" class="alert alert-error">
-      <CircleX class="w-5 h-5 shrink-0" />
-      <span class="text-sm break-words">{{ actionError }}</span>
+    <div v-if="actionError" role="alert" class="action-error">
+      <CircleX class="w-3.5 h-3.5 shrink-0 sev-critical" />
+      <span>{{ actionError }}</span>
     </div>
 
     <DataState
@@ -161,249 +171,493 @@ const selected = ref<Certificate | null>(null)
       :loaded="certs.loaded.value"
       @retry="certs.refresh()"
     >
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <!-- Counts and filter are the same control. Four separate stat tiles that
+           also happen to filter is two mental models for one object. -->
+      <div class="filter-bar">
         <button
           v-for="tile in [
-            { key: 'all', label: 'All certificates', value: counts.all, tone: '' },
-            { key: 'ok', label: 'Healthy', value: counts.ok, tone: 'text-success' },
-            { key: 'warning', label: 'Expiring', value: counts.warning, tone: 'text-warning' },
-            { key: 'critical', label: 'Needs attention', value: counts.critical, tone: 'text-error' },
+            { key: 'all', label: 'All', value: counts.all, tone: '' },
+            { key: 'critical', label: 'Needs attention', value: counts.critical, tone: 'sev-critical' },
+            { key: 'warning', label: 'Expiring', value: counts.warning, tone: 'sev-warning' },
+            { key: 'ok', label: 'Healthy', value: counts.ok, tone: 'sev-ok' },
           ]"
           :key="tile.key"
-          class="stat bg-base-100 rounded-xl border p-4 text-left transition-colors"
-          :class="filterStatus === tile.key ? 'border-primary' : 'border-base-300 hover:border-base-content/20'"
+          type="button"
+          class="filter-chip"
+          :data-active="filterStatus === tile.key || undefined"
           @click="filterStatus = tile.key as typeof filterStatus"
         >
-          <div class="stat-title text-xs">{{ tile.label }}</div>
-          <div class="stat-value text-xl tabular-nums" :class="tile.value > 0 ? tile.tone : ''">
-            {{ tile.value }}
-          </div>
+          {{ tile.label }}
+          <span
+            class="filter-count"
+            :class="filterStatus === tile.key || tile.value === 0 ? '' : tile.tone"
+          >{{ tile.value }}</span>
         </button>
+
+        <label class="filter-search">
+          <Search class="w-3 h-3 shrink-0" style="color: var(--text-muted)" />
+          <input
+            v-model="searchQuery"
+            type="search"
+            placeholder="Common name, SAN, or serial"
+          />
+        </label>
       </div>
 
-      <label class="input input-bordered input-sm flex items-center gap-2">
-        <Search class="w-4 h-4 opacity-50" />
-        <input
-          v-model="searchQuery" type="search" class="grow"
-          placeholder="Search common name, SAN, or serial"
-        />
-      </label>
-
-      <div class="card bg-base-100 border border-base-300">
-        <div class="overflow-x-auto">
-          <table class="table table-sm">
-            <thead>
-              <tr>
-                <th class="text-xs">Common name</th>
-                <th class="text-xs">Issuer</th>
-                <th class="text-xs">Key</th>
-                <th class="text-xs">Expires</th>
-                <th class="text-xs text-right">Remaining</th>
-                <th class="text-xs">Status</th>
-                <th class="text-xs text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="cert in filtered" :key="cert.id" class="hover">
-                <td class="text-xs font-medium">
-                  {{ cert.common_name }}
-                  <span v-if="cert.sans?.length > 1" class="opacity-50">
-                    +{{ cert.sans.length - 1 }}
-                  </span>
-                </td>
-                <td class="text-xs opacity-70">{{ truncate(cert.issuer_dn, 32) }}</td>
-                <td class="text-xs font-mono">
-                  {{ cert.key_type }}<template v-if="cert.key_size">-{{ cert.key_size }}</template>
-                </td>
-                <td class="text-xs font-mono">{{ formatDate(cert.not_after) }}</td>
-                <td
-                  class="text-xs font-mono tabular-nums text-right"
-                  :class="severityText(certSeverity(cert.status))"
+      <!-- Table beside detail rather than a modal over it. A modal makes you
+           forget the list to read one row; the split keeps the ordering — the
+           thing this page is for — on screen while you inspect. -->
+      <div class="split" :data-open="selected ? true : undefined">
+        <PanelBox
+          label="Certificates"
+          :note="`${filtered.length} shown`"
+          flush
+        >
+          <div class="table-scroll">
+            <table class="tbl">
+              <thead>
+                <tr>
+                  <th class="rail"></th>
+                  <th>Common name</th>
+                  <th>Issuer</th>
+                  <th>Key</th>
+                  <th>Expires</th>
+                  <th class="num">Left</th>
+                  <th>Status</th>
+                  <th class="num">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="cert in filtered"
+                  :key="cert.id"
+                  :data-selected="selected?.id === cert.id || undefined"
+                  class="cursor-pointer"
+                  @click="selected = cert"
                 >
-                  {{ formatDaysShort(cert.days_remaining) }}
-                </td>
-                <td>
-                  <span class="badge badge-sm" :class="severityBadge(certSeverity(cert.status))">
-                    {{ statusLabel(cert.status) }}
-                  </span>
-                </td>
-                <td class="text-right whitespace-nowrap">
-                  <button class="btn btn-ghost btn-xs" title="Details" @click="selected = cert">
-                    <Eye class="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    class="btn btn-ghost btn-xs" title="Renew now"
-                    :disabled="renewingId === cert.id" @click="renewCert(cert)"
-                  >
-                    <RotateCw class="w-3.5 h-3.5" :class="renewingId === cert.id && 'animate-spin'" />
-                  </button>
-                </td>
-              </tr>
-              <tr v-if="!filtered.length">
-                <td colspan="7" class="text-center py-10">
-                  <ShieldCheck class="w-8 h-8 opacity-30 mx-auto mb-2" />
-                  <p class="text-xs opacity-60">
-                    {{ certificates.length
-                      ? 'No certificates match this filter.'
-                      : 'No certificates yet. Request one to get started.' }}
-                  </p>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+                  <td class="rail" :class="sevBg(certUrgency(cert))"></td>
+                  <td class="cell-primary max-w-[16rem] truncate">
+                    {{ cert.common_name }}
+                    <span v-if="cert.sans?.length > 1" style="color: var(--text-muted)">
+                      +{{ cert.sans.length - 1 }}
+                    </span>
+                  </td>
+                  <td class="max-w-[14rem] truncate">{{ truncate(cert.issuer_dn, 30) }}</td>
+                  <td>
+                    {{ cert.key_type
+                    }}<template v-if="cert.key_size">-{{ cert.key_size }}</template>
+                  </td>
+                  <td>{{ formatDate(cert.not_after) }}</td>
+                  <td class="num" :class="sevClass(certUrgency(cert))">
+                    {{ formatDaysShort(cert.days_remaining) }}
+                  </td>
+                  <td>
+                    <SevChip
+                      :severity="certUrgency(cert)"
+                      :label="certStateLabel(cert)"
+                    />
+                  </td>
+                  <td class="num">
+                    <button
+                      class="row-action"
+                      title="Renew now"
+                      :disabled="renewingId === cert.id"
+                      @click.stop="renewCert(cert)"
+                    >
+                      <RotateCw
+                        class="w-3.5 h-3.5"
+                        :class="renewingId === cert.id && 'animate-spin'"
+                      />
+                    </button>
+                  </td>
+                </tr>
+                <tr v-if="!filtered.length">
+                  <td colspan="8">
+                    <div class="empty-state">
+                      <ShieldCheck class="w-6 h-6" style="color: var(--text-muted)" />
+                      <p class="prose-ui">
+                        {{
+                          certificates.length
+                            ? 'No certificates match this filter.'
+                            : 'No certificates yet. Request one to get started.'
+                        }}
+                      </p>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </PanelBox>
+
+        <!-- Detail -->
+        <PanelBox v-if="selected" label="Detail">
+          <template #actions>
+            <button class="btn-console" @click="selected = null">Close</button>
+          </template>
+
+          <div class="flex flex-col gap-3 min-w-0">
+            <div class="flex items-center gap-2 flex-wrap min-w-0">
+              <span class="detail-title">{{ selected.common_name }}</span>
+              <SevChip
+                :severity="certUrgency(selected)"
+                :label="certStateLabel(selected)"
+              />
+            </div>
+
+            <dl class="detail-list">
+              <div class="detail-wide">
+                <dt class="label-micro">Subject alternative names</dt>
+                <dd>{{ selected.sans?.join(', ') || '—' }}</dd>
+              </div>
+              <div class="detail-wide">
+                <dt class="label-micro">Serial</dt>
+                <dd class="break-all">{{ selected.serial_number || '—' }}</dd>
+              </div>
+              <div>
+                <dt class="label-micro">Key</dt>
+                <dd>{{ selected.key_type }}-{{ selected.key_size }}</dd>
+              </div>
+              <div>
+                <dt class="label-micro">Renewals</dt>
+                <dd>{{ selected.renewal_count }}</dd>
+              </div>
+              <div>
+                <dt class="label-micro">Issued</dt>
+                <dd>{{ formatDate(selected.not_before) }}</dd>
+              </div>
+              <div>
+                <dt class="label-micro">Expires</dt>
+                <dd>{{ formatDate(selected.not_after) }}</dd>
+              </div>
+              <div class="detail-wide">
+                <dt class="label-micro">Auto renew</dt>
+                <dd>
+                  {{
+                    selected.auto_renew
+                      ? `Yes, ${selected.renewal_lead_days} days ahead`
+                      : 'No'
+                  }}
+                </dd>
+              </div>
+              <div class="detail-wide">
+                <dt class="label-micro">Issuer</dt>
+                <dd class="break-all">{{ selected.issuer_dn || '—' }}</dd>
+              </div>
+              <div v-if="selected.renewal_error" class="detail-wide">
+                <dt class="label-micro sev-critical">Last renewal error</dt>
+                <dd class="sev-critical break-words">{{ selected.renewal_error }}</dd>
+              </div>
+            </dl>
+          </div>
+        </PanelBox>
       </div>
     </DataState>
 
-    <!-- Request modal -->
-    <dialog class="modal" :class="{ 'modal-open': showRequest }">
-      <div class="modal-box max-w-lg">
-        <h3 class="text-base font-bold mb-4">Request certificate</h3>
-
-        <div v-if="requestError" role="alert" class="alert alert-error mb-3">
-          <CircleX class="w-4 h-4 shrink-0" />
-          <span class="text-xs break-words">{{ requestError }}</span>
+    <!-- Request. A modal is right here: it is a create action with its own
+         validity, not a thing to compare against the list behind it. -->
+    <div v-if="showRequest" class="modal-scrim" @click.self="showRequest = false">
+      <PanelBox label="Request certificate" class="modal-panel">
+        <div v-if="requestError" role="alert" class="action-error mb-3">
+          <CircleX class="w-3.5 h-3.5 shrink-0 sev-critical" />
+          <span>{{ requestError }}</span>
         </div>
 
-        <form class="space-y-3" @submit.prevent="requestCert">
-          <div class="form-control">
-            <label class="label" for="cn"><span class="label-text text-xs">Common name</span></label>
+        <form class="flex flex-col gap-2.5" @submit.prevent="requestCert">
+          <div class="field">
+            <label class="label-micro" for="cn">Common name</label>
             <input
-              id="cn" v-model="reqForm.common_name" type="text" required
-              placeholder="app.example.com" class="input input-bordered input-sm"
+              id="cn"
+              v-model="reqForm.common_name"
+              type="text"
+              required
+              placeholder="app.example.com"
+              class="input-console"
             />
           </div>
 
-          <div class="form-control">
-            <label class="label" for="sans">
-              <span class="label-text text-xs">Additional names</span>
-              <span class="label-text-alt text-[10px] opacity-60">Comma separated</span>
-            </label>
+          <div class="field">
+            <label class="label-micro" for="sans">Additional names — comma separated</label>
             <input
-              id="sans" v-model="reqForm.sans" type="text"
+              id="sans"
+              v-model="reqForm.sans"
+              type="text"
               placeholder="www.example.com, api.example.com"
-              class="input input-bordered input-sm"
+              class="input-console"
             />
           </div>
 
-          <div class="form-control">
-            <label class="label" for="ca-account">
-              <span class="label-text text-xs">Issue from</span>
-            </label>
-            <select
-              id="ca-account" v-model="reqForm.ca_account_id" required
-              class="select select-bordered select-sm"
-            >
+          <div class="field">
+            <label class="label-micro" for="ca-account">Issue from</label>
+            <select id="ca-account" v-model="reqForm.ca_account_id" required class="input-console">
               <option value="" disabled>Select a CA account</option>
               <option v-for="acc in caAccounts" :key="acc.id" :value="acc.id">
                 {{ acc.name }} ({{ acc.provider_type }})
               </option>
             </select>
-            <p v-if="accounts.loaded.value && !caAccounts.length" class="text-[11px] text-warning mt-1">
+            <p v-if="accounts.loaded.value && !caAccounts.length" class="label-micro sev-warning">
               No CA accounts configured — add one on the Gateways page first.
             </p>
           </div>
 
-          <div class="grid grid-cols-3 gap-3">
-            <div class="form-control">
-              <label class="label" for="kt"><span class="label-text text-xs">Key type</span></label>
+          <div class="grid grid-cols-3 gap-2">
+            <div class="field">
+              <label class="label-micro" for="kt">Key type</label>
               <select
-                id="kt" v-model="reqForm.key_type" class="select select-bordered select-sm"
+                id="kt"
+                v-model="reqForm.key_type"
+                class="input-console"
                 @change="onKeyTypeChange"
               >
                 <option value="ECDSA">ECDSA</option>
                 <option value="RSA">RSA</option>
               </select>
             </div>
-            <div class="form-control">
-              <label class="label" for="ks"><span class="label-text text-xs">Key size</span></label>
-              <select id="ks" v-model="reqForm.key_size" class="select select-bordered select-sm">
+            <div class="field">
+              <label class="label-micro" for="ks">Key size</label>
+              <select id="ks" v-model="reqForm.key_size" class="input-console">
                 <option v-for="size in keySizeOptions" :key="size" :value="size">{{ size }}</option>
               </select>
             </div>
-            <div class="form-control">
-              <label class="label" for="vd"><span class="label-text text-xs">Validity (days)</span></label>
+            <div class="field">
+              <label class="label-micro" for="vd">Validity (days)</label>
               <input
-                id="vd" v-model="reqForm.validity_days" type="number" min="1" max="398"
-                class="input input-bordered input-sm"
+                id="vd"
+                v-model="reqForm.validity_days"
+                type="number"
+                min="1"
+                max="398"
+                class="input-console"
               />
             </div>
           </div>
 
-          <div class="grid grid-cols-2 gap-3">
-            <input
-              v-model="reqForm.environment" type="text" placeholder="Environment"
-              class="input input-bordered input-sm"
-            />
-            <input
-              v-model="reqForm.team" type="text" placeholder="Owning team"
-              class="input input-bordered input-sm"
-            />
+          <div class="grid grid-cols-2 gap-2">
+            <div class="field">
+              <label class="label-micro" for="env">Environment</label>
+              <input
+                id="env"
+                v-model="reqForm.environment"
+                type="text"
+                placeholder="production"
+                class="input-console"
+              />
+            </div>
+            <div class="field">
+              <label class="label-micro" for="team">Owning team</label>
+              <input
+                id="team"
+                v-model="reqForm.team"
+                type="text"
+                placeholder="Platform Engineering"
+                class="input-console"
+              />
+            </div>
           </div>
 
-          <label class="label cursor-pointer justify-start gap-3">
-            <input v-model="reqForm.auto_renew" type="checkbox" class="checkbox checkbox-sm" />
-            <span class="label-text text-xs">Renew automatically before expiry</span>
+          <label class="flex items-center gap-2 cursor-pointer" style="font-size: 11px">
+            <input v-model="reqForm.auto_renew" type="checkbox" />
+            Renew automatically before expiry
           </label>
 
-          <div class="modal-action">
-            <button type="button" class="btn btn-ghost btn-sm" @click="showRequest = false">
-              Cancel
-            </button>
-            <button type="submit" class="btn btn-primary btn-sm" :disabled="requesting">
-              <span v-if="requesting" class="loading loading-spinner loading-xs"></span>
-              Request
+          <div class="flex justify-end gap-2 pt-1">
+            <button type="button" class="btn-console" @click="showRequest = false">Cancel</button>
+            <button type="submit" class="btn-console" data-variant="signal" :disabled="requesting">
+              {{ requesting ? 'Requesting…' : 'Request' }}
             </button>
           </div>
         </form>
-      </div>
-      <form method="dialog" class="modal-backdrop" @click="showRequest = false">
-        <button>close</button>
-      </form>
-    </dialog>
-
-    <!-- Detail modal -->
-    <dialog class="modal" :class="{ 'modal-open': !!selected }">
-      <div v-if="selected" class="modal-box max-w-lg">
-        <h3 class="text-base font-bold mb-1">{{ selected.common_name }}</h3>
-        <span class="badge badge-sm mb-4" :class="severityBadge(certSeverity(selected.status))">
-          {{ statusLabel(selected.status) }}
-        </span>
-
-        <dl class="grid grid-cols-2 gap-3 text-xs">
-          <div class="col-span-2">
-            <dt class="opacity-60 mb-0.5">Subject alternative names</dt>
-            <dd class="font-mono break-all">{{ selected.sans?.join(', ') || '—' }}</dd>
-          </div>
-          <div><dt class="opacity-60 mb-0.5">Serial</dt>
-            <dd class="font-mono break-all">{{ selected.serial_number || '—' }}</dd></div>
-          <div><dt class="opacity-60 mb-0.5">Key</dt>
-            <dd class="font-mono">{{ selected.key_type }}-{{ selected.key_size }}</dd></div>
-          <div><dt class="opacity-60 mb-0.5">Issued</dt>
-            <dd class="font-mono">{{ formatDate(selected.not_before) }}</dd></div>
-          <div><dt class="opacity-60 mb-0.5">Expires</dt>
-            <dd class="font-mono">{{ formatDate(selected.not_after) }}</dd></div>
-          <div><dt class="opacity-60 mb-0.5">Auto renew</dt>
-            <dd>{{ selected.auto_renew ? `Yes, ${selected.renewal_lead_days} days ahead` : 'No' }}</dd></div>
-          <div><dt class="opacity-60 mb-0.5">Renewals</dt>
-            <dd class="tabular-nums">{{ selected.renewal_count }}</dd></div>
-          <div class="col-span-2">
-            <dt class="opacity-60 mb-0.5">Issuer</dt>
-            <dd class="font-mono break-all">{{ selected.issuer_dn || '—' }}</dd>
-          </div>
-          <div v-if="selected.renewal_error" class="col-span-2">
-            <dt class="opacity-60 mb-0.5 text-error">Last renewal error</dt>
-            <dd class="text-error break-words">{{ selected.renewal_error }}</dd>
-          </div>
-        </dl>
-
-        <div class="modal-action">
-          <button class="btn btn-ghost btn-sm" @click="selected = null">Close</button>
-        </div>
-      </div>
-      <form method="dialog" class="modal-backdrop" @click="selected = null">
-        <button>close</button>
-      </form>
-    </dialog>
+      </PanelBox>
+    </div>
   </div>
 </template>
+
+<style scoped>
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.page-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 0.25rem;
+}
+
+.action-error {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.625rem;
+  font-size: 11px;
+  background: var(--sev-critical-wash);
+  border: 1px solid var(--sev-critical);
+  border-left-width: 3px;
+  word-break: break-word;
+}
+
+.filter-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  flex-wrap: wrap;
+  background: var(--line);
+  border: 1px solid var(--line);
+}
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.625rem;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--ink-panel);
+  border: 0;
+  cursor: pointer;
+}
+
+.filter-chip:hover {
+  color: var(--text-primary);
+  background: var(--ink-hover);
+}
+
+.filter-chip[data-active] {
+  color: var(--text-primary);
+  background: var(--ink-raised);
+  box-shadow: inset 0 -2px 0 0 var(--signal);
+}
+
+.filter-count {
+  font-weight: 700;
+  font-size: 10px;
+}
+
+.filter-search {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+  padding: 0 0.5rem;
+  background: var(--ink-panel);
+}
+
+.filter-search input {
+  background: none;
+  border: 0;
+  outline: none;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  width: 14rem;
+}
+
+.filter-search input::placeholder {
+  color: var(--text-muted);
+}
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+@media (min-width: 1280px) {
+  .split[data-open] {
+    grid-template-columns: minmax(0, 1fr) 22rem;
+  }
+}
+
+.table-scroll {
+  overflow-x: auto;
+  max-height: calc(100vh - 15rem);
+  overflow-y: auto;
+}
+
+.row-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--text-muted);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.row-action:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.row-action:disabled {
+  opacity: 0.4;
+}
+
+.detail-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.detail-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.625rem 0.75rem;
+  font-size: 11px;
+}
+
+.detail-wide {
+  grid-column: 1 / -1;
+}
+
+.detail-list dd {
+  color: var(--text-secondary);
+  margin-top: 0.15rem;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 2.5rem 1rem;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 3rem 1rem;
+  background: rgb(0 0 0 / 0.65);
+  overflow-y: auto;
+}
+
+.modal-panel {
+  width: 100%;
+  max-width: 30rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+</style>

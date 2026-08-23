@@ -8,9 +8,10 @@ import { useApi } from '@/composables/useApi'
 import { useCasStore } from '@/stores/cas'
 import { useEventStream } from '@/composables/useEventStream'
 import DataState from '@/components/common/DataState.vue'
+import PanelBox from '@/components/ui/PanelBox.vue'
+import SevChip from '@/components/ui/SevChip.vue'
 import {
-  caSeverity, compareSeverity, severityBadge, severityBorder, severityText,
-  statusLabel, type Severity,
+  caSeverity, compareSeverity, sevBg, sevClass, statusLabel, type Severity,
 } from '@/lib/severity'
 import { describeChainPosition, describeLineage, resolveChains } from '@/lib/chain'
 import { formatDate, formatDateTime, formatRelative, formatTime } from '@/lib/format'
@@ -94,12 +95,12 @@ const chips = computed(() => [
     key: 'attention' as Filter,
     label: 'Needs attention',
     count: attentionCount.value,
-    tone: attentionCount.value > 0 ? 'text-warning' : '',
+    tone: attentionCount.value > 0 ? 'sev-warning' : '',
   },
-  { key: 'critical' as Filter, label: 'Critical', count: counts.value.critical, tone: 'text-error' },
-  { key: 'warning' as Filter, label: 'Warning', count: counts.value.warning, tone: 'text-warning' },
+  { key: 'critical' as Filter, label: 'Critical', count: counts.value.critical, tone: 'sev-critical' },
+  { key: 'warning' as Filter, label: 'Warning', count: counts.value.warning, tone: 'sev-warning' },
   { key: 'unknown' as Filter, label: 'Unassessed', count: counts.value.unknown, tone: '' },
-  { key: 'ok' as Filter, label: 'Healthy', count: counts.value.ok, tone: 'text-success' },
+  { key: 'ok' as Filter, label: 'Healthy', count: counts.value.ok, tone: 'sev-ok' },
 ])
 
 // ── Row rendering ─────────────────────────────────────────
@@ -199,213 +200,185 @@ const worst = computed<Severity>(() => {
 })
 </script>
 
+
 <template>
-  <div class="space-y-5">
-    <!-- Header -->
-    <div class="flex items-end justify-between gap-4 flex-wrap">
-      <div>
-        <h1 class="text-lg font-bold tracking-tight">Certificate authority health</h1>
-        <p class="text-xs text-base-content/60 mt-0.5">
+  <div class="flex flex-col gap-3 min-w-0">
+    <!-- Intent, then freshness. Both matter: the sentence says why this page
+         exists, and the clock says whether to believe it. -->
+    <div class="page-head">
+      <div class="min-w-0">
+        <h1 class="label-rail">Certificate authority health</h1>
+        <p class="page-sub prose-ui">
           Every CA under management, most urgent first. An expiring issuing CA invalidates
           everything it has ever signed.
         </p>
       </div>
-      <div class="flex items-center gap-2">
-        <span class="text-[11px] text-base-content/50 tabular-nums">
-          Updated {{ formatTime(lastUpdatedAt) }}
-        </span>
-        <button class="btn btn-ghost btn-sm gap-1.5" :disabled="cas.loading" @click="cas.refresh()">
-          <RotateCw class="w-3.5 h-3.5" :class="cas.loading && 'animate-spin'" />
+      <div class="flex items-center gap-2 shrink-0">
+        <span class="label-micro">Updated {{ formatTime(lastUpdatedAt) }}</span>
+        <button class="btn-console" :disabled="cas.loading" @click="cas.refresh()">
+          <RotateCw class="w-3 h-3" :class="cas.loading && 'animate-spin'" />
           Refresh
         </button>
       </div>
     </div>
 
-    <div v-if="actionError" role="alert" class="alert alert-error py-2">
-      <CircleX class="w-4 h-4 shrink-0" />
-      <span class="text-xs break-words">{{ actionError }}</span>
+    <div v-if="actionError" role="alert" class="action-error">
+      <CircleX class="w-3.5 h-3.5 shrink-0 sev-critical" />
+      <span>{{ actionError }}</span>
     </div>
 
     <DataState :loading="cas.loading" :error="cas.error" :loaded="cas.loaded" @retry="cas.refresh()">
-      <!-- Filters, which double as the severity tally -->
-      <div class="flex items-center gap-2 flex-wrap">
+      <!-- Filters that double as the severity tally, so the counts and the
+           controls are the same object rather than two things to reconcile. -->
+      <div class="filter-bar">
         <button
           v-for="chip in chips"
           :key="chip.key"
           type="button"
-          class="btn btn-sm gap-2 font-medium"
-          :class="filter === chip.key ? 'btn-neutral' : 'btn-ghost border border-base-300'"
+          class="filter-chip"
+          :data-active="filter === chip.key || undefined"
           @click="filter = chip.key"
         >
-          <span>{{ chip.label }}</span>
-          <span
-            class="tabular-nums text-[11px] opacity-80"
-            :class="filter === chip.key ? '' : chip.tone"
-          >
+          {{ chip.label }}
+          <span class="filter-count" :class="filter === chip.key ? '' : chip.tone">
             {{ chip.count }}
           </span>
         </button>
 
-        <label class="input input-bordered input-sm flex items-center gap-2 ml-auto max-w-56">
-          <Search class="w-3.5 h-3.5 opacity-50" />
-          <input v-model="query" type="search" placeholder="Filter by name" class="grow text-xs" />
+        <label class="filter-search">
+          <Search class="w-3 h-3 shrink-0" style="color: var(--text-muted)" />
+          <input v-model="query" type="search" placeholder="Filter by name" />
         </label>
       </div>
 
       <!-- The list -->
-      <div v-if="visible.length" class="space-y-2">
-        <article
-          v-for="ca in visible"
-          :key="ca.id"
-          class="bg-base-100 border border-base-300 border-l-4 rounded-xl"
-          :class="severityBorder(caSeverity(ca.status))"
-        >
-          <div class="flex items-center gap-4 p-3 pl-4">
-            <!-- Days remaining: the largest thing on the row, on purpose.
-                 Tabular numerals so the column does not jitter as values change
-                 under a live feed. -->
-            <div class="w-20 shrink-0 text-center">
-              <div
-                class="text-3xl font-bold leading-none tabular-nums"
-                :class="severityText(caSeverity(ca.status))"
-              >
-                {{ remainingNumeral(ca.days_remaining) }}
-              </div>
-              <div class="text-[10px] uppercase tracking-wide opacity-60 mt-1">
-                {{ remainingLabel(ca.days_remaining) }}
-              </div>
-            </div>
+      <div v-if="visible.length" class="flex flex-col gap-px" style="background: var(--line)">
+        <article v-for="ca in visible" :key="ca.id" class="ca-row">
+          <span class="ca-rail" :class="sevBg(caSeverity(ca.status))" aria-hidden="true" />
 
-            <!-- Identity and position in the hierarchy -->
-            <div class="min-w-0 flex-1">
-              <div class="flex items-center gap-2 min-w-0">
-                <component
-                  :is="severityIcon(caSeverity(ca.status))"
-                  class="w-4 h-4 shrink-0"
-                  :class="severityText(caSeverity(ca.status))"
-                />
-                <span class="font-bold text-sm truncate">{{ ca.name }}</span>
-                <span class="badge badge-xs" :class="severityBadge(caSeverity(ca.status))">
-                  {{ statusLabel(ca.status) }}
-                </span>
-              </div>
-              <div class="text-[11px] text-base-content/60 mt-1 flex items-center gap-1.5 flex-wrap">
-                <span>{{ statusLabel(ca.ca_type) }}</span>
-                <span class="opacity-40">·</span>
-                <span :title="describeLineage(chains.get(ca.id), ca.name)">
-                  {{ describeChainPosition(chains.get(ca.id)) }}
-                </span>
+          <!-- Days remaining: the largest thing on the row, on purpose. Tabular
+               numerals so the column does not jitter under a live feed. -->
+          <div class="ca-days">
+            <span class="ca-days-num" :class="sevClass(caSeverity(ca.status))">
+              {{ remainingNumeral(ca.days_remaining) }}
+            </span>
+            <span class="label-micro">{{ remainingLabel(ca.days_remaining) }}</span>
+          </div>
+
+          <div class="ca-identity">
+            <div class="flex items-center gap-2 min-w-0">
+              <component
+                :is="severityIcon(caSeverity(ca.status))"
+                class="w-3.5 h-3.5 shrink-0"
+                :class="sevClass(caSeverity(ca.status))"
+              />
+              <span class="ca-name">{{ ca.name }}</span>
+              <SevChip :severity="caSeverity(ca.status)" :label="statusLabel(ca.status)" />
+            </div>
+            <div class="ca-meta">
+              <span>{{ statusLabel(ca.ca_type) }}</span>
+              <span class="ca-sep">·</span>
+              <span :title="describeLineage(chains.get(ca.id), ca.name)">
+                {{ describeChainPosition(chains.get(ca.id)) }}
+              </span>
+              <template v-if="chains.get(ca.id)?.detached">
+                <span class="ca-sep">·</span>
                 <span
-                  v-if="chains.get(ca.id)?.detached"
-                  class="inline-flex items-center gap-1 text-warning"
+                  class="inline-flex items-center gap-1 sev-warning"
                   :title="chains.get(ca.id)?.detachedReason"
                 >
-                  <Link2Off class="w-3 h-3" />
-                  detached
+                  <Link2Off class="w-3 h-3" />detached
                 </span>
-                <span class="opacity-40">·</span>
-                <span class="font-mono">expires {{ formatDate(ca.not_after) }}</span>
-              </div>
-            </div>
-
-            <!-- Operational facts, right-aligned so they form columns -->
-            <div class="hidden md:flex items-center gap-6 shrink-0 text-[11px]">
-              <div class="w-20 text-right">
-                <div class="opacity-60">Certificates</div>
-                <div class="font-bold tabular-nums text-sm">
-                  {{ ca.certificates_issued_count }}
-                </div>
-              </div>
-
-              <div class="w-24">
-                <div class="opacity-60">Revocation</div>
-                <div v-if="ca.crl_distribution_url" class="flex items-center gap-1 font-medium">
-                  <CircleCheck v-if="ca.is_crl_fresh" class="w-3.5 h-3.5 text-success" />
-                  <CircleX v-else class="w-3.5 h-3.5 text-error" />
-                  <span :class="ca.is_crl_fresh ? '' : 'text-error'">
-                    CRL {{ ca.is_crl_fresh ? 'fresh' : 'stale' }}
-                  </span>
-                </div>
-                <!-- Distinct from "stale": a CA that publishes no CRL cannot have
-                     a stale one, and conflating the two invents a problem. -->
-                <div v-else class="opacity-50">No CRL published</div>
-              </div>
-
-              <div class="w-32">
-                <div class="opacity-60">Owner</div>
-                <div v-if="ca.owner_team || ca.owner_email" class="font-medium truncate">
-                  <span v-if="ca.owner_team">{{ ca.owner_team }}</span>
-                  <a
-                    v-else
-                    :href="`mailto:${ca.owner_email}`"
-                    class="link"
-                  >{{ ca.owner_email }}</a>
-                </div>
-                <!-- Distinct from a blank cell: an unowned CA is a real and
-                     worrying state, not a rendering gap. -->
-                <div v-else class="text-warning">Nobody</div>
-              </div>
-
-              <div class="w-40">
-                <div class="opacity-60">Last alert</div>
-                <div
-                  v-if="ca.last_alert_sent_at"
-                  class="font-medium"
-                  :title="`CertPilot sent an alert at the ${ca.last_alert_threshold}-day threshold on ${formatDateTime(ca.last_alert_sent_at)}. This records what was sent, not whether anyone acknowledged it.`"
-                >
-                  {{ ca.last_alert_threshold }}-day threshold
-                </div>
-                <div v-else class="opacity-50">None sent</div>
-              </div>
+              </template>
+              <span class="ca-sep">·</span>
+              <span>expires {{ formatDate(ca.not_after) }}</span>
             </div>
           </div>
 
-          <!-- Acknowledgement.
-               Shown beneath the row rather than replacing anything in it: the CA
-               is still exactly as urgent as it was, and this says who is on it. -->
-          <div
-            v-if="ca.acknowledgement"
-            class="mx-3 mb-3 px-3 py-2 rounded-lg bg-base-200/60 text-[11px] flex items-start gap-2 flex-wrap"
-          >
-            <UserRound class="w-3.5 h-3.5 shrink-0 mt-0.5 opacity-60" />
+          <!-- Operational facts as fixed columns, so they line up down the list
+               and can be compared without reading each row as a sentence. -->
+          <dl class="ca-facts">
+            <div>
+              <dt class="label-micro">Issued</dt>
+              <dd class="ca-fact-value">{{ ca.certificates_issued_count.toLocaleString() }}</dd>
+            </div>
+
+            <div>
+              <dt class="label-micro">Revocation</dt>
+              <dd v-if="ca.crl_distribution_url" class="ca-fact-value">
+                <span :class="ca.is_crl_fresh ? '' : 'sev-warning'">
+                  CRL {{ ca.is_crl_fresh ? 'fresh' : 'stale' }}
+                </span>
+              </dd>
+              <!-- Distinct from "stale": a CA that publishes no CRL cannot have
+                   a stale one, and conflating the two invents a problem. -->
+              <dd v-else class="ca-fact-value sev-unknown">No CRL</dd>
+            </div>
+
+            <div>
+              <dt class="label-micro">Owner</dt>
+              <dd v-if="ca.owner_team || ca.owner_email" class="ca-fact-value truncate">
+                <span v-if="ca.owner_team">{{ ca.owner_team }}</span>
+                <a v-else :href="`mailto:${ca.owner_email}`" class="ca-link">{{ ca.owner_email }}</a>
+              </dd>
+              <!-- Distinct from a blank cell: an unowned CA is a real and
+                   worrying state, not a rendering gap. -->
+              <dd v-else class="ca-fact-value sev-warning">Nobody</dd>
+            </div>
+
+            <div>
+              <dt class="label-micro">Last alert</dt>
+              <dd
+                v-if="ca.last_alert_sent_at"
+                class="ca-fact-value"
+                :title="`CertPilot sent an alert at the ${ca.last_alert_threshold}-day threshold on ${formatDateTime(ca.last_alert_sent_at)}. This records what was sent, not whether anyone acknowledged it.`"
+              >
+                {{ ca.last_alert_threshold }}d sent
+              </dd>
+              <dd v-else class="ca-fact-value sev-unknown">None</dd>
+            </div>
+          </dl>
+
+          <!-- Acknowledgement. Beneath the row rather than replacing anything in
+               it: the CA is exactly as urgent as it was, and this says who is on
+               it. Acknowledging never removes a row — hiding a problem because
+               someone clicked a button is how CAs expire in organisations that
+               believed they were monitoring them. -->
+          <div v-if="ca.acknowledgement" class="ca-drawer">
+            <UserRound class="w-3.5 h-3.5 shrink-0 mt-0.5" style="color: var(--text-muted)" />
             <div class="min-w-0 flex-1">
-              <span class="font-semibold">
+              <span class="ca-ack-who">
                 Acknowledged by {{ ca.acknowledgement.acknowledged_by_email || 'an operator' }}
               </span>
-              <span class="opacity-60"> {{ formatRelative(ca.acknowledgement.acknowledged_at) }}</span>
-              <template v-if="ca.acknowledgement.note">
-                — {{ ca.acknowledgement.note }}
-              </template>
-              <div class="opacity-70 mt-0.5">
+              <span class="ca-ack-when">
+                &nbsp;{{ formatRelative(ca.acknowledgement.acknowledged_at) }}
+              </span>
+              <template v-if="ca.acknowledgement.note"> — {{ ca.acknowledgement.note }}</template>
+              <div class="ca-ack-state">
                 <template v-if="isSilenced(ca)">
                   Alerts are silenced until
-                  {{ formatDateTime(ca.acknowledgement.silence_until) }}<template
-                    v-if="ca.acknowledgement.threshold"
-                  >, for the {{ ca.acknowledgement.threshold }}-day threshold only — a tighter one
-                    alerts again</template>.
+                  {{ formatDateTime(ca.acknowledgement.silence_until)
+                  }}<template v-if="ca.acknowledgement.threshold">, for the
+                    {{ ca.acknowledgement.threshold }}-day threshold only — a tighter one alerts
+                    again</template>.
                 </template>
                 <template v-else>Alerts are still being delivered.</template>
               </div>
             </div>
-            <button
-              class="btn btn-ghost btn-xs"
-              :disabled="acting === ca.id"
-              @click="withdraw(ca)"
-            >
+            <button class="btn-console" :disabled="acting === ca.id" @click="withdraw(ca)">
               Withdraw
             </button>
           </div>
 
-          <!-- Acknowledge -->
-          <div v-else-if="acknowledging === ca.id" class="mx-3 mb-3 px-3 py-2 rounded-lg bg-base-200/60 space-y-2">
+          <div v-else-if="acknowledging === ca.id" class="ca-drawer flex-col items-stretch gap-2">
             <input
               v-model="ackNote"
               placeholder="What is being done? e.g. replacement issued, cutover Thursday"
-              class="input input-bordered input-xs w-full"
+              class="input-console w-full"
             />
             <div class="flex items-center gap-2 flex-wrap">
-              <label class="text-[11px] opacity-70">Silence alerts for</label>
-              <select v-model.number="ackSilenceDays" class="select select-bordered select-xs">
+              <label class="label-micro">Silence alerts for</label>
+              <select v-model.number="ackSilenceDays" class="input-console">
                 <option :value="0">not at all — keep alerting</option>
                 <option :value="1">1 day</option>
                 <option :value="7">7 days</option>
@@ -413,61 +386,58 @@ const worst = computed<Severity>(() => {
                 <option :value="90">90 days (maximum)</option>
               </select>
               <button
-                class="btn btn-primary btn-xs"
+                class="btn-console"
+                data-variant="signal"
                 :disabled="acting === ca.id"
                 @click="acknowledge(ca)"
               >
                 Acknowledge
               </button>
-              <button class="btn btn-ghost btn-xs" @click="acknowledging = null">Cancel</button>
-              <span class="text-[11px] opacity-60">
-                This never hides the CA — it stays on this page and on the wall display.
+              <button class="btn-console" @click="acknowledging = null">Cancel</button>
+              <span class="label-micro">
+                This never hides the CA — it stays here and on the wall display
               </span>
             </div>
           </div>
 
-          <div v-else-if="caSeverity(ca.status) !== 'ok'" class="mx-3 mb-3">
-            <button class="btn btn-ghost btn-xs" @click="openAcknowledge(ca)">Acknowledge</button>
+          <div v-else-if="caSeverity(ca.status) !== 'ok'" class="ca-drawer">
+            <button class="btn-console" @click="openAcknowledge(ca)">Acknowledge</button>
           </div>
         </article>
-
-        <p v-if="filtered" class="text-[11px] text-base-content/50 pt-1">
-          Showing {{ visible.length }} of {{ cas.authorities.length }} certificate authorities.
-          <button class="link" @click="filter = 'all'; query = ''">Show all</button>
-        </p>
       </div>
+
+      <p v-if="visible.length && filtered" class="label-micro">
+        Showing {{ visible.length }} of {{ cas.authorities.length }} authorities.
+        <button class="ca-link" @click="filter = 'all'; query = ''">Show all</button>
+      </p>
 
       <!-- Nothing matched the filter — distinct from having no CAs at all -->
-      <div
-        v-else-if="cas.authorities.length"
-        class="card bg-base-100 border border-base-300"
-      >
-        <div class="card-body items-center text-center py-10">
-          <Search class="w-8 h-8 opacity-30" />
-          <h3 class="font-bold text-sm">No CA matches this filter</h3>
-          <p class="text-xs opacity-60">
-            {{ cas.authorities.length }} authorities are under management.
-          </p>
-          <button class="btn btn-sm btn-ghost mt-1" @click="filter = 'all'; query = ''">
-            Clear the filter
-          </button>
+      <PanelBox v-if="!visible.length && cas.authorities.length">
+        <div class="empty-state">
+          <Search class="w-6 h-6" style="color: var(--text-muted)" />
+          <p class="label-rail">No CA matches this filter</p>
+          <p class="prose-ui">{{ cas.authorities.length }} authorities are under management.</p>
+          <button class="btn-console" @click="filter = 'all'; query = ''">Clear the filter</button>
         </div>
-      </div>
+      </PanelBox>
 
-      <div v-else class="card bg-base-100 border border-base-300">
-        <div class="card-body items-center text-center py-12">
-          <ShieldCheck class="w-10 h-10 opacity-30" />
-          <h3 class="font-bold text-sm">No certificate authorities are being monitored</h3>
-          <p class="text-xs opacity-60 max-w-sm">
+      <PanelBox v-else-if="!cas.authorities.length">
+        <div class="empty-state">
+          <ShieldCheck class="w-7 h-7" style="color: var(--text-muted)" />
+          <p class="label-rail">No certificate authorities are being monitored</p>
+          <!-- The distinction this paragraph draws is the whole reason it is
+               here. An empty monitoring screen looks identical to a healthy one. -->
+          <p class="prose-ui max-w-md">
             This page is empty because nothing has been imported — not because everything is
             healthy. Import a CA to begin monitoring its expiry.
           </p>
-          <router-link to="/pki" class="btn btn-primary btn-sm mt-2">Import a CA</router-link>
+          <router-link to="/pki" class="btn-console" data-variant="signal">Import a CA</router-link>
         </div>
-      </div>
+      </PanelBox>
 
-      <!-- A quiet, factual footer rather than a reassuring one -->
-      <p v-if="cas.authorities.length" class="text-[11px] text-base-content/50">
+      <!-- A quiet, factual footer rather than a reassuring one. "All healthy"
+           is only ever stated with the time it was true. -->
+      <p v-if="cas.authorities.length" class="label-micro">
         <template v-if="worst === 'ok'">
           All {{ cas.authorities.length }} authorities were healthy as of
           {{ formatTime(lastUpdatedAt) }}.
@@ -479,3 +449,229 @@ const worst = computed<Severity>(() => {
     </DataState>
   </div>
 </template>
+
+<style scoped>
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.page-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 0.25rem;
+  max-width: 46rem;
+}
+
+.action-error {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.625rem;
+  font-size: 11px;
+  background: var(--sev-critical-wash);
+  border: 1px solid var(--sev-critical);
+  border-left-width: 3px;
+  word-break: break-word;
+}
+
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  flex-wrap: wrap;
+  background: var(--line);
+  border: 1px solid var(--line);
+}
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.625rem;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--ink-panel);
+  border: 0;
+  cursor: pointer;
+}
+
+.filter-chip:hover {
+  color: var(--text-primary);
+  background: var(--ink-hover);
+}
+
+.filter-chip[data-active] {
+  color: var(--text-primary);
+  background: var(--ink-raised);
+  box-shadow: inset 0 -2px 0 0 var(--signal);
+}
+
+.filter-count {
+  font-weight: 700;
+  font-size: 10px;
+}
+
+.filter-search {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+  padding: 0 0.5rem;
+  background: var(--ink-panel);
+  align-self: stretch;
+}
+
+.filter-search input {
+  background: none;
+  border: 0;
+  outline: none;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  width: 11rem;
+}
+
+.filter-search input::placeholder {
+  color: var(--text-muted);
+}
+
+/* Rows separated by a single hairline rather than gaps between cards. The list
+   is one object — an ordering — and gaps would say it is many. */
+.ca-row {
+  display: grid;
+  grid-template-columns: 3px 4.5rem minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 0.75rem;
+  background: var(--ink-panel);
+  padding: 0.5rem 0.75rem 0.5rem 0;
+}
+
+.ca-rail {
+  align-self: stretch;
+  margin: -0.5rem 0;
+}
+
+.ca-days {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 0.125rem;
+}
+
+.ca-days-num {
+  font-size: 1.75rem;
+  line-height: 1;
+  font-weight: 500;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+
+.ca-identity {
+  min-width: 0;
+}
+
+.ca-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ca-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  margin-top: 0.2rem;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.ca-sep {
+  opacity: 0.45;
+}
+
+.ca-facts {
+  display: none;
+  gap: 1.25rem;
+  flex: none;
+}
+
+@media (min-width: 1024px) {
+  .ca-facts {
+    display: flex;
+  }
+}
+
+.ca-facts > div {
+  min-width: 5rem;
+  max-width: 9rem;
+}
+
+.ca-fact-value {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 0.1rem;
+}
+
+.ca-link {
+  color: var(--signal);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+.ca-drawer {
+  grid-column: 2 / -1;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  background: var(--ink-raised);
+  border-left: 2px solid var(--line-strong);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.ca-ack-who {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ca-ack-when,
+.ca-ack-state {
+  color: var(--text-muted);
+}
+
+.ca-ack-state {
+  margin-top: 0.15rem;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 2.5rem 1rem;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+</style>

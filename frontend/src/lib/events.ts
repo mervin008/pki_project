@@ -8,7 +8,10 @@
  */
 
 import type { Severity } from './severity'
+import { parseDetails } from './types'
 import type {
+  AuditLog,
+  CaExpiryAlertDetails,
   CaExpiryAlertPayload,
   CaHealthPayload,
   CertEventPayload,
@@ -110,4 +113,49 @@ export function eventCategory(event: StreamEvent): string {
 function humanize(value: string | undefined): string {
   if (!value) return 'unknown'
   return value.toLowerCase()
+}
+
+/**
+ * Renders an audit entry as a sentence, with CA alerts given their real detail.
+ *
+ * Lived inside DashboardView, which meant every other surface that showed audit
+ * rows either duplicated it or printed the raw `cert.renewal_failed` action
+ * string at the reader. It belongs beside describeEvent: the two answer the same
+ * question about the same vocabulary, one for the live stream and one for the
+ * recorded log.
+ */
+export function describeAudit(log: AuditLog): string {
+  if (log.action === 'ca.expiry_alert') {
+    const d = parseDetails<CaExpiryAlertDetails>(log.details)
+    if (d) return `${d.ca_name} expires in ${d.days_remaining} days (${d.threshold}-day threshold)`
+  }
+  const d = parseDetails<{ cn?: string; ca_name?: string; error?: string }>(log.details)
+  const subject = d?.cn ?? d?.ca_name ?? log.entity_type
+  switch (log.action) {
+    case 'cert.issued':
+      return `Issued ${subject}`
+    case 'cert.renewed':
+      return `Renewed ${subject}`
+    case 'cert.renewal_failed':
+      return `Renewal failed for ${subject}${d?.error ? `: ${d.error}` : ''}`
+    case 'cert.deleted':
+      return `Deleted ${subject}`
+    case 'cert.private_key_exported':
+      return `Private key exported for ${subject}`
+    case 'ca_account.created':
+      return `CA account ${subject} registered`
+    default:
+      return `${log.action} — ${subject}`
+  }
+}
+
+/** Severity of a recorded audit entry, matching describeAudit's vocabulary. */
+export function auditSeverity(log: AuditLog): Severity {
+  if (log.action === 'ca.expiry_alert') {
+    const d = parseDetails<CaExpiryAlertDetails>(log.details)
+    return d?.severity === 'CRITICAL' ? 'critical' : 'warning'
+  }
+  if (log.action.endsWith('_failed')) return 'critical'
+  if (log.action === 'cert.private_key_exported') return 'warning'
+  return 'ok'
 }
