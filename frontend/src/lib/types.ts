@@ -106,7 +106,17 @@ export interface Certificate {
   ca_authority_id?: string | null
   certificate_pem?: string
   chain_pem?: string
-  discovered_via: 'MANUAL' | 'SCAN' | 'CT_LOG' | 'IMPORT' | 'REQUESTED'
+  discovered_via: 'MANUAL' | 'SCAN' | 'CT_LOG' | 'IMPORT' | 'REQUESTED' | 'AGENT' | 'CLOUD'
+  /**
+   * Who holds the private key — core/store/models.go KeyCustody*.
+   *
+   * The only honest basis for offering an export. Provenance cannot answer it:
+   * a CSR-signed certificate is `REQUESTED` like any other and CertPilot holds
+   * no key for it, so a UI keying off `discovered_via` would offer a download
+   * that can only 404.
+   */
+  key_custody?: 'CERTPILOT' | 'AGENT' | 'EXTERNAL'
+  key_holder_agent_id?: string | null
   environment?: string
   team?: string
   tags?: string[]

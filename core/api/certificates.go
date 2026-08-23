@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/certpilot/certpilot/core/engine/policy"
@@ -93,16 +94,32 @@ func (h *CertificateHandler) Get(c *gin.Context) {
 
 // RequestCertificateInput defines the payload to request a new certificate.
 type RequestCertificateInput struct {
-	CommonName      string   `json:"common_name" binding:"required"`
-	SANs            []string `json:"sans"`
-	CAAccountID     string   `json:"ca_account_id" binding:"required"`
-	KeyType         string   `json:"key_type"`
-	KeySize         int      `json:"key_size"`
-	ValidityDays    int      `json:"validity_days"`
-	Environment     string   `json:"environment"`
-	Team            string   `json:"team"`
-	AutoRenew       bool     `json:"auto_renew"`
-	RenewalLeadDays int      `json:"renewal_lead_days"`
+	// CommonName is required unless CSRPEM is supplied, in which case the names
+	// come from the request itself. Validated below rather than by a binding
+	// tag, which cannot express "one of these two".
+	CommonName  string   `json:"common_name"`
+	SANs        []string `json:"sans"`
+	CAAccountID string   `json:"ca_account_id" binding:"required"`
+
+	// CSRPEM is a certificate signing request whose private key was generated
+	// somewhere else and never sent here.
+	//
+	// This is the path for the keys CertPilot must not hold: an HSM, a load
+	// balancer that generates its own, a team whose policy forbids a key
+	// leaving their host. The names, key type and key size are taken from the
+	// request and the corresponding fields above are ignored, because the only
+	// key that can serve the certificate is the one the requester already has —
+	// honouring a conflicting key_type here would issue a certificate nobody
+	// can use.
+	CSRPEM string `json:"csr_pem"`
+
+	KeyType         string `json:"key_type"`
+	KeySize         int    `json:"key_size"`
+	ValidityDays    int    `json:"validity_days"`
+	Environment     string `json:"environment"`
+	Team            string `json:"team"`
+	AutoRenew       bool   `json:"auto_renew"`
+	RenewalLeadDays int    `json:"renewal_lead_days"`
 }
 
 // Create handles POST /api/v1/certificates (Requests and issues a new certificate).
@@ -119,6 +136,30 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		return
 	}
 	input.Environment = environment
+
+	// A signing request, when there is one, is the authority on what is being
+	// asked for. Parsed first so the policy engine and the gateway both see the
+	// real names and the real key rather than whatever the form also sent.
+	var csrInfo *x509util.CSRInfo
+	if strings.TrimSpace(input.CSRPEM) != "" {
+		csrInfo, err = x509util.ParseCSRPEM([]byte(input.CSRPEM))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		names := csrInfo.Names()
+		input.CommonName = names[0]
+		input.SANs = names[1:]
+		input.KeyType = csrInfo.KeyType
+		input.KeySize = csrInfo.KeySize
+	}
+
+	if input.CommonName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "common_name is required when no csr_pem is supplied",
+		})
+		return
+	}
 
 	if input.KeyType == "" {
 		input.KeyType = "RSA"
@@ -189,6 +230,11 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		ValidityDays:   int32(input.ValidityDays),
 		ProviderConfig: providerConfig,
 	}
+	if csrInfo != nil {
+		// With a CSR present the gateway signs the key it was given instead of
+		// generating one, so no private key comes back and none is stored.
+		issueReq.CsrPem = []byte(input.CSRPEM)
+	}
 
 	resp, err := gw.Client.IssueCertificate(c.Request.Context(), issueReq)
 	if err != nil {
@@ -242,6 +288,11 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 	certPEM := string(resp.Certificate.CertificatePem)
 	notBefore, notAfter := info.NotBefore, info.NotAfter
 
+	keyCustody := store.KeyCustodyExternal
+	if privateKey != nil {
+		keyCustody = store.KeyCustodyCertPilot
+	}
+
 	certRecord := &store.Certificate{
 		FingerprintSHA256:   info.FingerprintSHA256,
 		CommonName:          info.CommonName,
@@ -264,6 +315,10 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		Environment:         input.Environment,
 		Team:                input.Team,
 		CreatedBy:           createdBy,
+		// Stated rather than inferred. A CSR-signed certificate is REQUESTED
+		// like any other, so provenance cannot answer "do we hold the key" —
+		// and that is the question deciding whether an export is even offered.
+		KeyCustody: keyCustody,
 	}
 
 	if err := h.store.CreateCertificate(c.Request.Context(), certRecord); err != nil {
@@ -279,8 +334,9 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		EntityID:   &certRecord.ID,
 		ActorID:    createdBy,
 		ActorEmail: &userEmail,
-		Details: fmt.Sprintf(`{"cn": %q, "gateway": %q, "serial": %q, "not_after": %q}`,
-			certRecord.CommonName, gw.Name, certRecord.SerialNumber, notAfter.Format(time.RFC3339)),
+		Details: fmt.Sprintf(`{"cn": %q, "gateway": %q, "serial": %q, "not_after": %q, "key_custody": %q}`,
+			certRecord.CommonName, gw.Name, certRecord.SerialNumber,
+			notAfter.Format(time.RFC3339), keyCustody),
 	})
 
 	h.broker.Publish(events.Event{
@@ -296,11 +352,27 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		},
 	})
 
-	if len(violations) > 0 {
+	var warnings []string
+	if csrInfo != nil {
+		if dropped := csrInfo.DroppedNames(); len(dropped) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"the signing request asked for %s, which this issuance path does not carry; the certificate covers DNS names only",
+				strings.Join(dropped, ", ")))
+		}
+	}
+
+	if len(violations) > 0 || len(warnings) > 0 {
 		// Non-blocking violations were allowed through, so the response has to
 		// say so — silently discarding them makes a policy that reports
 		// nothing indistinguishable from a policy that found nothing.
-		c.JSON(http.StatusCreated, gin.H{"certificate": certRecord, "policy_violations": violations})
+		body := gin.H{"certificate": certRecord}
+		if len(violations) > 0 {
+			body["policy_violations"] = violations
+		}
+		if len(warnings) > 0 {
+			body["warnings"] = warnings
+		}
+		c.JSON(http.StatusCreated, body)
 		return
 	}
 	c.JSON(http.StatusCreated, certRecord)
