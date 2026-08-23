@@ -1,5 +1,6 @@
-import { supabase } from '@/lib/supabase'
+import { currentAccessToken } from '@/lib/oidc'
 import { displayTokenHeaders } from '@/lib/displayToken'
+import { onUnauthorized } from '@/lib/session'
 
 export function useApi() {
   async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
@@ -8,16 +9,13 @@ export function useApi() {
       ...(options.headers as Record<string, string>),
     }
 
-    // Attach the access token when signed in. With no Supabase project
-    // configured, requests go out unauthenticated — which the core accepts only
-    // in development mode on a loopback address, and rejects otherwise.
-    if (supabase) {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession()
-      if (session?.access_token) {
-        headers['Authorization'] = `Bearer ${session.access_token}`
-      }
+    // Attach the access token when there is a session, refreshing it first if
+    // it is close to expiring. With no sign-in configured, requests go out
+    // unauthenticated — which the core accepts only in development mode on a
+    // loopback address, and rejects otherwise.
+    const token = await currentAccessToken()
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`
     }
 
     // A wall display has no session. It authenticates with a kiosk token, which
@@ -29,6 +27,14 @@ export function useApi() {
       ...options,
       headers,
     })
+
+    // A 401 once the token has already been refreshed means the session is
+    // genuinely over — revoked, or the refresh token spent. Handled centrally
+    // so that every panel does not have to recognise it, and so the operator is
+    // told rather than left reading a screen of failed requests as an outage.
+    if (response.status === 401) {
+      onUnauthorized()
+    }
 
     if (!response.ok) {
       // The API returns {"error": "..."}; prefer that message, since it is

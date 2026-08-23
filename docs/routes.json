@@ -231,7 +231,7 @@
       "min_role": null,
       "display_token": false,
       "note": "Public, and necessarily so: this is what a browser reads before it holds any credential. It carries the issuer and client id, which are public by construction in authorization code with PKCE \u2014 the user's own browser sends both to the provider in a URL they can read.",
-      "source_line": 71
+      "source_line": 90
     },
     {
       "method": "GET",

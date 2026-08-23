@@ -111,6 +111,14 @@ reach the database (`pkg/secrets`, envelope encryption, `CPS1` magic). Losing th
 KEK makes every stored secret unrecoverable. The core refuses to start against a
 database without one.
 
+**The identity provider says who you are; CertPilot says what you may do.**
+Roles live in the `users` table keyed on `(issuer, subject)`, not in a token
+claim — `app_metadata.certpilot_role` is ignored when a directory is wired in.
+A sign-in never writes a role, so `auth.bootstrap_admins` grants a first one and
+never maintains it. A subject is opaque text, **not a uuid**: Okta, Google and
+Auth0 all issue non-uuid subjects, which is what migration 028 widened every
+actor column for. `GET /me` is the only honest source of a role for the UI.
+
 **`key_custody` on a certificate says who holds the private key** — `CERTPILOT`,
 `AGENT`, or `EXTERNAL`. Provenance (`discovered_via`) cannot answer that
 question: a CSR-signed certificate is `REQUESTED` like any other and CertPilot
@@ -204,6 +212,10 @@ Severity utility classes are tripled (`.sev-critical.sev-critical.sev-critical`)
 to win specificity fights against `.tbl tbody td` and scoped component styles.
 That is deliberate; do not "simplify" it.
 
+Sign-in is OpenID Connect, authorization code with PKCE, in `lib/oidc.ts`. The
+frontend reads the issuer and client id from `/auth/config` rather than from
+build-time environment variables, so one instance is described by one file.
+
 **Converted to the console idiom:** `DashboardView`, `CaHealthView`,
 `CertificatesView`, plus the shell (`CommandRail`), `DataState`, and the `ui/`
 and `metadata/` components.
@@ -244,6 +256,14 @@ adding a required field makes the whole estate unsaveable.
 
 Documented, not secretly broken. Do not "discover" these as findings.
 
+- **The refresh token is in `localStorage`.** An access token is held in memory
+  only, but surviving a page reload needs something persistent and a page with
+  no backend of its own has no option a script cannot read. The fix is a
+  backend-for-frontend with an httpOnly cookie; that is a deployment change.
+- **No user-management UI yet.** Roles are stored and enforced, and
+  `SetUserRole` / `SetUserStatus` exist in the store, but nothing exposes them —
+  changing a role means a SQL update. The Settings → Users screen is the next
+  step.
 - **No certificate revocation endpoint.** Both gateways implement it; the core
   exposes no route. `DELETE /certificates/:id` deletes the record and leaves the
   certificate live at the CA. This is the largest hole in the product.

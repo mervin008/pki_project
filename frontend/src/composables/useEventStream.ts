@@ -1,5 +1,5 @@
 import { computed, readonly, ref, type ComputedRef, type Ref } from 'vue'
-import { supabase } from '@/lib/supabase'
+import { currentAccessToken } from '@/lib/oidc'
 import { createSseParser } from '@/lib/sse'
 import { displayTokenHeaders } from '@/lib/displayToken'
 import type { StreamEvent, StreamSnapshot } from '@/lib/types'
@@ -185,13 +185,12 @@ function createEventStream(): EventStream {
   async function authHeaders(): Promise<Record<string, string>> {
     const headers: Record<string, string> = { Accept: 'text/event-stream' }
 
-    if (supabase) {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession()
-      if (session?.access_token) {
-        headers.Authorization = `Bearer ${session.access_token}`
-      }
+    // Refreshed before the stream opens rather than after it fails. A long-
+    // lived connection outlives a short access token, and reconnecting is the
+    // moment to present a current one.
+    const token = await currentAccessToken()
+    if (token) {
+      headers.Authorization = `Bearer ${token}`
     }
 
     Object.assign(headers, displayTokenHeaders(headers.Authorization !== undefined))

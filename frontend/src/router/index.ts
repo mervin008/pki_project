@@ -8,7 +8,10 @@ import DiscoveryView from '@/views/DiscoveryView.vue'
 import PoliciesView from '@/views/PoliciesView.vue'
 import SettingsView from '@/views/SettingsView.vue'
 import DisplayView from '@/views/DisplayView.vue'
+import LoginView from '@/views/LoginView.vue'
+import AuthCallbackView from '@/views/AuthCallbackView.vue'
 import { DISPLAY_TOKEN_PARAM, captureDisplayToken } from '@/lib/displayToken'
+import { useAuthStore } from '@/stores/auth'
 
 declare module 'vue-router' {
   interface RouteMeta {
@@ -16,10 +19,27 @@ declare module 'vue-router' {
     chrome?: boolean
     /** Browser tab title. A PKI team runs several of these side by side. */
     title?: string
+    /**
+     * Reachable without a session. Only sign-in itself and the wall display,
+     * which carries its own credential.
+     */
+    public?: boolean
   }
 }
 
 const routes: RouteRecordRaw[] = [
+  {
+    path: '/login',
+    name: 'login',
+    component: LoginView,
+    meta: { chrome: false, public: true, title: 'Sign in' },
+  },
+  {
+    path: '/auth/callback',
+    name: 'auth-callback',
+    component: AuthCallbackView,
+    meta: { chrome: false, public: true, title: 'Signing in' },
+  },
   { path: '/', name: 'dashboard', component: DashboardView, meta: { title: 'Dashboard' } },
   {
     path: '/ca-health',
@@ -44,7 +64,7 @@ const routes: RouteRecordRaw[] = [
     path: '/display',
     name: 'display',
     component: DisplayView,
-    meta: { chrome: false, title: 'CA Health Wall' },
+    meta: { chrome: false, public: true, title: 'CA Health Wall' },
   },
 ]
 
@@ -69,14 +89,38 @@ export const router = createRouter({
  * revoked token a friendlier error than the honest one the server returns. The
  * view renders the server's rejection instead.
  */
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
   const raw = to.query[DISPLAY_TOKEN_PARAM]
   if (typeof raw === 'string' && captureDisplayToken(raw)) {
     const query = { ...to.query }
     delete query[DISPLAY_TOKEN_PARAM]
     return { path: to.path, query, hash: to.hash, replace: true }
   }
-  return true
+
+  // `/display` is public here for the same reason it always was: it carries a
+  // kiosk token rather than a session, and the core is the authority on whether
+  // that token is good. Sending a wall screen to a login page it can never
+  // complete would replace a loud, honest server rejection with a silent one.
+  if (to.meta.public) return true
+
+  const auth = useAuthStore()
+
+  // Resolved once per page load. The guard runs on every navigation, and
+  // re-asking the API on each one would put a round trip in front of every
+  // click in the application.
+  if (!auth.config) await auth.init()
+
+  // Anonymous development, or a build with no sign-in configured: there is no
+  // session to require, and demanding one would lock an evaluator out of an
+  // instance the core is perfectly willing to serve.
+  if (auth.mode !== 'oidc') return true
+
+  if (auth.isAuthenticated) return true
+
+  // `next` is carried so that a link into a deep page survives the round trip
+  // through the identity provider. Losing it is how a paged operator ends up on
+  // the dashboard hunting for the CA they were sent to look at.
+  return { name: 'login', query: { next: to.fullPath, reason: 'expired' }, replace: true }
 })
 
 router.afterEach((to) => {

@@ -28,7 +28,7 @@ import type { GatewaySummary, ListResponse } from '@/lib/types'
 const api = useApi()
 const auth = useAuthStore()
 const theme = useThemeStore()
-const { role, user, isAuthEnabled } = storeToRefs(auth)
+const { role, me, isAuthEnabled } = storeToRefs(auth)
 const { currentTheme } = storeToRefs(theme)
 
 // The health endpoint is /healthz and is unversioned; this page used to call
@@ -137,7 +137,7 @@ function refreshAll() {
             </div>
             <div class="flex items-center justify-between gap-3">
               <dt class="opacity-60">Signed in as</dt>
-              <dd class="font-mono truncate">{{ user?.email ?? '—' }}</dd>
+              <dd class="font-mono truncate">{{ me?.email ?? '—' }}</dd>
             </div>
             <div class="flex items-center justify-between gap-3">
               <dt class="opacity-60">Role</dt>
