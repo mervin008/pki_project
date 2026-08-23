@@ -24,14 +24,15 @@ import (
 // the same records to build a snapshot. Sharing pointers between those two made
 // a data race out of an ordinary dashboard refresh.
 type MemoryStore struct {
-	mu            sync.RWMutex
-	certificates  map[string]*Certificate
-	caAuthorities map[string]*CAAuthority
-	caAccounts    map[string]*CAAccount
-	targets       map[string]*DeploymentTarget
-	policies      map[string]*Policy
-	displayTokens map[string]*DisplayToken
-	notifChannels map[string]*NotificationChannel
+	mu             sync.RWMutex
+	certificates   map[string]*Certificate
+	caAuthorities  map[string]*CAAuthority
+	caAccounts     map[string]*CAAccount
+	targets        map[string]*DeploymentTarget
+	policies       map[string]*Policy
+	displayTokens  map[string]*DisplayToken
+	metadataFields map[string]*MetadataField
+	notifChannels  map[string]*NotificationChannel
 	// acks is append-only, newest last. Who acknowledged what and when is the
 	// record an incident review reads, so an acknowledgement is never
 	// overwritten by the next one.
@@ -221,8 +222,9 @@ func NewMemoryStore() *MemoryStore {
 		caAccounts: map[string]*CAAccount{
 			accSelfSignedID: accSelfSigned,
 		},
-		targets:  make(map[string]*DeploymentTarget),
-		policies: map[string]*Policy{polID: policy1},
+		targets:        make(map[string]*DeploymentTarget),
+		policies:       map[string]*Policy{polID: policy1},
+		metadataFields: map[string]*MetadataField{},
 		// Deliberately empty. Every other map here carries sample data so a
 		// first run has something to render, but a seeded credential is a
 		// credential someone forgets to remove.
@@ -3545,5 +3547,136 @@ func (m *MemoryStore) UpdateCertificatePosture(ctx context.Context, id string,
 		cert.PublicKeyAlgorithm = update.PublicKeyAlgorithm
 	}
 	cert.QuantumAssessedAt = &assessedAt
+	return nil
+}
+
+// ── Custom metadata ────────────────────────────────────────
+
+func (s *MemoryStore) UpdateCertificateMetadata(
+	_ context.Context, id string, update CertificateMetadataUpdate,
+) (*Certificate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cert, ok := s.certificates[id]
+	if !ok {
+		return nil, fmt.Errorf("certificate %s not found", id)
+	}
+	if update.Environment != nil {
+		cert.Environment = *update.Environment
+	}
+	if update.Team != nil {
+		cert.Team = *update.Team
+	}
+	if update.Tags != nil {
+		cert.Tags = append([]string(nil), *update.Tags...)
+	}
+	if update.Metadata != nil {
+		cert.Metadata = map[string]any{}
+		for k, v := range update.Metadata {
+			cert.Metadata[k] = v
+		}
+	}
+	cert.UpdatedAt = time.Now()
+
+	// A copy. Returning the live pointer hands the caller a record other
+	// writers keep mutating under it — the same defect ListAuditLogs had.
+	out := *cert
+	return &out, nil
+}
+
+func (s *MemoryStore) ListMetadataFields(_ context.Context, includeArchived bool) ([]*MetadataField, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	fields := []*MetadataField{}
+	for _, f := range s.metadataFields {
+		if !includeArchived && f.IsArchived {
+			continue
+		}
+		copied := *f
+		copied.Options = append([]MetadataOption(nil), f.Options...)
+		fields = append(fields, &copied)
+	}
+	sort.Slice(fields, func(i, j int) bool {
+		if fields[i].SortOrder != fields[j].SortOrder {
+			return fields[i].SortOrder < fields[j].SortOrder
+		}
+		return fields[i].Label < fields[j].Label
+	})
+	return fields, nil
+}
+
+func (s *MemoryStore) GetMetadataField(_ context.Context, id string) (*MetadataField, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	f, ok := s.metadataFields[id]
+	if !ok {
+		return nil, fmt.Errorf("metadata field %s not found", id)
+	}
+	copied := *f
+	copied.Options = append([]MetadataOption(nil), f.Options...)
+	return &copied, nil
+}
+
+func (s *MemoryStore) CreateMetadataField(_ context.Context, field *MetadataField) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// The unique constraint PostgreSQL enforces on `key`. Without it here the
+	// two stores disagree about whether a duplicate key is an error, which is
+	// exactly the class of drift the conformance suite exists to catch.
+	for _, existing := range s.metadataFields {
+		if existing.Key == field.Key {
+			return fmt.Errorf("a metadata field with key %q already exists", field.Key)
+		}
+	}
+
+	field.ID = uuid.New().String()
+	field.CreatedAt = time.Now()
+	field.UpdatedAt = field.CreatedAt
+	if field.Options == nil {
+		field.Options = []MetadataOption{}
+	}
+	copied := *field
+	copied.Options = append([]MetadataOption(nil), field.Options...)
+	s.metadataFields[field.ID] = &copied
+	return nil
+}
+
+func (s *MemoryStore) UpdateMetadataField(_ context.Context, field *MetadataField) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, ok := s.metadataFields[field.ID]
+	if !ok {
+		return fmt.Errorf("metadata field %s not found", field.ID)
+	}
+	// The key is the identity certificates store their values under, so it is
+	// carried forward rather than taken from the caller.
+	key := existing.Key
+	copied := *field
+	copied.Key = key
+	copied.CreatedAt = existing.CreatedAt
+	copied.UpdatedAt = time.Now()
+	copied.Options = append([]MetadataOption(nil), field.Options...)
+	if copied.Options == nil {
+		copied.Options = []MetadataOption{}
+	}
+	s.metadataFields[field.ID] = &copied
+	return nil
+}
+
+func (s *MemoryStore) ArchiveMetadataField(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	f, ok := s.metadataFields[id]
+	if !ok {
+		return fmt.Errorf("metadata field %s not found", id)
+	}
+	f.IsArchived = true
+	f.UpdatedAt = time.Now()
 	return nil
 }

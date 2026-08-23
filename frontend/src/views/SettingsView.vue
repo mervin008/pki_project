@@ -7,6 +7,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useThemeStore } from '@/stores/theme'
 import DataState from '@/components/common/DataState.vue'
 import NotificationChannels from '@/components/settings/NotificationChannels.vue'
+import MetadataFields from '@/components/settings/MetadataFields.vue'
 import {
   Server, Cpu, ShieldCheck, CircleCheck, CircleX, RotateCw, Palette, UserCog,
 } from 'lucide-vue-next'
@@ -157,6 +158,8 @@ function refreshAll() {
       </section>
 
       <!-- Alert delivery -->
+      <MetadataFields />
+
       <NotificationChannels />
 
       <!-- Preferences -->

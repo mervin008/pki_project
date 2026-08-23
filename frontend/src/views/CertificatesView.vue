@@ -14,7 +14,9 @@ import {
 import { formatDate, formatDaysShort, truncate } from '@/lib/format'
 import { downloadText, fullChain, pemFilename } from '@/lib/download'
 import { useAuthStore } from '@/stores/auth'
-import type { CaAccount, Certificate, ListResponse } from '@/lib/types'
+import MetadataInput from '@/components/metadata/MetadataInput.vue'
+import { formatMetadataValue } from '@/lib/types'
+import type { CaAccount, Certificate, ListResponse, MetadataField } from '@/lib/types'
 
 const api = useApi()
 const auth = useAuthStore()
@@ -26,12 +28,63 @@ const certs = useAsyncData<ListResponse<Certificate>>((s) =>
 const accounts = useAsyncData<ListResponse<CaAccount>>((s) =>
   api.get<ListResponse<CaAccount>>('/api/v1/ca-accounts', s),
 )
+// Archived fields included: a certificate may hold a value for one, and without
+// the definition the panel could only print the raw stored value with no label.
+const metaFields = useAsyncData<ListResponse<MetadataField>>((s) =>
+  api.get<ListResponse<MetadataField>>('/api/v1/metadata-fields?include_archived=true', s),
+)
 
 const certificates = computed(() => certs.data.value?.data ?? [])
 const caAccounts = computed(() => accounts.data.value?.data ?? [])
+const allFields = computed(() => metaFields.data.value?.data ?? [])
+/** Offered on new certificates and in the editor. */
+const liveFields = computed(() => allFields.value.filter((f) => !f.is_archived))
 
 const searchQuery = ref('')
 const filterStatus = ref<'all' | 'ok' | 'warning' | 'critical'>('all')
+
+/**
+ * Metadata filters, one selected value per field.
+ *
+ * The reason for letting people define fields at all: an inventory you cannot
+ * slice is a list. Applied client-side over the already-fetched list, like the
+ * search box beside it.
+ */
+const metaFilter = ref<Record<string, string>>({})
+
+const activeMetaFilters = computed(() =>
+  Object.entries(metaFilter.value).filter(([, v]) => v !== ''),
+)
+
+function clearMetaFilters() {
+  metaFilter.value = {}
+}
+
+/** Distinct answers actually present, so a filter never offers an empty result. */
+function answersInUse(field: MetadataField): { value: string; label: string }[] {
+  const seen = new Set<string>()
+  for (const cert of certificates.value) {
+    const raw = cert.metadata?.[field.key]
+    if (raw === undefined || raw === null || raw === '') continue
+    for (const v of Array.isArray(raw) ? raw : [raw]) seen.add(String(v))
+  }
+  return [...seen]
+    .map((value) => ({
+      value,
+      label: field.options.find((o) => o.value === value)?.label
+        ?? (field.field_type === 'BOOLEAN' ? (value === 'true' ? 'Yes' : 'No') : value),
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label))
+}
+
+function matchesMetadata(cert: Certificate): boolean {
+  return activeMetaFilters.value.every(([key, wanted]) => {
+    const raw = cert.metadata?.[key]
+    if (raw === undefined || raw === null) return false
+    if (Array.isArray(raw)) return raw.map(String).includes(wanted)
+    return String(raw) === wanted
+  })
+}
 
 // Filters group by severity rather than by exact status: an operator scanning
 // for trouble wants "everything critical", not to remember that REVOKED and
@@ -47,7 +100,7 @@ const filtered = computed(() => {
         (c.serial_number ?? '').toLowerCase().includes(q)
       const matchesStatus =
         filterStatus.value === 'all' || certUrgency(c) === filterStatus.value
-      return matchesSearch && matchesStatus
+      return matchesSearch && matchesStatus && matchesMetadata(c)
     })
     .sort((a, b) => {
       const bySeverity = compareSeverity(certUrgency(a), certUrgency(b))
@@ -81,6 +134,8 @@ const blankRequest = () => ({
   team: '',
   auto_renew: true,
 })
+/** Values being entered on the request form, keyed by field key. */
+const reqMeta = ref<Record<string, unknown>>({})
 const reqForm = ref(blankRequest())
 
 // RSA and ECDSA have entirely different meaningful key sizes; offering 2048 for
@@ -107,9 +162,11 @@ async function requestCert() {
       environment: reqForm.value.environment || undefined,
       team: reqForm.value.team || undefined,
       auto_renew: reqForm.value.auto_renew,
+      metadata: reqMeta.value,
     })
     showRequest.value = false
     reqForm.value = blankRequest()
+    reqMeta.value = {}
     await certs.refresh()
   } catch (err) {
     requestError.value = err instanceof Error ? err.message : String(err)
@@ -222,6 +279,67 @@ async function exportPEM(cert: Certificate, what: 'cert' | 'chain' | 'fullchain'
   }
 }
 
+// ── Editing what an operator owns ─────────────────────────
+
+/**
+ * A certificate record has two halves, and only one of them is anybody's to
+ * change. Serial, fingerprint, expiry and renewal state are facts the CA
+ * established; environment, team, tags and the custom fields are decisions
+ * somebody made and may need to correct. Until now there was no way to correct
+ * any of them — a certificate outlives the team that requested it, and a record
+ * that cannot be fixed becomes a record nobody trusts.
+ */
+const editingMeta = ref(false)
+const savingMeta = ref(false)
+const metaError = ref<string | null>(null)
+const metaDraft = ref<{
+  environment: string
+  team: string
+  tags: string
+  metadata: Record<string, unknown>
+}>({ environment: '', team: '', tags: '', metadata: {} })
+
+function startEditMeta(cert: Certificate) {
+  metaError.value = null
+  editingMeta.value = true
+  metaDraft.value = {
+    environment: cert.environment ?? '',
+    team: cert.team ?? '',
+    tags: (cert.tags ?? []).join(', '),
+    metadata: { ...(cert.metadata ?? {}) },
+  }
+}
+
+async function saveMeta(cert: Certificate) {
+  savingMeta.value = true
+  metaError.value = null
+  try {
+    // Only what this form owns is sent. The endpoint leaves an omitted field
+    // alone, so a stale tab cannot blank something it never displayed.
+    const updated = await api.patch<Certificate>(`/api/v1/certificates/${cert.id}`, {
+      environment: metaDraft.value.environment,
+      team: metaDraft.value.team,
+      tags: metaDraft.value.tags.split(',').map((t) => t.trim()).filter(Boolean),
+      metadata: metaDraft.value.metadata,
+    })
+    selected.value = updated
+    editingMeta.value = false
+    await certs.refresh()
+  } catch (err) {
+    metaError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    savingMeta.value = false
+  }
+}
+
+/** Fields with a value on this certificate, archived ones included. */
+function answeredFields(cert: Certificate): MetadataField[] {
+  return allFields.value.filter((f) => {
+    const v = cert.metadata?.[f.key]
+    return v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && !v.length)
+  })
+}
+
 // ── Signing an existing request ───────────────────────────
 
 /**
@@ -261,6 +379,7 @@ async function signCSR() {
       validity_days: Number(reqForm.value.validity_days),
       environment: reqForm.value.environment || undefined,
       team: reqForm.value.team || undefined,
+      metadata: reqMeta.value,
       // Renewal needs a key to produce a new certificate with, and there is no
       // key here. Offering it would schedule a renewal that can only fail.
       auto_renew: false,
@@ -268,6 +387,7 @@ async function signCSR() {
     showRequest.value = false
     csrText.value = ''
     reqForm.value = blankRequest()
+    reqMeta.value = {}
     await certs.refresh()
   } catch (err) {
     requestError.value = err instanceof Error ? err.message : String(err)
@@ -342,6 +462,34 @@ async function signCSR() {
             placeholder="Common name, SAN, or serial"
           />
         </label>
+      </div>
+
+      <!-- Slicing by what this organisation defined. Only fields that some
+           certificate actually answers are offered, so a filter never presents
+           a choice that can only return nothing. -->
+      <div v-if="liveFields.length" class="meta-filter">
+        <template v-for="field in liveFields" :key="field.id">
+          <label v-if="answersInUse(field).length" class="meta-filter-item">
+            <span class="label-micro">{{ field.label }}</span>
+            <select
+              class="input-console"
+              :value="metaFilter[field.key] ?? ''"
+              @change="metaFilter[field.key] = ($event.target as HTMLSelectElement).value"
+            >
+              <option value="">Any</option>
+              <option v-for="a in answersInUse(field)" :key="a.value" :value="a.value">
+                {{ a.label }}
+              </option>
+            </select>
+          </label>
+        </template>
+        <button
+          v-if="activeMetaFilters.length"
+          class="btn-console self-end"
+          @click="clearMetaFilters"
+        >
+          Clear
+        </button>
       </div>
 
       <!-- Table beside detail rather than a modal over it. A modal makes you
@@ -491,6 +639,90 @@ async function signCSR() {
               </div>
 
               <p v-if="exportError" role="alert" class="export-error">{{ exportError }}</p>
+            </div>
+
+            <!-- Metadata, above the immutable facts. It is the part somebody
+                 came here to change; the serial is not. -->
+            <div class="meta-block">
+              <div class="meta-head">
+                <span class="label-rail">Metadata</span>
+                <button
+                  v-if="!editingMeta && auth.canWrite"
+                  class="btn-console"
+                  @click="startEditMeta(selected)"
+                >
+                  Edit
+                </button>
+              </div>
+
+              <p v-if="metaError" role="alert" class="export-error">{{ metaError }}</p>
+
+              <template v-if="editingMeta">
+                <div class="grid gap-2 sm:grid-cols-2">
+                  <div class="field">
+                    <label class="label-micro" for="ed-env">Environment</label>
+                    <select id="ed-env" v-model="metaDraft.environment" class="input-console">
+                      <option value="">— not set —</option>
+                      <option value="production">production</option>
+                      <option value="staging">staging</option>
+                      <option value="development">development</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label class="label-micro" for="ed-team">Owning team</label>
+                    <input id="ed-team" v-model="metaDraft.team" type="text" class="input-console" />
+                  </div>
+                </div>
+                <div class="field">
+                  <label class="label-micro" for="ed-tags">Tags</label>
+                  <input id="ed-tags" v-model="metaDraft.tags" type="text" class="input-console" />
+                  <p class="field-help">Comma separated.</p>
+                </div>
+
+                <MetadataInput
+                  v-for="field in liveFields"
+                  :key="field.id"
+                  :field="field"
+                  :model-value="metaDraft.metadata[field.key]"
+                  @update:model-value="metaDraft.metadata[field.key] = $event"
+                />
+
+                <div class="flex justify-end gap-2">
+                  <button class="btn-console" @click="editingMeta = false">Cancel</button>
+                  <button
+                    class="btn-console"
+                    data-variant="signal"
+                    :disabled="savingMeta"
+                    @click="saveMeta(selected)"
+                  >
+                    {{ savingMeta ? 'Saving…' : 'Save' }}
+                  </button>
+                </div>
+              </template>
+
+              <dl v-else class="detail-list">
+                <div>
+                  <dt class="label-micro">Environment</dt>
+                  <dd>{{ selected.environment || '—' }}</dd>
+                </div>
+                <div>
+                  <dt class="label-micro">Team</dt>
+                  <dd>{{ selected.team || '—' }}</dd>
+                </div>
+                <div v-if="selected.tags?.length" class="detail-wide">
+                  <dt class="label-micro">Tags</dt>
+                  <dd>{{ selected.tags.join(', ') }}</dd>
+                </div>
+                <div v-for="field in answeredFields(selected)" :key="field.id">
+                  <dt class="label-micro">
+                    {{ field.label }}
+                    <span v-if="field.is_archived" class="sev-unknown">(archived)</span>
+                  </dt>
+                  <!-- The label, never the stored value: tier_1 is what the
+                       database holds and "Tier 1" is what it means. -->
+                  <dd>{{ formatMetadataValue(field, selected.metadata?.[field.key]) }}</dd>
+                </div>
+              </dl>
             </div>
 
             <dl class="detail-list">
@@ -715,6 +947,16 @@ async function signCSR() {
             </div>
           </div>
 
+          <!-- Whatever this organisation decided it needs to know. Required
+               ones are enforced by the server at issuance. -->
+          <MetadataInput
+            v-for="field in liveFields"
+            :key="field.id"
+            :field="field"
+            :model-value="reqMeta[field.key]"
+            @update:model-value="reqMeta[field.key] = $event"
+          />
+
           <label
             v-if="requestMode !== 'sign'"
             class="flex items-center gap-2 cursor-pointer"
@@ -924,6 +1166,44 @@ async function signCSR() {
 .modal-panel {
   width: 100%;
   max-width: 30rem;
+}
+
+.meta-filter {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 0.625rem;
+  background: var(--ink-panel);
+  border: 1px solid var(--line);
+}
+
+.meta-filter-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+/* A select sizes to its widest option, so a field whose answers are all short
+   collapses to a box narrower than its own label. */
+.meta-filter-item select {
+  min-width: 9rem;
+}
+
+.meta-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  background: var(--ink-raised);
+  border: 1px solid var(--line);
+}
+
+.meta-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
 }
 
 .field {

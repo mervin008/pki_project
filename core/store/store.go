@@ -13,6 +13,21 @@ type Store interface {
 	GetCertificateByFingerprint(ctx context.Context, fingerprint string) (*Certificate, error)
 	CreateCertificate(ctx context.Context, cert *Certificate) error
 	UpdateCertificate(ctx context.Context, cert *Certificate) error
+	// UpdateCertificateMetadata writes the operator-owned fields and nothing
+	// else. Narrow rather than a full UpdateCertificate because everything else
+	// on the row is a fact about the certificate itself — serial, expiry,
+	// fingerprint — and a full-object write from a form is how a stale copy in
+	// a browser tab overwrites what a renewal just recorded.
+	UpdateCertificateMetadata(ctx context.Context, id string, update CertificateMetadataUpdate) (*Certificate, error)
+
+	// ── Custom metadata fields ──
+	ListMetadataFields(ctx context.Context, includeArchived bool) ([]*MetadataField, error)
+	GetMetadataField(ctx context.Context, id string) (*MetadataField, error)
+	CreateMetadataField(ctx context.Context, field *MetadataField) error
+	UpdateMetadataField(ctx context.Context, field *MetadataField) error
+	// ArchiveMetadataField retires a field without deleting it, so the values
+	// certificates already hold keep something that can label them.
+	ArchiveMetadataField(ctx context.Context, id string) error
 	DeleteCertificate(ctx context.Context, id string) error
 	GetCertificatesDueForRenewal(ctx context.Context, leadDays int) ([]*Certificate, error)
 	// GetCertificatePrivateKey reads the sealed private key for one
@@ -584,3 +599,13 @@ type RenewalInfoUpdate struct {
 // running and left a stale one behind — must not be able to talk this system
 // out of renewing something that is about to stop working.
 const RenewalSafetyFloorDays = 7
+
+// CertificateMetadataUpdate is the set of fields an operator owns on a
+// certificate. Pointers so an omitted field is left alone rather than cleared —
+// a form that submits only what it edited must not blank the rest.
+type CertificateMetadataUpdate struct {
+	Environment *string
+	Team        *string
+	Tags        *[]string
+	Metadata    map[string]any
+}

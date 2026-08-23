@@ -120,6 +120,9 @@ type RequestCertificateInput struct {
 	Team            string `json:"team"`
 	AutoRenew       bool   `json:"auto_renew"`
 	RenewalLeadDays int    `json:"renewal_lead_days"`
+	// Metadata holds values for the admin-defined fields. Required ones are
+	// enforced at request time.
+	Metadata map[string]any `json:"metadata"`
 }
 
 // Create handles POST /api/v1/certificates (Requests and issues a new certificate).
@@ -161,6 +164,20 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// Required fields are enforced here and only here: at the moment somebody
+	// asks for a certificate, which is when the organisation gets to insist on
+	// a cost centre or a change ticket.
+	metadataFields, err := h.store.ListMetadataFields(c.Request.Context(), false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	cleanedMetadata, err := validateMetadata(metadataFields, input.Metadata, true)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	if input.KeyType == "" {
 		input.KeyType = "RSA"
 	}
@@ -174,7 +191,14 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		input.RenewalLeadDays = 30
 	}
 
-	allDomains := append([]string{input.CommonName}, input.SANs...)
+	// Deduplicated, case-insensitively.
+	//
+	// CAB Forum rules require the common name to also appear as a SAN, so
+	// nearly every client sends it in both fields — and the certificate came
+	// back listing the same name twice, which the inventory then reported as
+	// "one extra name". Harmless in the certificate, wrong on every screen
+	// that counts them.
+	allDomains := dedupeNames(append([]string{input.CommonName}, input.SANs...))
 
 	// 1. Fetch CA account
 	caAccount, err := h.store.GetCAAccount(c.Request.Context(), input.CAAccountID)
@@ -315,6 +339,7 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		Environment:         input.Environment,
 		Team:                input.Team,
 		CreatedBy:           createdBy,
+		Metadata:            cleanedMetadata,
 		// Stated rather than inferred. A CSR-signed certificate is REQUESTED
 		// like any other, so provenance cannot answer "do we hold the key" —
 		// and that is the question deciding whether an export is even offered.
@@ -376,6 +401,91 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusCreated, certRecord)
+}
+
+// UpdateMetadataInput is what an operator may change on a certificate.
+//
+// Pointers, so an omitted field is left alone rather than cleared. A form that
+// edits only the team must not blank the environment, and a client that knows
+// about three of these fields must not erase the fourth.
+type UpdateMetadataInput struct {
+	Environment *string        `json:"environment"`
+	Team        *string        `json:"team"`
+	Tags        *[]string      `json:"tags"`
+	Metadata    map[string]any `json:"metadata"`
+}
+
+// UpdateMetadata handles PATCH /api/v1/certificates/:id.
+//
+// The only mutable part of a certificate record. Everything else on it —
+// serial, fingerprint, expiry, renewal state — is a fact about the certificate
+// rather than a decision about it, and none of those are a person's to edit.
+func (h *CertificateHandler) UpdateMetadata(c *gin.Context) {
+	id := c.Param("id")
+
+	existing, err := h.store.GetCertificate(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	var input UpdateMetadataInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	update := store.CertificateMetadataUpdate{Tags: input.Tags}
+
+	if input.Environment != nil {
+		environment, err := normalizeEnvironment(*input.Environment)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		update.Environment = &environment
+	}
+	if input.Team != nil {
+		team := strings.TrimSpace(*input.Team)
+		update.Team = &team
+	}
+
+	if input.Metadata != nil {
+		fields, err := h.store.ListMetadataFields(c.Request.Context(), true)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		// Required is not enforced here. Marking a field required later must
+		// not make every existing certificate unsaveable — an operator would
+		// be unable to correct the team on a certificate because of an
+		// unrelated new field somebody added this morning.
+		cleaned, err := validateMetadata(fields, input.Metadata, false)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		update.Metadata = cleaned
+	}
+
+	updated, err := h.store.UpdateCertificateMetadata(c.Request.Context(), id, update)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	actorID := c.GetString(middleware.ContextUserID)
+	actorEmail := c.GetString(middleware.ContextUserEmail)
+	_ = h.store.CreateAuditLog(c.Request.Context(), &store.AuditLog{
+		Action:     "cert.metadata_updated",
+		EntityType: "certificate",
+		EntityID:   &existing.ID,
+		ActorID:    &actorID,
+		ActorEmail: &actorEmail,
+		Details:    fmt.Sprintf(`{"cn": %q}`, existing.CommonName),
+	})
+
+	c.JSON(http.StatusOK, updated)
 }
 
 // Renew handles POST /api/v1/certificates/:id/renew.

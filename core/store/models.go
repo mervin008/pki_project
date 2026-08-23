@@ -195,16 +195,20 @@ type Certificate struct {
 	// PrivateKeyEncrypted holds the sealed private key. It is never serialized
 	// in a list or detail response; retrieving a key is a separate,
 	// admin-only, audited operation.
-	PrivateKeyEncrypted *string   `json:"-"`
-	CertificatePEM      *string   `json:"certificate_pem,omitempty"`
-	ChainPEM            *string   `json:"chain_pem,omitempty"`
-	DiscoveredVia       string    `json:"discovered_via"` // MANUAL, SCAN, CT_LOG, IMPORT, REQUESTED
-	Environment         string    `json:"environment,omitempty"`
-	Team                string    `json:"team,omitempty"`
-	Tags                []string  `json:"tags,omitempty"`
-	CreatedBy           *string   `json:"created_by,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	PrivateKeyEncrypted *string  `json:"-"`
+	CertificatePEM      *string  `json:"certificate_pem,omitempty"`
+	ChainPEM            *string  `json:"chain_pem,omitempty"`
+	DiscoveredVia       string   `json:"discovered_via"` // MANUAL, SCAN, CT_LOG, IMPORT, REQUESTED
+	Environment         string   `json:"environment,omitempty"`
+	Team                string   `json:"team,omitempty"`
+	Tags                []string `json:"tags,omitempty"`
+	// Metadata holds values for the admin-defined MetadataFields, keyed by
+	// field key. Always non-nil after a read so a template can index it
+	// without a guard.
+	Metadata  map[string]any `json:"metadata"`
+	CreatedBy *string        `json:"created_by,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
 	// KeyCustody says who holds the private key: CERTPILOT (sealed here),
 	// AGENT (on a host, never anywhere else), or EXTERNAL (somebody we cannot
 	// name). Until agents existed, "no key stored" meant only the last of
@@ -1881,4 +1885,64 @@ func (g *AgentGrant) AllowsKey(keyType string, keySize int) (bool, string) {
 		}
 	}
 	return true, ""
+}
+
+// ── Custom metadata ────────────────────────────────────────
+
+// Field type vocabulary for MetadataField.
+const (
+	MetadataText        = "TEXT"
+	MetadataSelect      = "SELECT"
+	MetadataMultiSelect = "MULTI_SELECT"
+	MetadataBoolean     = "BOOLEAN"
+)
+
+// Display vocabulary for how a single choice is drawn.
+const (
+	MetadataDisplayDropdown = "DROPDOWN"
+	MetadataDisplayRadio    = "RADIO"
+)
+
+// MetadataOption is one choice on a SELECT or MULTI_SELECT field.
+//
+// Value and Label are separate so a label can be reworded without rewriting
+// every certificate that holds the value. Value is fixed at creation.
+type MetadataOption struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+}
+
+// MetadataField is one question every certificate can answer.
+//
+// What a PKI team needs to slice its inventory by belongs to that team — cost
+// centre, change ticket, data classification, which product line — and a fixed
+// schema guesses at it and is wrong everywhere. An admin defines the fields.
+type MetadataField struct {
+	ID string `json:"id"`
+	// Key is the immutable machine name certificates store their values under.
+	Key       string           `json:"key"`
+	Label     string           `json:"label"`
+	FieldType string           `json:"field_type"`
+	Options   []MetadataOption `json:"options"`
+	Display   string           `json:"display"`
+	HelpText  string           `json:"help_text,omitempty"`
+	// IsRequired is enforced when a certificate is requested, never
+	// retroactively: adding a required field must not invalidate the estate.
+	IsRequired bool `json:"is_required"`
+	SortOrder  int  `json:"sort_order"`
+	// IsArchived fields stop being offered and keep labelling stored values.
+	IsArchived bool      `json:"is_archived"`
+	CreatedBy  *string   `json:"created_by,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// HasOption reports whether value is one this field offers.
+func (f *MetadataField) HasOption(value string) bool {
+	for _, o := range f.Options {
+		if o.Value == value {
+			return true
+		}
+	}
+	return false
 }

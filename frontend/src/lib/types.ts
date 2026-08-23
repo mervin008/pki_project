@@ -116,6 +116,8 @@ export interface Certificate {
    * that can only 404.
    */
   key_custody?: 'CERTPILOT' | 'AGENT' | 'EXTERNAL'
+  /** Values for the admin-defined MetadataFields, keyed by field key. */
+  metadata?: Record<string, unknown>
   key_holder_agent_id?: string | null
   environment?: string
   team?: string
@@ -545,4 +547,66 @@ export interface ListResponse<T> {
 /** The empty list, for endpoints that legitimately return nothing yet. */
 export function emptyList<T>(): ListResponse<T> {
   return { data: [], total: 0 }
+}
+
+// ── Custom metadata ────────────────────────────────────────
+
+/** core/store/models.go — MetadataField.FieldType. */
+export type MetadataFieldType = 'TEXT' | 'SELECT' | 'MULTI_SELECT' | 'BOOLEAN'
+
+/**
+ * How a single choice is drawn. The same data either way — a list of eight
+ * options reads better as a dropdown and a list of two as radio buttons, and
+ * which one is a judgement the person defining the field makes.
+ */
+export type MetadataDisplay = 'DROPDOWN' | 'RADIO'
+
+export interface MetadataOption {
+  /** Immutable. Certificates store this, so relabelling never rewrites them. */
+  value: string
+  label: string
+}
+
+/** core/store/models.go — MetadataField. */
+export interface MetadataField {
+  id: string
+  /** The immutable machine name certificates key their values on. */
+  key: string
+  label: string
+  field_type: MetadataFieldType
+  options: MetadataOption[]
+  display: MetadataDisplay
+  help_text?: string
+  is_required: boolean
+  sort_order: number
+  /** Archived fields stop being offered and keep labelling stored values. */
+  is_archived: boolean
+  created_at: string
+  updated_at: string
+}
+
+/**
+ * Renders a stored value using its field definition.
+ *
+ * Never prints the raw stored value: `tier_1` is what the database holds and
+ * "Tier 1" is what it means, and a table showing the former makes the labels an
+ * admin carefully chose pointless.
+ */
+export function formatMetadataValue(field: MetadataField, value: unknown): string {
+  if (value === null || value === undefined || value === '') return '—'
+  switch (field.field_type) {
+    case 'BOOLEAN':
+      return value ? 'Yes' : 'No'
+    case 'SELECT':
+      return field.options.find((o) => o.value === value)?.label ?? String(value)
+    case 'MULTI_SELECT': {
+      const chosen = Array.isArray(value) ? value : [value]
+      if (!chosen.length) return '—'
+      return chosen
+        .map((v) => field.options.find((o) => o.value === v)?.label ?? String(v))
+        .join(', ')
+    }
+    default:
+      return String(value)
+  }
 }
