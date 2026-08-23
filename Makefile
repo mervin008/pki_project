@@ -74,7 +74,9 @@ migrate: build-core
 #
 # Each of these runs in its own terminal. Run `make dev-certs` first.
 
-## Start the local gateway, API, and frontend in one terminal.
+## Start PostgreSQL, the local gateway, the API, and the frontend in one
+## terminal, migrating the database first. Export CERTPILOT_DB_URL to use a
+## database of your own instead of the local certpilot_dev one.
 dev:
 	./scripts/dev.sh
 

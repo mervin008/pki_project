@@ -12,10 +12,39 @@ revocation endpoint.
 
 - Go 1.26+
 - Node.js 20+ (frontend only)
+- PostgreSQL 13+ (`brew install postgresql@17`)
 - [buf](https://buf.build) (only if you edit `.proto` files)
 
-No database and no cloud account are needed to try it. The core falls back to an
-in-memory store seeded with sample data.
+No cloud account is needed. If you skip PostgreSQL entirely the core still
+starts, on an in-memory store seeded with sample data that is discarded on exit
+— fine for a first look, useless for anything you want to still be there
+tomorrow.
+
+## The short version
+
+```bash
+make dev
+```
+
+That is the whole thing: it starts PostgreSQL if it is not already running,
+creates a `certpilot_dev` database, applies the prelude and all 26 migrations,
+generates a development key encryption key once and reuses it, starts the
+self-signed gateway, the API, and the frontend, and registers the gateway as a
+CA account so there is something to issue from.
+
+Open `http://localhost:3000`. Ctrl-C stops everything, and stops PostgreSQL too
+if it was not already running when you started.
+
+The database survives restarts, and so does the key encryption key — it is
+written to `.certpilot/dev-kek` and reused, because generating a fresh one would
+make every private key already stored permanently unreadable.
+
+To use a database of your own, export `CERTPILOT_DB_URL` before running; the
+bootstrap above is skipped entirely, including the prelude, which must never run
+against a real Supabase project.
+
+The rest of this page is the same thing done by hand, which is what you want
+when you are changing one piece of it.
 
 ## 1. Generate development keys
 
@@ -37,6 +66,7 @@ export CERTPILOT_KEK=$(make -s generate-kek | cut -d= -f2-)
 The key encryption key seals certificate private keys and CA credentials before
 they reach the database. Against a real database the core refuses to start
 without one; with the in-memory store it will generate an ephemeral key and warn.
+(`make dev` handles this for you and keeps the key in `.certpilot/dev-kek`.)
 
 > `.certpilot/` is gitignored. Never commit it: it contains CA and ACME account
 > private keys.

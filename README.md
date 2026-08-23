@@ -113,30 +113,23 @@ whole design follows from.
 | GCP CAS, AWS PCA, DigiCert, Sectigo gateways | ❌ | Not started |
 ## Quick start
 
-Requires Go 1.26+ and Node 20+. No database or cloud account needed — the core
-runs with an in-memory store seeded with sample data.
+Requires Go 1.26+, Node 20+, and PostgreSQL 13+. No cloud account needed.
 
 ```bash
 git clone https://github.com/your-org/certpilot.git
 cd certpilot
-make dev-certs
+make dev
 ```
 
-Then, in separate terminals:
+That starts PostgreSQL, creates and migrates a `certpilot_dev` database,
+generates a key encryption key once and keeps it, then runs the self-signed
+gateway, the API, and the frontend in one terminal — and registers the gateway
+as a CA account so there is something to issue from. Ctrl-C stops all of it.
 
-```bash
-make run-gateway-selfsigned
-```
-
-```bash
-cp config.example.yaml config.dev.yaml
-export CERTPILOT_KEK=$(make -s generate-kek | cut -d= -f2-)
-make run-core
-```
-
-```bash
-make run-frontend
-```
+Everything survives a restart, which is the point: the store under test is the
+same PostgreSQL code that runs in production. Export `CERTPILOT_DB_URL` first to
+point at a database of your own. Without PostgreSQL the core still starts, on an
+in-memory store that is discarded on exit.
 
 The API is on `:8080`, the frontend on `:3000`. Three pages are worth opening
 first: `/` for the dashboard, `/ca-health` for every CA sorted by urgency, and

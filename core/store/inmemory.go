@@ -137,17 +137,6 @@ func NewMemoryStore() *MemoryStore {
 		UpdatedAt:    now,
 	}
 
-	accACMEID := uuid.New().String()
-	accACME := &CAAccount{
-		ID:           accACMEID,
-		Name:         "letsencrypt-staging",
-		ProviderType: "acme",
-		GatewayAddr:  "localhost:9092",
-		Status:       "CONNECTED",
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-
 	cert1ID := uuid.New().String()
 	cert1 := &Certificate{
 		ID:                cert1ID,
@@ -231,7 +220,6 @@ func NewMemoryStore() *MemoryStore {
 		},
 		caAccounts: map[string]*CAAccount{
 			accSelfSignedID: accSelfSigned,
-			accACMEID:       accACME,
 		},
 		targets:  make(map[string]*DeploymentTarget),
 		policies: map[string]*Policy{polID: policy1},
