@@ -88,3 +88,12 @@ func dedupeNames(names []string) []string {
 	}
 	return out
 }
+
+// boolQuery reads an explicit opt-in from the query string.
+//
+// Only "true" counts. A parameter that is present but says something else is
+// not an opt-in, and treating "?forget=maybe" as consent for an irreversible
+// operation is the kind of leniency that gets used by accident.
+func boolQuery(c *gin.Context, name string) bool {
+	return c.Query(name) == "true"
+}

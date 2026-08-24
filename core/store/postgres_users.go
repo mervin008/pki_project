@@ -198,3 +198,34 @@ func (s *PostgresStore) TouchUser(ctx context.Context, id string, seenAt time.Ti
 	}
 	return nil
 }
+
+// MarkCertificateRevoked records a revocation the CA has already accepted.
+//
+// Guarded on the current status rather than written unconditionally, so that
+// two operators revoking the same certificate at once produce one revocation
+// and one clear "already revoked" rather than a silently overwritten reason and
+// timestamp — the pair an incident review actually reads.
+func (s *PostgresStore) MarkCertificateRevoked(ctx context.Context, id string, reason int, actorID string) (*Certificate, error) {
+	if !ValidRevocationReason(reason) {
+		return nil, fmt.Errorf("store: %d is not a revocation reason CertPilot accepts", reason)
+	}
+
+	row := s.pool.QueryRow(ctx, `
+		UPDATE public.certificates
+		   SET status = 'REVOKED', revoked_at = now(),
+		       revocation_reason = $2, revoked_by = NULLIF($3, ''), updated_at = now()
+		 WHERE id = $1 AND status <> 'REVOKED'
+		RETURNING `+certificateColumns, id, reason, actorID)
+
+	cert, err := scanCertificate(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Either no such certificate or it was already revoked. The caller
+		// distinguishes them by reading the row; both are refusals, not
+		// failures.
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: could not record the revocation of certificate %s: %w", id, err)
+	}
+	return cert, nil
+}

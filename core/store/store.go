@@ -73,6 +73,13 @@ type Store interface {
 	// suspending somebody has to do to mean anything.
 	RevokeSessionsForUser(ctx context.Context, userID string) (int, error)
 	TouchSession(ctx context.Context, id string, seenAt time.Time, ip string) error
+
+	// MarkCertificateRevoked records a revocation that the CA has already
+	// accepted. It is deliberately not called until the gateway has confirmed:
+	// a row marked REVOKED while the certificate is still live at the CA is the
+	// exact failure the old DELETE produced, and it is worse than no record at
+	// all because it stops anybody looking.
+	MarkCertificateRevoked(ctx context.Context, id string, reason int, actorID string) (*Certificate, error)
 	DeleteCertificate(ctx context.Context, id string) error
 	GetCertificatesDueForRenewal(ctx context.Context, leadDays int) ([]*Certificate, error)
 	// GetCertificatePrivateKey reads the sealed private key for one

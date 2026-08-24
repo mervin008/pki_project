@@ -262,6 +262,16 @@ type Certificate struct {
 	PostureRequirements   json.RawMessage `json:"posture_requirements,omitempty"`
 	QuantumReadinessScore *int            `json:"quantum_readiness_score,omitempty"`
 	QuantumAssessedAt     *time.Time      `json:"quantum_assessed_at,omitempty"`
+
+	// Revocation. RevokedAt and Status must agree — the schema enforces it,
+	// because a row carrying a revocation timestamp while still reading ISSUED
+	// is the disagreement that makes somebody trust the wrong one.
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	// RevocationReason is the RFC 5280 CRLReason, stored as the integer the
+	// standard defines because that is what reaches the CRL and the OCSP
+	// responder.
+	RevocationReason *int   `json:"revocation_reason,omitempty"`
+	RevokedBy        string `json:"revoked_by,omitempty"`
 	// VerifyAfter is when the next check may run, set on a successful renewal
 	// to now plus a grace period: a deployment done by hand does not happen in
 	// the same second as the issuance.
@@ -2087,3 +2097,25 @@ const (
 	MaxFailedLogins = 8
 	LockoutWindow   = 15 * time.Minute
 )
+
+// RevocationReasons are the RFC 5280 CRLReason codes CertPilot accepts.
+//
+// The set is ACME's, which is the narrowest of the three gateways and therefore
+// the one that works everywhere. certificateHold (6) is deliberately excluded:
+// it is reversible, nothing here can lift a hold, and offering it would let
+// somebody believe they had suspended a certificate this system can never
+// un-suspend.
+var RevocationReasons = map[int]string{
+	0: "unspecified",
+	1: "keyCompromise",
+	3: "affiliationChanged",
+	4: "superseded",
+	5: "cessationOfOperation",
+	9: "privilegeWithdrawn",
+}
+
+// ValidRevocationReason reports whether a reason code may be used.
+func ValidRevocationReason(reason int) bool {
+	_, ok := RevocationReasons[reason]
+	return ok
+}

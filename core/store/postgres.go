@@ -97,7 +97,8 @@ const certificateColumns = `id, fingerprint_sha256, common_name,
 		coalesce(signature_algorithm, ''), coalesce(public_key_algorithm, ''),
 		coalesce(posture_verdict, ''), coalesce(posture_summary, ''),
 		coalesce(posture_requirements, '[]'::jsonb),
-		quantum_readiness_score, quantum_assessed_at`
+		quantum_readiness_score, quantum_assessed_at,
+	revoked_at, revocation_reason, coalesce(revoked_by, '')`
 
 // scanCertificate reads one row of certificateColumns.
 func scanCertificate(row pgx.Row) (*Certificate, error) {
@@ -118,6 +119,7 @@ func scanCertificate(row pgx.Row) (*Certificate, error) {
 		&cert.SignatureAlgorithm, &cert.PublicKeyAlgorithm,
 		&cert.PostureVerdict, &cert.PostureSummary, &postureJSON,
 		&cert.QuantumReadinessScore, &cert.QuantumAssessedAt,
+		&cert.RevokedAt, &cert.RevocationReason, &cert.RevokedBy,
 	)
 	if err != nil {
 		return nil, err

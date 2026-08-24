@@ -132,6 +132,13 @@ never maintains it. A subject is opaque text, **not a uuid**: Okta, Google and
 Auth0 all issue non-uuid subjects, which is what migration 028 widened every
 actor column for. `GET /me` is the only honest source of a role for the UI.
 
+**Revocation tells the CA first and records only what the CA accepted.**
+`POST /certificates/:id/revoke` (admin). A row can never read `REVOKED` while
+the certificate still answers handshakes — the schema enforces that `status =
+'REVOKED'` and `revoked_at is not null` agree. `DELETE` now refuses a live
+certificate and points at revoke; `?forget=true` is the deliberate override for
+a certificate you want to stop tracking while it stays live.
+
 **`key_custody` on a certificate says who holds the private key** — `CERTPILOT`,
 `AGENT`, or `EXTERNAL`. Provenance (`discovered_via`) cannot answer that
 question: a CSR-signed certificate is `REQUESTED` like any other and CertPilot
@@ -275,9 +282,6 @@ Documented, not secretly broken. Do not "discover" these as findings.
   `SetUserRole` / `SetUserStatus` exist in the store, but nothing exposes them —
   changing a role means a SQL update. The Settings → Users screen is the next
   step.
-- **No certificate revocation endpoint.** Both gateways implement it; the core
-  exposes no route. `DELETE /certificates/:id` deletes the record and leaves the
-  certificate live at the CA. This is the largest hole in the product.
 - Audit log is not hash-chained.
 - No agent nonce store (replay window bounded by timestamp only).
 - OCSP checking is a bare GET, not a signed-response validation.

@@ -200,3 +200,27 @@ func (s *MemoryStore) CountPasswordAccounts(_ context.Context) (int, error) {
 	}
 	return n, nil
 }
+
+func (s *MemoryStore) MarkCertificateRevoked(_ context.Context, id string, reason int, actorID string) (*Certificate, error) {
+	if !ValidRevocationReason(reason) {
+		return nil, fmt.Errorf("store: %d is not a revocation reason CertPilot accepts", reason)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cert, ok := s.certificates[id]
+	if !ok || cert.Status == "REVOKED" {
+		return nil, nil
+	}
+
+	now := time.Now()
+	cert.Status = "REVOKED"
+	cert.RevokedAt = &now
+	cert.RevocationReason = &reason
+	cert.RevokedBy = actorID
+	cert.UpdatedAt = now
+
+	copied := *cert
+	return &copied, nil
+}

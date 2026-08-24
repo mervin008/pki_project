@@ -177,6 +177,11 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/certificates/:id/renew", middleware.RequireRole(middleware.RoleOperator), certHandler.Renew)
 		// Exporting a private key is admin-only and audited: it is the one
 		// operation that removes a secret from the system's custody.
+		// Revocation is admin, and it is the operation DELETE was being used
+		// for. It tells the CA first and records only what the CA accepted, so
+		// a certificate can never read REVOKED here while still answering
+		// handshakes in production.
+		v1.POST("/certificates/:id/revoke", middleware.RequireRole(middleware.RoleAdmin), certHandler.Revoke)
 		v1.GET("/certificates/:id/private-key", middleware.RequireRole(middleware.RoleAdmin), certHandler.PrivateKey)
 		v1.DELETE("/certificates/:id", middleware.RequireRole(middleware.RoleAdmin), certHandler.Delete)
 

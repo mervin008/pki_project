@@ -628,12 +628,43 @@ func (h *CertificateHandler) PrivateKey(c *gin.Context) {
 }
 
 // Delete handles DELETE /api/v1/certificates/:id.
+//
+// Deleting removes CertPilot's record and nothing else. It has never revoked
+// anything, and while it was the only way to get rid of a certificate it was
+// routinely used as though it did — which is how a compromised certificate
+// could stop appearing in the estate while continuing to authenticate, valid
+// until its own notAfter.
+//
+// It now refuses a certificate that is still live, and names the endpoint that
+// does the thing the caller almost certainly meant. Stopping being watched is
+// not the same as stopping being trusted, and only one of those is something a
+// person can ask for by accident.
 func (h *CertificateHandler) Delete(c *gin.Context) {
 	id := c.Param("id")
 
 	cert, err := h.store.GetCertificate(c.Request.Context(), id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	if cert == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no such certificate"})
+		return
+	}
+
+	// Expired certificates are safe to forget: they authenticate nothing.
+	// Revoked ones are safe to forget: the CA has been told. Anything else is
+	// still trusted by everything that trusts its issuer.
+	expired := cert.NotAfter != nil && cert.NotAfter.Before(time.Now())
+	if cert.Status != "REVOKED" && !expired && !boolQuery(c, "forget") {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "this certificate is still valid, and deleting the record would not revoke it — " +
+				"it would keep working while disappearing from the estate. Revoke it with " +
+				"POST /certificates/" + id + "/revoke, or pass ?forget=true if you genuinely " +
+				"want CertPilot to stop tracking a certificate that remains live",
+			"status":    cert.Status,
+			"not_after": cert.NotAfter,
+		})
 		return
 	}
 
@@ -650,7 +681,11 @@ func (h *CertificateHandler) Delete(c *gin.Context) {
 		EntityID:   &cert.ID,
 		ActorID:    &actorID,
 		ActorEmail: &actorEmail,
-		Details:    fmt.Sprintf(`{"cn": %q, "serial": %q}`, cert.CommonName, cert.SerialNumber),
+		// The status at deletion is recorded because it is the question an
+		// incident review asks: was this forgotten because it was dealt with,
+		// or forgotten while still live.
+		Details: fmt.Sprintf(`{"cn": %q, "serial": %q, "status_at_deletion": %q, "forced": %t}`,
+			cert.CommonName, cert.SerialNumber, cert.Status, boolQuery(c, "forget")),
 	})
 
 	c.JSON(http.StatusOK, gin.H{"message": "certificate deleted"})
