@@ -276,6 +276,10 @@ adding a required field makes the whole estate unsaveable.
 
 Documented, not secretly broken. Do not "discover" these as findings.
 
+**Blocked on this machine, not on the code:** the Key Vault and F5 deployers
+need a real Azure tenant and a real F5 to test against, and the Docker assets
+need a container runtime.
+
 - **The OIDC refresh token is in `localStorage`** — for federated sign-in only.
   Local password sessions use an httpOnly cookie and are unaffected.
 - **No user-management UI yet.** Roles are stored and enforced, and
@@ -287,12 +291,9 @@ Documented, not secretly broken. Do not "discover" these as findings.
 - OCSP checking is a bare GET, not a signed-response validation.
 - Key Vault and F5 deployers are unit-tested only.
 - The KEK lives in an environment variable.
-- No API rate limiting.
 - Deployment ordering is not expressible.
 - Discovery, CT and cloud-sync tables are thinly covered by the conformance suite.
 - Docker assets were fixed but never built — no container runtime on this machine.
-- The light theme ships but has never been verified in a rendered screenshot;
-  this machine is in system dark mode and headless Chrome inherits it.
 
 ---
 

@@ -48,6 +48,7 @@ type RouterDeps struct {
 	Broker       *events.Broker
 	Dispatcher   *notifications.Dispatcher
 	Auth         *middleware.Authenticator
+	RateLimiter  *middleware.RateLimiter
 	Config       *config.CoreConfig
 }
 
@@ -55,6 +56,16 @@ type RouterDeps struct {
 func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	engine.Use(gin.Recovery())
 	engine.Use(middleware.SecurityHeaders())
+
+	// Ahead of authentication, so an unauthenticated flood costs a map lookup
+	// rather than a JWKS fetch or an Argon2id derivation. The key falls back to
+	// the client address until an identity is established, and prefers the
+	// identity once one is — a credential should not escape its limit by
+	// arriving from more addresses.
+	if limiter := deps.RateLimiter; limiter != nil {
+		engine.Use(limiter.Middleware())
+	}
+
 	engine.Use(middleware.CORS(deps.Config.Server.AllowedOrigins))
 
 	// ── Health ──

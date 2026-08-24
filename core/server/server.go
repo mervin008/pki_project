@@ -49,6 +49,7 @@ type Server struct {
 	deployQueue  *deploy.Queue
 	assessor     *posture.Assessor
 	fleetMonitor *fleet.Monitor
+	rateLimiter  *middleware.RateLimiter
 	cfg          *config.CoreConfig
 }
 
@@ -189,6 +190,21 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 	// of the provider rather than of the team that owns the CA hierarchy.
 	authenticator = authenticator.WithUserDirectory(st)
 
+	// A negative rate is an explicit opt-out, for a deployment with something
+	// in front of it already shaping traffic. Zero means the defaults, so an
+	// operator who has never thought about it still gets a limit.
+	var limiter *middleware.RateLimiter
+	if cfg.Auth.RateLimitPerSecond >= 0 {
+		rlCfg := middleware.DefaultAPIRateLimit
+		if cfg.Auth.RateLimitPerSecond > 0 {
+			rlCfg.Rate = cfg.Auth.RateLimitPerSecond
+		}
+		if cfg.Auth.RateLimitBurst > 0 {
+			rlCfg.Burst = cfg.Auth.RateLimitBurst
+		}
+		limiter = middleware.NewRateLimiter(rlCfg)
+	}
+
 	// Before the router is built, so that an instance nobody can sign in to is
 	// reported at start-up rather than discovered at the login screen.
 	if err := bootstrapFirstAdmin(ctx, st, cfg.Auth); err != nil {
@@ -222,6 +238,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		Broker:        broker,
 		Dispatcher:    dispatcher,
 		Auth:          authenticator,
+		RateLimiter:   limiter,
 		Config:        cfg,
 	})
 
@@ -254,6 +271,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		deployQueue:  deployQueue,
 		assessor:     assessor,
 		fleetMonitor: fleetMonitor,
+		rateLimiter:  limiter,
 		cfg:          cfg,
 	}, nil
 }
@@ -354,6 +372,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.deployQueue.Stop()
 	s.assessor.Stop()
 	s.fleetMonitor.Stop()
+	if s.rateLimiter != nil {
+		s.rateLimiter.Stop()
+	}
 	// A range scan can run for minutes. Left alone it would hold the grace
 	// period open and then be killed mid-write anyway; cancelled, it records
 	// what it found and stops.

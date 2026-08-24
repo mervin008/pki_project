@@ -84,6 +84,13 @@ type AuthConfig struct {
 	// email are what populate a user's name and address here.
 	Scopes []string `yaml:"scopes"`
 
+	// RateLimitPerSecond and RateLimitBurst bound how fast one caller may make
+	// requests. Zero means the built-in defaults; negative disables the limit,
+	// which is a thing to do deliberately when something in front of the
+	// application already shapes traffic.
+	RateLimitPerSecond float64 `yaml:"rate_limit_per_second"`
+	RateLimitBurst     float64 `yaml:"rate_limit_burst"`
+
 	// BootstrapAdmins are email addresses promoted to admin the first time
 	// they sign in.
 	//
