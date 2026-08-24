@@ -92,6 +92,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	deployHandler := NewDeploymentHandler(deps.Store, deps.Keyring)
 	postureHandler := NewPostureHandler(deps.Store, posture.ToolVersion)
 	sessionHandler := NewSessionHandler(deps.Store, deps.Config.Auth)
+	userHandler := NewUserHandler(deps.Store)
 
 	// ── Sign-in discovery ──
 	// Public, and necessarily so: this is what a browser reads before it holds
@@ -362,6 +363,18 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.GET("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.ListEnrolTokens)
 		v1.POST("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.CreateEnrolToken)
 		v1.DELETE("/agent-enrol-tokens/:id", middleware.RequireRole(middleware.RoleAdmin), agentHandler.RevokeEnrolToken)
+
+		// ── Accounts ──
+		//
+		// Admin throughout, including the list. A list of accounts is a map of
+		// who can do what to the CA hierarchy, and it is exactly what somebody
+		// who has taken over one account wants next.
+		v1.GET("/users", middleware.RequireRole(middleware.RoleAdmin), userHandler.List)
+		v1.POST("/users", middleware.RequireRole(middleware.RoleAdmin), userHandler.Create)
+		v1.PATCH("/users/:id", middleware.RequireRole(middleware.RoleAdmin), userHandler.Update)
+		// Resetting somebody else's password does not require the old one —
+		// that is the point, it is the path back from a locked-out colleague.
+		v1.POST("/users/:id/password", middleware.RequireRole(middleware.RoleAdmin), userHandler.ResetPassword)
 
 		// ── Display Tokens ──
 		// Admin-only throughout: minting a credential that authenticates to

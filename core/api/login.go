@@ -98,6 +98,12 @@ func (h *SessionHandler) Login(c *gin.Context) {
 		AuthMethod:  middleware.AuthMethodSession,
 		UserID:      user.ID,
 		RoleSource:  user.RoleSource,
+		// Carried on the sign-in response as well as on /me. The frontend sets
+		// its identity from whichever it saw last, and omitting it here meant a
+		// newly created account was never asked to change the password somebody
+		// else had chosen for it — while the first-run banner promised it would
+		// be.
+		MustChangePassword: user.MustChangePassword,
 	})
 }
 

@@ -13,13 +13,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// LocalIssuer marks an account that exists only in CertPilot.
-//
-// Stored in the same column an identity provider's issuer goes in, so that a
-// local account and a federated one cannot collide even if a provider ever
-// issued the same subject.
-const LocalIssuer = "certpilot-local"
-
 // bootstrapFirstAdmin creates the first account when there are none.
 //
 // Somebody has to be able to grant the first role, and every alternative is
@@ -71,7 +64,7 @@ func bootstrapFirstAdmin(ctx context.Context, st store.Store, cfg config.AuthCon
 
 	if user == nil {
 		user, err = st.ResolveUser(ctx, store.UserIdentity{
-			Issuer: LocalIssuer,
+			Issuer: store.LocalIssuer,
 			// A local account still needs a subject: it is what every actor
 			// column records, and it must not change if the address does.
 			Subject:     uuid.NewString(),

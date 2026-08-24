@@ -132,6 +132,12 @@ never maintains it. A subject is opaque text, **not a uuid**: Okta, Google and
 Auth0 all issue non-uuid subjects, which is what migration 028 widened every
 actor column for. `GET /me` is the only honest source of a role for the UI.
 
+**Accounts are managed in Settings → Accounts** (admin only, including the
+list). The last active admin cannot be demoted or suspended — the only way back
+from that is SQL, which is what the screen exists to remove. Suspending revokes
+every session immediately. A generated password sets `must_change_password`,
+which raises a modal that cannot be dismissed.
+
 **Revocation tells the CA first and records only what the CA accepted.**
 `POST /certificates/:id/revoke` (admin). A row can never read `REVOKED` while
 the certificate still answers handshakes — the schema enforces that `status =
@@ -282,10 +288,6 @@ need a container runtime.
 
 - **The OIDC refresh token is in `localStorage`** — for federated sign-in only.
   Local password sessions use an httpOnly cookie and are unaffected.
-- **No user-management UI yet.** Roles are stored and enforced, and
-  `SetUserRole` / `SetUserStatus` exist in the store, but nothing exposes them —
-  changing a role means a SQL update. The Settings → Users screen is the next
-  step.
 - Audit log is not hash-chained.
 - No agent nonce store (replay window bounded by timestamp only).
 - OCSP checking is a bare GET, not a signed-response validation.

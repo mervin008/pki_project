@@ -1,7 +1,9 @@
 package api
 
 import (
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -96,4 +98,17 @@ func dedupeNames(names []string) []string {
 // operation is the kind of leniency that gets used by accident.
 func boolQuery(c *gin.Context, name string) bool {
 	return c.Query(name) == "true"
+}
+
+// randomIndex returns a uniform index below n, from the cryptographic source.
+//
+// crypto/rand rather than math/rand: this picks characters for passwords that
+// are handed to people, and a predictable sequence there is a credential an
+// attacker can regenerate.
+func randomIndex(n int) (int, error) {
+	value, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		return 0, err
+	}
+	return int(value.Int64()), nil
 }

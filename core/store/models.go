@@ -1990,6 +1990,13 @@ type User struct {
 	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
+// LocalIssuer marks an account that exists only in CertPilot.
+//
+// Stored in the column an identity provider's issuer goes in, so that a local
+// account and a federated one cannot collide even if a provider ever issued
+// the same subject.
+const LocalIssuer = "certpilot-local"
+
 // RBAC roles, in ascending order of privilege.
 //
 // Declared here as well as in core/server/middleware because middleware
