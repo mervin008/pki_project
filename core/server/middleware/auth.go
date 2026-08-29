@@ -4,6 +4,7 @@ package middleware
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"strings"
@@ -81,6 +82,10 @@ type UserClaims struct {
 	Name              string         `json:"name"`
 	PreferredUsername string         `json:"preferred_username"`
 	AppMetadata       map[string]any `json:"app_metadata"`
+	// Nonce binds an ID token to the one authorization request that asked for
+	// it. Present only on ID tokens, and checked only there: without it, a
+	// token captured from one sign-in can be replayed into another.
+	Nonce string `json:"nonce"`
 	jwt.RegisteredClaims
 }
 
@@ -309,6 +314,73 @@ func (a *Authenticator) Verify(ctx context.Context, tokenString string) (*UserCl
 	}
 
 	return claims, nil
+}
+
+// VerifyIDToken validates an ID token returned by an authorization code
+// exchange.
+//
+// Separate from Verify because an ID token is a different document with
+// different rules, and conflating them is how audience checks get skipped. Its
+// audience is the *client id* — not the API audience an access token carries —
+// so verifying one with the other's expectations either rejects every valid
+// token or, worse, accepts a token minted for a different application.
+//
+// The nonce is required and compared here. It is the only thing tying the token
+// to the browser that started this particular sign-in; a provider will happily
+// re-issue an ID token that is valid in every other respect.
+func (a *Authenticator) VerifyIDToken(ctx context.Context, tokenString, clientID, nonce string) (*UserClaims, error) {
+	if clientID == "" {
+		return nil, fmt.Errorf("auth: no client id is configured, so an ID token cannot be verified")
+	}
+	if nonce == "" {
+		return nil, fmt.Errorf("auth: this sign-in carried no nonce, so its ID token cannot be tied to it")
+	}
+
+	claims := &UserClaims{}
+	opts := []jwt.ParserOption{
+		jwt.WithExpirationRequired(),
+		jwt.WithLeeway(30 * time.Second),
+		jwt.WithAudience(clientID),
+		// Pinned for the same reason as in Verify: an unpinned parser accepts
+		// "none", and accepts HS256 signed with the public half of an RS256
+		// keypair.
+		jwt.WithValidMethods([]string{"RS256", "RS512", "ES256", "ES384", "ES512", "EdDSA"}),
+	}
+	if a.cfg.Issuer != "" {
+		opts = append(opts, jwt.WithIssuer(a.cfg.Issuer))
+	}
+
+	token, err := jwt.ParseWithClaims(tokenString, claims, a.keyFunc(ctx), opts...)
+	if err != nil {
+		return nil, err
+	}
+	if !token.Valid {
+		return nil, fmt.Errorf("auth: ID token is not valid")
+	}
+	if subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(nonce)) != 1 {
+		return nil, fmt.Errorf("auth: the ID token's nonce does not match the sign-in that requested it")
+	}
+	if claims.Subject == "" {
+		return nil, fmt.Errorf("auth: the ID token carries no subject, so there is nobody to sign in")
+	}
+	return claims, nil
+}
+
+// ResolveIdentity turns verified claims into a CertPilot user.
+//
+// Shared with the middleware so that a federated sign-in and a federated
+// request establish identity by exactly the same rules — including taking the
+// issuer from the token rather than from configuration.
+func (a *Authenticator) ResolveIdentity(ctx context.Context, claims *UserClaims) (*store.User, error) {
+	if a.users == nil {
+		return nil, fmt.Errorf("auth: no user directory is configured")
+	}
+	return a.users.ResolveUser(ctx, store.UserIdentity{
+		Issuer:      identityIssuer(claims, a.cfg.Issuer),
+		Subject:     claims.Subject,
+		Email:       claims.Email,
+		DisplayName: claims.DisplayName(),
+	}, a.cfg.BootstrapAdmins)
 }
 
 func (a *Authenticator) keyFunc(ctx context.Context) jwt.Keyfunc {

@@ -1,5 +1,4 @@
 import { computed, readonly, ref, type ComputedRef, type Ref } from 'vue'
-import { currentAccessToken } from '@/lib/oidc'
 import { createSseParser } from '@/lib/sse'
 import { displayTokenHeaders } from '@/lib/displayToken'
 import type { StreamEvent, StreamSnapshot } from '@/lib/types'
@@ -16,9 +15,10 @@ import type { StreamEvent, StreamSnapshot } from '@/lib/types'
  *
  * ## Why fetch, and not EventSource
  *
- * `EventSource` cannot set request headers, so it cannot carry the operator's
- * bearer token; it would authenticate only through a session cookie or
- * with a kiosk token in the query string. Its reconnect is also fixed-interval
+ * `EventSource` cannot set request headers. A person's session travels in a
+ * cookie and would be fine, but a wall display authenticates with a kiosk token
+ * and would be left putting it in the query string, where it lands in every
+ * access log between here and the core. Its reconnect is also fixed-interval
  * and uncontrollable beyond the server's `retry:` directive, so the
  * exponential backoff this needs would mean fighting the built-in behaviour
  * with close()/new anyway.
@@ -177,23 +177,16 @@ function createEventStream(): EventStream {
   /**
    * Headers for the stream request.
    *
-   * Two ways to authenticate: an operator's bearer token, or the kiosk display
-   * token a wall screen is launched with. `displayTokenHeaders` mirrors the
-   * server's precedence — a real session always wins, so a display token left in
-   * a bookmark cannot mask an operator's identity.
+   * Two ways to authenticate: a person's session cookie, which travels on its
+   * own and is invisible here, or the kiosk display token a wall screen is
+   * launched with. The core applies the same precedence — an explicit
+   * credential beats an ambient one — so a display token left in a bookmark
+   * cannot mask an operator's identity.
    */
   async function authHeaders(): Promise<Record<string, string>> {
     const headers: Record<string, string> = { Accept: 'text/event-stream' }
 
-    // Refreshed before the stream opens rather than after it fails. A long-
-    // lived connection outlives a short access token, and reconnecting is the
-    // moment to present a current one.
-    const token = await currentAccessToken()
-    if (token) {
-      headers.Authorization = `Bearer ${token}`
-    }
-
-    Object.assign(headers, displayTokenHeaders(headers.Authorization !== undefined))
+    Object.assign(headers, displayTokenHeaders(false))
 
     // Resume from where we left off. The core replays from its history when it
     // can, and sends a fresh snapshot when the gap is too wide — it never
@@ -206,6 +199,10 @@ function createEventStream(): EventStream {
   async function readStream(signal: AbortSignal): Promise<void> {
     const response = await fetch(STREAM_URL, {
       headers: await authHeaders(),
+      // The session cookie is the credential for a person. Explicit, because
+      // the stream is the one long-lived request in the application and its
+      // authentication should not rest on a fetch default.
+      credentials: 'same-origin',
       signal,
       cache: 'no-store',
     })

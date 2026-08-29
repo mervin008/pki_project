@@ -1,4 +1,3 @@
-import { currentAccessToken } from '@/lib/oidc'
 import { displayTokenHeaders } from '@/lib/displayToken'
 import { onUnauthorized } from '@/lib/session'
 
@@ -9,22 +8,20 @@ export function useApi() {
       ...(options.headers as Record<string, string>),
     }
 
-    // Attach the access token when there is a session, refreshing it first if
-    // it is close to expiring. With no sign-in configured, requests go out
-    // unauthenticated — which the core accepts only in development mode on a
-    // loopback address, and rejects otherwise.
-    const token = await currentAccessToken()
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`
-    }
-
     // A wall display has no session. It authenticates with a kiosk token, which
     // must reach every REST call and not only the event stream — a screen whose
     // feed connects while each panel returns 401 is the worst of both.
-    Object.assign(headers, displayTokenHeaders(headers['Authorization'] !== undefined))
+    Object.assign(headers, displayTokenHeaders(false))
 
     const response = await fetch(endpoint, {
       ...options,
+      // The credential is the session cookie, which is httpOnly and therefore
+      // invisible to this code. Stated explicitly rather than left to the
+      // same-origin default: this line is the whole authentication story for a
+      // person using the console, and it should be visible as such. A federated
+      // sign-in gets the same cookie — the browser stopped handling bearer
+      // tokens when the core took over redeeming the authorization code.
+      credentials: 'same-origin',
       headers,
     })
 

@@ -11,22 +11,24 @@
  * never leaves this origin, and is what proves the code being redeemed belongs
  * to the browser that asked for it.
  *
- * ── Where tokens live, and what that costs ──────────────────────────────────
+ * ── This module holds no tokens ─────────────────────────────────────────────
  *
- * The access token is held in memory only. It dies with the tab, and no script
- * can read it out of storage after the fact.
+ * It used to. The browser redeemed the authorization code itself, kept the
+ * access token in memory, and kept the refresh token in localStorage — because
+ * surviving a page reload requires *something* persistent and every storage a
+ * page can reach is readable by script on this origin. That was a documented
+ * trade-off rather than an oversight, and it is now gone.
  *
- * The refresh token is in localStorage, and that is a real trade-off rather
- * than an oversight. Surviving a page reload without sending the operator back
- * to their identity provider requires *something* persistent, and every option
- * available to a page with no backend of its own is readable by script running
- * on this origin. The honest mitigation is that a cross-site scripting flaw
- * here is already fatal — it could simply call the API — so the refresh token
- * raises the duration of a compromise rather than its severity.
+ * The code is posted to `POST /api/v1/auth/callback` and the core redeems it.
+ * What comes back is the same httpOnly session cookie a local password sign-in
+ * gets. So this file builds an authorization URL, checks `state`, and hands the
+ * result to the core; it never sees an access token, a refresh token, or an ID
+ * token. There is nothing here for a cross-site scripting flaw to steal that it
+ * could not already do by calling the API directly.
  *
- * The durable fix is a backend-for-frontend holding the refresh token in an
- * httpOnly cookie. That is a deployment change, not a code change here, and it
- * is recorded as a known gap rather than pretended away.
+ * The nonce is generated here and sent to the core alongside the code, because
+ * the core is the half that must check it. A browser verifying its own nonce
+ * proves nothing.
  */
 
 export interface AuthConfig {
@@ -46,21 +48,27 @@ interface ProviderMetadata {
   end_session_endpoint?: string
 }
 
-interface TokenResponse {
-  access_token: string
-  refresh_token?: string
-  expires_in?: number
-  token_type?: string
-}
-
-const REFRESH_KEY = 'certpilot.refresh_token'
 const PENDING_KEY = 'certpilot.auth_pending'
 const RETURN_KEY = 'certpilot.return_to'
 
-/** Held in memory deliberately — see the note at the top of this file. */
-let accessToken: string | null = null
-let accessTokenExpiry = 0
-let inFlightRefresh: Promise<string | null> | null = null
+/**
+ * The key an older build kept a refresh token under.
+ *
+ * Removed on load rather than merely stopped being written. An upgrade
+ * otherwise leaves a live refresh token sitting in localStorage indefinitely,
+ * belonging to a flow nothing uses any more — the exact object this change
+ * exists to get rid of, preserved by the change that removed it.
+ */
+const LEGACY_REFRESH_KEY = 'certpilot.refresh_token'
+
+/** Marks that a sign-in has completed in this browser. Carries no credential. */
+const SIGNED_IN_KEY = 'certpilot.signed_in'
+try {
+  localStorage.removeItem(LEGACY_REFRESH_KEY)
+} catch {
+  // Storage can be unavailable — a private window, or a browser configured to
+  // block it. Nothing here depends on the removal succeeding.
+}
 
 // ── Small crypto helpers ────────────────────────────────────────────────────
 
@@ -186,7 +194,7 @@ export async function completeSignIn(search: string): Promise<string> {
     throw new Error('This sign-in did not start here. Begin again from the login page.')
   }
 
-  const pending = JSON.parse(pendingRaw) as { verifier: string; state: string }
+  const pending = JSON.parse(pendingRaw) as { verifier: string; state: string; nonce: string }
 
   // The check that makes the redirect safe. Without it, an attacker can hand
   // somebody a callback URL carrying their own authorization code and have the
@@ -198,109 +206,86 @@ export async function completeSignIn(search: string): Promise<string> {
     )
   }
 
-  const config = await loadAuthConfig()
-  const metadata = await providerMetadata(config.issuer!)
-
-  const response = await fetch(metadata.token_endpoint, {
+  // The core redeems the code, not this page. What comes back is an httpOnly
+  // session cookie — the same one a local password sign-in gets — so nothing
+  // token-shaped ever reaches this origin's storage or this module's memory.
+  //
+  // The nonce goes with it. It was generated here, and the core is the half
+  // that checks the ID token carries the same one; a browser verifying its own
+  // nonce proves nothing.
+  const response = await fetch('/api/v1/auth/callback', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'authorization_code',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({
       code,
-      redirect_uri: redirectUri(),
-      client_id: config.client_id!,
       code_verifier: pending.verifier,
+      redirect_uri: redirectUri(),
+      nonce: pending.nonce,
     }),
   })
 
   if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as { error?: string }
     throw new Error(
-      `The identity provider refused to exchange the sign-in code (HTTP ${response.status}). ` +
-        'The most common cause is a redirect URI that is not registered for this client.',
+      body.error ??
+        `This sign-in could not be completed (HTTP ${response.status}). ` +
+          'The most common cause is a redirect URI that is not registered for this client.',
     )
   }
 
-  storeTokens((await response.json()) as TokenResponse)
+  rememberSignIn()
 
   const returnTo = sessionStorage.getItem(RETURN_KEY) ?? '/'
   sessionStorage.removeItem(RETURN_KEY)
   return returnTo
 }
 
-function storeTokens(tokens: TokenResponse): void {
-  accessToken = tokens.access_token
-  // Refreshed a minute early, so a request is never sent with a token that
-  // expires while it is in flight.
-  accessTokenExpiry = Date.now() + ((tokens.expires_in ?? 300) - 60) * 1000
-  if (tokens.refresh_token) {
-    localStorage.setItem(REFRESH_KEY, tokens.refresh_token)
-  }
-}
-
 // ── Keeping the session alive ───────────────────────────────────────────────
 
 /**
- * Returns a usable access token, refreshing if necessary, or null.
+ * Whether a previous session might still be usable without interaction.
  *
- * Concurrent callers share one refresh. A dashboard opens several requests and
- * an event stream at once, and letting each redeem the same refresh token
- * would — with the rotation every serious provider now does — invalidate the
- * others and sign the user out at the moment the page loads.
+ * The session cookie is httpOnly, so this page cannot see it. The honest answer
+ * is therefore "ask the API", which the auth store does on start-up — and the
+ * only thing this can report is whether this browser has ever completed a
+ * sign-in here.
+ *
+ * It exists to keep one message truthful. "Your session ended" shown to a
+ * first-time visitor who has simply arrived at the URL is wrong and alarming;
+ * the same message after a session really has expired is exactly right.
  */
-export async function currentAccessToken(): Promise<string | null> {
-  if (accessToken && Date.now() < accessTokenExpiry) return accessToken
-  if (inFlightRefresh) return inFlightRefresh
-
-  inFlightRefresh = refresh().finally(() => {
-    inFlightRefresh = null
-  })
-  return inFlightRefresh
-}
-
-async function refresh(): Promise<string | null> {
-  const stored = localStorage.getItem(REFRESH_KEY)
-  if (!stored) return null
-
+export function hasResumableSession(): boolean {
   try {
-    const config = await loadAuthConfig()
-    if (config.mode !== 'oidc') return null
-    const metadata = await providerMetadata(config.issuer!)
-
-    const response = await fetch(metadata.token_endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: stored,
-        client_id: config.client_id!,
-      }),
-    })
-
-    if (!response.ok) {
-      // The refresh token is spent, revoked, or expired. Clearing it is what
-      // turns this into a clean prompt to sign in again rather than a loop.
-      clearTokens()
-      return null
-    }
-
-    storeTokens((await response.json()) as TokenResponse)
-    return accessToken
+    return localStorage.getItem(SIGNED_IN_KEY) === '1'
   } catch {
-    // A network failure is not proof the session ended, so the refresh token
-    // is kept and the next attempt can succeed.
-    return null
+    return false
   }
 }
 
-export function clearTokens(): void {
-  accessToken = null
-  accessTokenExpiry = 0
-  localStorage.removeItem(REFRESH_KEY)
+/** Records that a sign-in has completed here, for hasResumableSession. */
+export function rememberSignIn(): void {
+  try {
+    localStorage.setItem(SIGNED_IN_KEY, '1')
+  } catch {
+    // Not worth failing a sign-in over.
+  }
 }
 
-/** True when a previous session may still be resumable without interaction. */
-export function hasResumableSession(): boolean {
-  return Boolean(accessToken || localStorage.getItem(REFRESH_KEY))
+/**
+ * Forgets local sign-in state.
+ *
+ * There are no tokens left to clear — the session lives in an httpOnly cookie
+ * the core sets and clears. This drops only the marker above, so that the next
+ * visit is treated as a first one rather than as an expired session.
+ */
+export function clearTokens(): void {
+  try {
+    localStorage.removeItem(SIGNED_IN_KEY)
+    localStorage.removeItem(LEGACY_REFRESH_KEY)
+  } catch {
+    // As above.
+  }
 }
 
 /**

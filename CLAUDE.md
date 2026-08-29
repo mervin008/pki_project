@@ -62,7 +62,7 @@ import), `renewal`, `discovery`, `ctlog`, `cloudsync`, `deploy`, `fleet`,
 `notifications`, `policy`, `posture`. They are started by `core/server` and
 publish to an in-process broker (`core/events`) that feeds the SSE endpoint.
 
-`core/api/` is 26 handler files behind 120 routes in `router.go`.
+`core/api/` is 26 handler files behind 121 routes in `router.go`.
 
 ---
 
@@ -117,6 +117,16 @@ creates the account in `auth.bootstrap_admins`, generates a password and prints
 it once; `make dev` also writes it to `.certpilot/dev-admin`. The bootstrap
 re-runs whenever **no active account has a password**, which is both the upgrade
 path and the recovery path.
+
+**The core redeems the OIDC authorization code, not the browser.** `POST
+/auth/callback` takes the code, the PKCE verifier and the nonce; the core
+exchanges them, verifies the ID token against the client id and that nonce, and
+returns the same session cookie a password sign-in gets. The browser therefore
+holds no access token, no refresh token and no ID token — `lib/oidc.ts` builds
+an authorization URL and checks `state`, and that is all it does. The provider's
+refresh token is discarded rather than stored: CertPilot's session is the
+durable credential, so a federated session outlives revocation at the provider
+until it expires, and suspending the account is what ends it immediately.
 
 **Browser sessions are rows, not tokens.** An opaque value in an `HttpOnly`,
 `SameSite=Strict` cookie, stored as a SHA-256 hash — so the core holds no key
@@ -296,8 +306,6 @@ Documented, not secretly broken. Do not "discover" these as findings.
 need a real Azure tenant and a real F5 to test against, and the Docker assets
 need a container runtime.
 
-- **The OIDC refresh token is in `localStorage`** — for federated sign-in only.
-  Local password sessions use an httpOnly cookie and are unaffected.
 - The audit chain has no external anchor — an attacker holding both the
   database and the KEK can rewrite it wholesale, or truncate the newest entries.
 - No agent nonce store (replay window bounded by timestamp only).

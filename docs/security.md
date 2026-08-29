@@ -144,11 +144,64 @@ imported, discovered, and agent-held certificates.
 
 ## Authentication
 
-Four methods, each with its own middleware.
+Four credentials, each with its own middleware: a session cookie, a bearer JWT,
+a display token, an agent signature. Federated sign-in is listed here too, but
+it is not a fifth credential — it is one of the two ways to obtain the first.
+
+There is no anonymous mode, locally or otherwise: `auth.allow_anonymous` is
+refused by configuration validation rather than ignored, so an operator who has
+it set finds out at start-up instead of on the day somebody is refused.
+
+### Session cookies
+
+How a person is authenticated, whether they signed in with a local password or
+through an identity provider.
+
+An opaque random value in an `HttpOnly`, `SameSite=Strict` cookie, stored as a
+SHA-256 hash — so the core holds nothing that can forge one, and a database dump
+does not yield a usable session. Twelve hours. Account status is re-checked on
+**every** request, not only at sign-in, so suspending somebody takes effect
+while they are looking at the screen.
+
+Local sign-in is throttled in the database rather than in memory (8 failures, 15
+minutes), because the core runs as several replicas and an in-process counter
+resets with every request that lands on a different one.
+
+### Federated sign-in
+
+OpenID Connect, authorization code with PKCE. There is no client secret; a
+single-page application cannot keep one.
+
+**The core redeems the code, not the browser.** `POST /api/v1/auth/callback`
+takes the code, the PKCE verifier and the nonce the browser generated. The core
+exchanges the code at the provider's token endpoint, verifies the returned ID
+token — signature against the JWKS, issuer, audience against the *client id*,
+and the nonce against the one supplied — resolves the identity against
+CertPilot's users table, and returns the same session cookie a password sign-in
+gets.
+
+This is a backend-for-frontend, and it exists to answer one question: where does
+the credential that survives a page reload live? A page that redeems the code
+itself receives a refresh token and has nowhere safe to put it — every storage a
+browser page can reach is readable by script on that origin. CertPilot used to
+keep it in `localStorage` and document the trade-off. Now the browser handles no
+token at all.
+
+The provider's refresh token is **discarded**, not stored. CertPilot's own
+session is the durable credential, and keeping a second one would mean holding a
+provider secret at rest to duplicate what the sessions table already does.
+
+What that costs, stated plainly: a federated session outlives revocation at the
+identity provider until it expires. CertPilot's answer to "this person should no
+longer have access" is suspending the account, which is checked on every request
+and ends every session immediately. The provider says who you are; CertPilot
+says what you may do.
 
 ### Bearer JWT
 
-The primary path. Two verification modes:
+For automation — agents' own API calls, CI, scripts. The browser stopped using
+this path when the core took over redeeming the authorization code. Two
+verification modes:
 
 **JWKS (preferred).** The core fetches the identity provider's published public
 keys and verifies asymmetric signatures. It holds nothing capable of minting a
@@ -160,6 +213,14 @@ core to hold a key that can *forge* an admin token. Kept only for Supabase
 projects that have not migrated to asymmetric signing keys.
 
 `issuer` and `audience` are validated when configured.
+
+An **ID token** is verified by different rules and by a separate function. Its
+audience is the client id rather than the API audience, and its nonce is
+required — conflating the two documents is how an audience check gets skipped.
+Accepted algorithms are pinned in both. That pinning is load-bearing on any
+instance that has both a JWKS and a legacy `jwt_secret`: without it, an ID token
+signed HS256 with that shared secret verifies, and a symmetric key becomes a way
+to assert any federated identity at all.
 
 ### Display tokens
 
@@ -198,13 +259,6 @@ Tolerance is five minutes.
 There is deliberately **no nonce store**. Replay within the tolerance window is
 possible and the requests are idempotent reports; a nonce table would add a
 write per heartbeat across a fleet to prevent a replay that changes nothing.
-
-### Anonymous
-
-Every request treated as admin. Refused unless `mode` is `development` **and**
-the bind address is loopback. It applies only when no `Authorization` header is
-present at all — an invalid token is always a rejection, never a fallback to
-admin.
 
 ---
 

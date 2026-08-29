@@ -15,10 +15,14 @@ import (
 type SessionHandler struct {
 	store store.Store
 	auth  config.AuthConfig
+	// authenticator verifies ID tokens for the federated sign-in callback. It
+	// is the same one the request path uses, so a sign-in and a request agree
+	// on issuer, signing keys and how an identity becomes a CertPilot user.
+	authenticator *middleware.Authenticator
 }
 
-func NewSessionHandler(s store.Store, auth config.AuthConfig) *SessionHandler {
-	return &SessionHandler{store: s, auth: auth}
+func NewSessionHandler(s store.Store, auth config.AuthConfig, authenticator *middleware.Authenticator) *SessionHandler {
+	return &SessionHandler{store: s, auth: auth, authenticator: authenticator}
 }
 
 // AuthConfigResponse tells the frontend how to authenticate against this

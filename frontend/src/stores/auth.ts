@@ -2,10 +2,10 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
   loadAuthConfig,
-  currentAccessToken,
   beginSignIn,
   signOut as oidcSignOut,
   clearTokens,
+  rememberSignIn,
   type AuthConfig,
 } from '@/lib/oidc'
 
@@ -69,13 +69,11 @@ export const useAuthStore = defineStore('auth', () => {
    * API had stopped honouring the moment somebody was demoted.
    */
   async function loadMe(): Promise<boolean> {
-    const headers: Record<string, string> = {}
-    const token = await currentAccessToken()
-    if (token) headers.Authorization = `Bearer ${token}`
-
     // same-origin so the session cookie travels. It is httpOnly, so this is the
-    // only way the page can find out whether it has one at all.
-    const response = await fetch('/api/v1/me', { headers, credentials: 'same-origin' })
+    // only way the page can find out whether it has one at all — and since the
+    // core took over redeeming the authorization code, it is the only credential
+    // the browser has for either kind of sign-in.
+    const response = await fetch('/api/v1/me', { credentials: 'same-origin' })
     if (!response.ok) {
       me.value = null
       role.value = 'viewer'
@@ -136,6 +134,7 @@ export const useAuthStore = defineStore('auth', () => {
     me.value = (await response.json()) as Me
     role.value = me.value.role
     isAuthenticated.value = true
+    rememberSignIn()
     return null
   }
 

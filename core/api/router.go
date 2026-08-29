@@ -92,7 +92,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	cloudHandler := NewCloudHandler(deps.Store, deps.CloudEngine, deps.Keyring)
 	deployHandler := NewDeploymentHandler(deps.Store, deps.Keyring)
 	postureHandler := NewPostureHandler(deps.Store, posture.ToolVersion)
-	sessionHandler := NewSessionHandler(deps.Store, deps.Config.Auth)
+	sessionHandler := NewSessionHandler(deps.Store, deps.Config.Auth, deps.Auth)
 	userHandler := NewUserHandler(deps.Store)
 
 	// ── Sign-in discovery ──
@@ -107,6 +107,14 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	// core runs as several replicas and an in-process counter would reset with
 	// every request that landed on a different one.
 	engine.POST("/api/v1/auth/login", sessionHandler.Login)
+
+	// The core redeems the authorization code, the browser does not.
+	//
+	// A single-page application that redeems it itself receives a refresh token
+	// and has nowhere safe to keep it — every storage a page can reach is
+	// readable by script on that origin. Doing the exchange here means the
+	// browser gets a session cookie and never handles a token at all.
+	engine.POST("/api/v1/auth/callback", sessionHandler.Callback)
 
 	// ── The agent API ──
 	//
