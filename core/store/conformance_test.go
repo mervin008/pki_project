@@ -107,9 +107,45 @@ func TestEveryValueThisCodebaseCanProduceIsAccepted(t *testing.T) {
 			} {
 				cert := sampleCertificate(fmt.Sprintf("status-%s", status))
 				cert.Status = status
+				// REVOKED is the one status that is not valid on its own.
+				// Migration 030 enforces that it and revoked_at agree, because
+				// a row reading REVOKED while the certificate still answers
+				// handshakes is a lie the console would repeat. Writing the
+				// pair here keeps the invariant this test exists for — a value
+				// the Go code can produce is a value the schema accepts —
+				// without asserting that a state the schema deliberately
+				// forbids should be allowed.
+				if status == "REVOKED" {
+					revokedAt := time.Now().Add(-time.Hour)
+					cert.RevokedAt = &revokedAt
+				}
 				if err := s.CreateCertificate(ctx, cert); err != nil {
 					t.Errorf("status %q is written by this codebase and refused by the store: %v", status, err)
 				}
+			}
+		})
+
+		// The other half of that constraint, and the reason it exists. This
+		// failed silently for as long as the suite ran without a database:
+		// the in-memory store has no CHECK to violate, so it accepts the
+		// inconsistent pair for ever and agrees with itself.
+		t.Run("revocation status and timestamp must agree", func(t *testing.T) {
+			if _, isMemory := s.(*MemoryStore); isMemory {
+				t.Skip("the in-memory store has no constraint to enforce this")
+			}
+
+			orphanStatus := sampleCertificate("revoked-without-a-timestamp")
+			orphanStatus.Status = "REVOKED"
+			if err := s.CreateCertificate(ctx, orphanStatus); err == nil {
+				t.Error("REVOKED without a revoked_at must be refused: a certificate cannot read revoked here while still answering handshakes")
+			}
+
+			orphanTime := sampleCertificate("timestamp-without-the-status")
+			orphanTime.Status = "ISSUED"
+			revokedAt := time.Now().Add(-time.Hour)
+			orphanTime.RevokedAt = &revokedAt
+			if err := s.CreateCertificate(ctx, orphanTime); err == nil {
+				t.Error("a revoked_at without the REVOKED status must be refused")
 			}
 		})
 

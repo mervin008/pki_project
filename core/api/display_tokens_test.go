@@ -67,6 +67,11 @@ func realRouter(t *testing.T) (*gin.Engine, store.Store) {
 	// token's own claim, which is the behaviour this design exists to replace.
 	auth = auth.WithUserDirectory(st)
 
+	// Same wiring as the server: audit entries written during a test are
+	// chained, so the tests exercise the path a deployment takes rather than an
+	// unchained one that cannot fail the same way.
+	st.UseAuditChain(store.NewAuditChainer(keyring))
+
 	pm := pluginmgr.NewManager(grpckit.TLSConfig{Insecure: true})
 
 	// A real dispatcher, not a nil one: the notification endpoints seal

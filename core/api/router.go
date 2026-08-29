@@ -80,6 +80,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	caHandler := NewCAHandler(deps.Store, deps.CAMonitor, deps.CAImporter, deps.ChainResolver)
 	caAccHandler := NewCAAccountHandler(deps.Store, deps.PluginMgr, deps.Keyring, deps.CAImporter)
 	dashHandler := NewDashboardHandler(deps.Store)
+	auditHandler := NewAuditHandler(deps.Store)
 	discHandler := NewDiscoveryHandler(deps.Store, deps.Scanner)
 	policyHandler := NewPolicyHandler(deps.Store)
 	eventsHandler := NewEventsHandler(deps.Store, deps.Broker)
@@ -178,6 +179,13 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.GET("/dashboard/stats", dashHandler.Stats)
 		v1.GET("/dashboard/expiring", dashHandler.Expiring)
 		v1.GET("/dashboard/activity", dashHandler.Activity)
+
+		// ── Audit record integrity ──
+		// Whether the audit log has been altered, as distinct from what it
+		// says. Admin only: the people who could tamper with it are the ones
+		// this answer would implicate, and telling them whether the check
+		// passes is telling them whether a rewrite worked.
+		v1.GET("/audit/verify", middleware.RequireRole(middleware.RoleAdmin), auditHandler.Verify)
 
 		// ── Certificates ──
 		v1.GET("/certificates", certHandler.List)

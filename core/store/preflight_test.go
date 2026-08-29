@@ -98,13 +98,44 @@ func TestInetColumnsAreReadThroughHost(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A bare column name inside a comma-separated list is a select projection.
-	// The INSERT that writes it ends the list with `ip_address)`, so it does
-	// not match and is correctly left alone.
-	for _, column := range []string{"ip_address", "last_seen_ip"} {
-		if strings.Contains(string(source), ", "+column+",") {
-			t.Errorf("%s is selected directly; it is an inet column and must be read as host(%s)",
-				column, column)
+	// Only projections are the problem: writing an inet works either way. This
+	// scans the text between each SELECT and its FROM rather than the whole
+	// file, because an INSERT names the same columns and naming them there is
+	// correct. The earlier version of this test looked for ", ip_address," in
+	// the file at large and relied on every INSERT happening to end its column
+	// list at ip_address — which stopped being true the moment one grew.
+	for _, projection := range selectProjections(string(source)) {
+		for _, column := range []string{"ip_address", "last_seen_ip"} {
+			for _, field := range strings.Split(projection, ",") {
+				if strings.TrimSpace(field) == column {
+					t.Errorf("%s is selected directly; it is an inet column and must be read as host(%s)",
+						column, column)
+				}
+			}
 		}
+	}
+}
+
+// selectProjections returns the text between each SELECT and the FROM that
+// follows it. Case-sensitive on purpose: every query in postgres.go writes its
+// keywords in capitals, and matching loosely would start pulling prose out of
+// the comments that explain them.
+func selectProjections(source string) []string {
+	var out []string
+	rest := source
+	for {
+		start := strings.Index(rest, "SELECT ")
+		if start < 0 {
+			return out
+		}
+		rest = rest[start+len("SELECT "):]
+		end := strings.Index(rest, "FROM ")
+		if end < 0 {
+			// A SELECT with no FROM — pg_advisory_xact_lock, COUNT over a
+			// literal — projects no columns and cannot contain the defect.
+			return out
+		}
+		out = append(out, rest[:end])
+		rest = rest[end:]
 	}
 }

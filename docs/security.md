@@ -31,6 +31,7 @@ high-value target by construction.
 | A compromised agent host | An agent can request certificates only for names an operator granted it in advance, and only its own |
 | Network interception | Core↔gateway is mutual TLS 1.3; agent↔core is Ed25519-signed over HTTPS |
 | A leaked wall-display token | `GET` only, viewer role, never private keys, revocable, and its last use is recorded |
+| Tampering with the audit log | Every entry is chained with a keyed tag. The key is derived from `CERTPILOT_KEK` and never stored in the database, so a database-only attacker can alter a row but cannot forge a tag that agrees with it |
 
 **Not defended against:**
 
@@ -39,7 +40,8 @@ high-value target by construction.
 | A compromised core host with the KEK in memory | It can decrypt everything. This is inherent to a system that must use these secrets |
 | A malicious operator | An operator can issue and deploy certificates. That is the job. The audit log records it |
 | A compromised CA | If Vault or an ACME account is under someone else's control, CertPilot faithfully manages certificates they issue |
-| Tampering with the audit log | The table is not yet hash-chained. See [known gaps](#known-gaps) |
+| Rewriting the audit log with the KEK in hand | Somebody holding both the database and the key can recompute the whole chain from any point. Detecting that needs an anchor outside the system; see [known gaps](#known-gaps) |
+| Truncating the audit log | Deleting the newest entries leaves a shorter chain that is internally consistent. Same anchor problem |
 
 ---
 
@@ -264,15 +266,80 @@ failures.
 The log is queryable through `GET /api/v1/dashboard/activity` with an `actions`
 filter and an index on `(action, created_at desc)`.
 
+### Tamper-evidence
+
+Every entry written since migration 031 carries a gapless sequence number, the
+tag of the entry before it, and its own **HMAC-SHA256 tag** over both. The MAC
+key is a purpose-derived subkey of `CERTPILOT_KEK` — never the KEK itself, so
+one key is not doing two cryptographic jobs — and it lives in the core's
+environment, not in the database.
+
+That boundary is the point. Someone holding a database dump, a compromised
+replica, or a DBA account can alter or delete a row, but cannot produce a tag
+that agrees with it. Editing one entry breaks that entry; re-tagging it breaks
+the next one; deleting one leaves a hole in the sequence.
+
+```
+entry N-1                     entry N
+┌──────────────┐              ┌──────────────┐
+│ seq          │              │ seq        N │
+│ contents     │         ┌───▶│ prev_hash    │
+│ entry_hash ──┼─────────┘    │ contents     │
+└──────────────┘              │ entry_hash = │
+                              │   HMAC(k,    │
+                              │    prev ‖    │
+                              │    contents) │
+                              └──────────────┘
+      k = subkey(CERTPILOT_KEK, "audit-chain")
+```
+
+Each entry also records **which** KEK signed it, in the same short hex form the
+encryption envelopes use, so rotating `CERTPILOT_KEK` does not invalidate
+history. Without that, the safe thing to do would be never to rotate.
+
+`GET /api/v1/audit/verify` (admin) walks the chain and reports the first break,
+its sequence number, and a reason. It is surfaced in **Settings → Audit record**.
+Three outcomes, deliberately distinct: intact, altered, and *could not be
+checked* — the last usually meaning a chain written under a key this core was
+never given. A missing key must never read as tampering, or the reverse.
+
+The report also counts entries that **predate** the mechanism. They are left
+unchained rather than back-filled: a chain computed over old rows today proves
+only that they looked like that at migration time, and presenting it as
+tamper-evidence would be a lie the verifier then repeats.
+
+Two things bound the guarantee. `audit_logs` also carries a trigger refusing
+`UPDATE` and `DELETE` — that is protection against a mistyped statement, not a
+security control, since anyone who can drop a trigger can drop it. And a
+determined attacker holding **both** the database and the KEK can rewrite the
+chain wholesale; see [known gaps](#known-gaps).
+
+Retention is the one legitimate deletion, and it has a documented door rather
+than teaching operators to drop the trigger:
+
+```sql
+begin;
+set local certpilot.audit_maintenance = 'on';
+delete from public.audit_logs where created_at < now() - interval '7 years';
+commit;
+```
+
+Verification will then report a gap across what was pruned, which is correct: a
+pruned chain is not an intact one.
+
 ---
 
 ## Known gaps
 
 Listed because a security document that only lists strengths is marketing.
 
-**The audit log is not tamper-evident.** Rows are written and can be deleted or
-altered by anything with write access to the database. Hash-chaining each row to
-its predecessor would make tampering detectable. Not built.
+**The audit chain has no external anchor.** Each entry is chained with a tag
+keyed from `CERTPILOT_KEK`, which defeats an attacker who holds the database but
+not the key. It does not defeat one who holds both: they can recompute the chain
+from any point forward, or truncate the newest entries and leave something
+internally consistent. Detecting either needs the head tag published somewhere
+append-only — a second system, an object-lock bucket, a printed page — on a
+schedule. Not built.
 
 **No nonce store for agent requests.** Replay inside the five-minute window is
 possible. The requests are idempotent reports, so the impact is a duplicate
@@ -287,16 +354,6 @@ APIs; never run against a real vault or appliance.
 **The KEK lives in an environment variable.** Loading it from a KMS or from
 Vault's transit engine — so that the core never holds the key material itself,
 only the ability to ask for unwrapping — would be materially better. Not built.
-
-**A compromised certificate cannot be revoked through CertPilot.** The
-gateways implement revocation; the core exposes no route that calls it, and
-`DELETE /certificates/:id` deletes the record while leaving the certificate
-live at the CA. This is the largest gap in this list: the response to a key
-compromise currently has to go around the tool.
-
-**No rate limiting on the API.** A stolen operator token can drive issuance as
-fast as the CA allows. CA accounts have their own renewal rate limits, which is
-a different control.
 
 **Deployment ordering is not expressible.** "Staging, then production" cannot
 be declared; the canary is one-per-worker rather than exactly one.

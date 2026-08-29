@@ -368,6 +368,20 @@ type AuditLog struct {
 	Details    string    `json:"details,omitempty"` // JSON string
 	IPAddress  *string   `json:"ip_address,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
+
+	// Seq is the entry's position in the tamper-evidence chain, assigned by the
+	// store. Gapless, so a deleted entry shows up as a hole rather than simply
+	// not being there. Zero for entries written before the chain existed.
+	Seq int64 `json:"seq,omitempty"`
+	// EntryHash is this entry's keyed tag; PrevHash is the tag of the entry
+	// before it. PrevHash is not serialised because it is only meaningful while
+	// walking the chain, and a caller that wants to check the record should ask
+	// the verifier rather than reassemble the walk itself.
+	EntryHash []byte `json:"entry_hash,omitempty"`
+	PrevHash  []byte `json:"-"`
+	// ChainKeyID names the KEK whose subkey produced EntryHash, so a chain
+	// written before a key rotation stays verifiable afterwards.
+	ChainKeyID string `json:"-"`
 }
 
 // DisplayToken is a long-lived, read-only credential for an unattended screen.

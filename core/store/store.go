@@ -551,6 +551,17 @@ type Store interface {
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)
 
+	// UseAuditChain installs the key that makes new audit entries
+	// tamper-evident. It is on the interface rather than a constructor argument
+	// because the store is built before the keyring is loaded, and on the
+	// interface rather than one implementation because a store that chains only
+	// in memory would let the conformance suite agree with itself while the
+	// real database wrote nothing.
+	UseAuditChain(chainer *AuditChainer)
+	// VerifyAuditChain walks the chain from a sequence number and reports the
+	// first break. A limit of zero walks to the end.
+	VerifyAuditChain(ctx context.Context, from int64, limit int) (*AuditChainReport, error)
+
 	// ── Dashboard ───────────────────────────────────────────
 	GetDashboardStats(ctx context.Context) (*DashboardStats, error)
 

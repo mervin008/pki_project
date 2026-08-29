@@ -346,9 +346,11 @@ hand-maintained `schema_test.sql` would drift from `migrations/`, and the suite
 would go on passing while the two diverged, which is the exact failure this
 exercise exists to end.
 
-### What the suite found on its first run
+### What the suite has found
 
-Three things, none of which any existing test could have caught.
+Four things, none of which any existing test could have caught. The first three
+came on its first run; the fourth arrived later, which is the more useful
+lesson — the suite earns its keep on every schema change, not once.
 
 **The schema did not apply to plain PostgreSQL at all.** Migration 001
 references `auth.users`, `auth.jwt()` and a `supabase_realtime` publication.
@@ -363,6 +365,17 @@ would shadow the genuine one and break every RLS policy in the database.
 positive — but passing an explicit zero overrides the default and violates the
 check. The in-memory store applied a floor; PostgreSQL did not. Class B, in the
 direction where the database writer is the one missing something.
+
+**`CreateCertificate` silently dropped every revocation column.** Found on the
+first run *after* migration 030 added them, and worth recording because the
+suite caught it in both directions at once. The writer never named `revoked_at`,
+`revocation_reason` or `revoked_by`, so importing a certificate that is already
+revoked set `status = 'REVOKED'`, dropped the timestamp, and had the whole
+insert refused by 030's consistency CHECK. Class B — a model field a writer
+drops — presenting as class A: a value the Go code produces that the schema
+rejects. The in-memory store has no CHECK to violate, so it accepted the
+inconsistent pair and agreed with itself for as long as the suite ran without a
+database. `make test` was green throughout.
 
 **Migration 002 was never rerunnable.** PostgreSQL has no
 `add constraint if not exists`, so re-applying the file failed on

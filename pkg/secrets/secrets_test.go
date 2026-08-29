@@ -1,6 +1,9 @@
 package secrets
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"strings"
@@ -295,5 +298,132 @@ func TestLargePayload(t *testing.T) {
 	}
 	if got != large {
 		t.Fatal("large payload did not round trip")
+	}
+}
+
+// ── Keyed authentication ────────────────────────────────
+
+func TestMACVerifiesAndRejects(t *testing.T) {
+	kr, err := NewEphemeralKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, tag, err := kr.MAC(PurposeAuditChain, []byte("audit entry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tag) != MACSize {
+		t.Fatalf("expected a %d-byte tag, got %d", MACSize, len(tag))
+	}
+
+	ok, err := kr.VerifyMAC(id, PurposeAuditChain, []byte("audit entry"), tag)
+	if err != nil || !ok {
+		t.Fatalf("a tag must verify over the data it was computed on (ok=%v err=%v)", ok, err)
+	}
+
+	ok, err = kr.VerifyMAC(id, PurposeAuditChain, []byte("audit entrz"), tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Error("a tag must not verify over altered data")
+	}
+}
+
+// The purpose string is the only thing separating this subkey from any other
+// use of the same KEK. If it were not bound in, a tag minted for one purpose
+// would be a valid tag for another.
+func TestMACIsDomainSeparatedByPurpose(t *testing.T) {
+	kr, err := NewEphemeralKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, tag, err := kr.MAC(PurposeAuditChain, []byte("same data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := kr.VerifyMAC(id, "some-other-purpose", []byte("same data"), tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Error("a tag from one purpose must not verify under another")
+	}
+}
+
+// Rotation must not invalidate what the retired key signed, or the safe thing
+// to do becomes never rotating.
+func TestMACVerifiesUnderARetiredKey(t *testing.T) {
+	oldKEK := make([]byte, KEKSize)
+	for i := range oldKEK {
+		oldKEK[i] = byte(i + 1)
+	}
+	newKEK := make([]byte, KEKSize)
+	for i := range newKEK {
+		newKEK[i] = byte(255 - i)
+	}
+
+	before, err := NewKeyring(oldKEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, tag, err := before.MAC(PurposeAuditChain, []byte("written yesterday"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := NewKeyring(newKEK, oldKEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := after.VerifyMAC(id, PurposeAuditChain, []byte("written yesterday"), tag)
+	if err != nil || !ok {
+		t.Fatalf("a retired key must still verify what it signed (ok=%v err=%v)", ok, err)
+	}
+}
+
+// "I cannot check this" and "this does not match" are different answers, and an
+// operator reading a broken audit chain needs to be able to tell them apart.
+func TestMACUnknownKeyIsAnErrorNotAMismatch(t *testing.T) {
+	writer, err := NewEphemeralKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, tag, err := writer.MAC(PurposeAuditChain, []byte("data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stranger, err := NewEphemeralKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stranger.VerifyMAC(id, PurposeAuditChain, []byte("data"), tag); !errors.Is(err, ErrUnknownKey) {
+		t.Errorf("expected ErrUnknownKey, got %v", err)
+	}
+}
+
+// The KEK also wraps every stored secret. Using it directly as a MAC key would
+// give one key two cryptographic roles; the derivation is what keeps them apart.
+func TestMACDoesNotUseTheKEKDirectly(t *testing.T) {
+	kek := make([]byte, KEKSize)
+	for i := range kek {
+		kek[i] = byte(i)
+	}
+	kr, err := NewKeyring(kek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tag, err := kr.MAC(PurposeAuditChain, []byte("data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	direct := hmac.New(sha256.New, kek)
+	direct.Write([]byte("data"))
+	if bytes.Equal(tag, direct.Sum(nil)) {
+		t.Error("the tag was computed with the raw KEK rather than a derived subkey")
 	}
 }

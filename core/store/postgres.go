@@ -9,8 +9,10 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,6 +21,12 @@ import (
 // PostgresStore implements Store using pgxpool for PostgreSQL.
 type PostgresStore struct {
 	pool *pgxpool.Pool
+
+	// auditChain is read on every audit write and set once at startup, but a
+	// mutex rather than a bare field because the engines are already running by
+	// the time the server wires it in.
+	auditMu    sync.RWMutex
+	auditChain *AuditChainer
 }
 
 // NewPostgresStore connects to PostgreSQL using the provided connection string.
@@ -265,12 +273,24 @@ func (s *PostgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 			auto_renew, renewal_lead_days, ca_account_id, ca_authority_id,
 			deployment_target_id, private_key_encrypted, certificate_pem, chain_pem,
 			discovered_via, environment, team, tags, created_by,
-			key_custody, key_holder_agent_id, metadata
+			key_custody, key_holder_agent_id, metadata,
+			revoked_at, revocation_reason, revoked_by
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-			$25, $26, $27
+			$25, $26, $27, $28, $29, $30
 		) RETURNING id, created_at, updated_at
 	`
+	// The revocation columns are written here even though revocation itself
+	// goes through MarkCertificateRevoked.
+	//
+	// Migration 030 requires status = 'REVOKED' and revoked_at to agree, and
+	// this statement did not name the columns at all — so a discovery or CT
+	// import of a certificate that is already revoked set the status, dropped
+	// the timestamp, and had the whole insert refused by the CHECK. Store
+	// defect class B, a model field a writer silently drops, with class A's
+	// symptom on top of it: the value is one the Go code produces and the
+	// schema rejects. The in-memory store has no constraint, so it accepted the
+	// inconsistent pair and the suite agreed with itself.
 	return s.pool.QueryRow(ctx, query,
 		cert.FingerprintSHA256, cert.CommonName, sansJSON, cert.SerialNumber, cert.IssuerDN,
 		cert.NotBefore, cert.NotAfter, cert.DaysRemaining, cert.KeyType, cert.KeySize, cert.Status,
@@ -278,6 +298,7 @@ func (s *PostgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 		cert.DeploymentTargetID, cert.PrivateKeyEncrypted, cert.CertificatePEM, cert.ChainPEM,
 		cert.DiscoveredVia, nullIfEmpty(cert.Environment), cert.Team, tagsJSON, cert.CreatedBy,
 		custodyOrDefault(cert), cert.KeyHolderAgentID, metadataJSON(cert.Metadata),
+		cert.RevokedAt, cert.RevocationReason, cert.RevokedBy,
 	).Scan(&cert.ID, &cert.CreatedAt, &cert.UpdatedAt)
 }
 
@@ -1215,19 +1236,171 @@ func (s *PostgresStore) TouchDisplayToken(ctx context.Context, id string, seenAt
 
 // ── Audit Logs ──────────────────────────────────────────
 
+// auditChainLockKey serialises audit writes across every replica.
+//
+// An arbitrary constant, but a fixed one: PostgreSQL advisory locks share a
+// single namespace, so it is written here rather than derived from a string in
+// case anything else in this codebase ever needs one and has to avoid it.
+const auditChainLockKey int64 = 0x43503A61756469 // "CP:audi"
+
+func (s *PostgresStore) UseAuditChain(chainer *AuditChainer) {
+	s.auditMu.Lock()
+	defer s.auditMu.Unlock()
+	s.auditChain = chainer
+}
+
+func (s *PostgresStore) chainer() *AuditChainer {
+	s.auditMu.RLock()
+	defer s.auditMu.RUnlock()
+	return s.auditChain
+}
+
 func (s *PostgresStore) CreateAuditLog(ctx context.Context, log *AuditLog) error {
-	query := `
-		INSERT INTO public.audit_logs (action, entity_type, entity_id, actor_id, actor_email, details, ip_address)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING id, created_at
+	const insert = `
+		INSERT INTO public.audit_logs
+			(id, action, entity_type, entity_id, actor_id, actor_email, details, ip_address,
+			 created_at, seq, prev_hash, entry_hash, chain_key_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`
-	var detailsJSON []byte
-	if log.Details != "" {
-		detailsJSON = []byte(log.Details)
+
+	if log.ID == "" {
+		log.ID = uuid.NewString()
 	}
-	return s.pool.QueryRow(ctx, query,
-		log.Action, log.EntityType, log.EntityID, log.ActorID, log.ActorEmail, detailsJSON, log.IPAddress,
-	).Scan(&log.ID, &log.CreatedAt)
+	if log.CreatedAt.IsZero() {
+		log.CreatedAt = time.Now()
+	}
+	// Truncated before the tag is computed, because timestamptz holds
+	// microseconds and would otherwise hand back a different instant than the
+	// one that was signed — making every entry read as tampered on the first
+	// verification.
+	log.CreatedAt = log.CreatedAt.UTC().Truncate(time.Microsecond)
+
+	var details *string
+	if log.Details != "" {
+		details = &log.Details
+	}
+
+	chainer := s.chainer()
+	if chainer == nil {
+		// Written unchained rather than refused. Losing the record of what
+		// happened is worse than losing the proof that the record is intact,
+		// and VerifyAuditChain counts these and says so rather than letting
+		// them pass as verified.
+		_, err := s.pool.Exec(ctx, insert,
+			log.ID, log.Action, log.EntityType, log.EntityID, log.ActorID, log.ActorEmail,
+			details, log.IPAddress, log.CreatedAt, nil, nil, nil, nil)
+		return err
+	}
+
+	// The head read and the insert have to be one atomic step. Without the
+	// lock, two replicas writing at the same moment both read sequence N as the
+	// head and both chain from it: the unique index then rejects one of them and
+	// an audit entry is lost, or — worse, before that index existed — the chain
+	// silently forks and verification fails forever at that point. The lock is
+	// transaction-scoped, so it is released by commit or rollback and cannot be
+	// stranded by a replica dying mid-write.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", auditChainLockKey); err != nil {
+		return fmt.Errorf("could not take the audit chain lock: %w", err)
+	}
+
+	var headSeq int64
+	prev := append([]byte(nil), AuditChainZeroPrev...)
+	err = tx.QueryRow(ctx,
+		`SELECT seq, entry_hash FROM public.audit_logs WHERE seq IS NOT NULL ORDER BY seq DESC LIMIT 1`,
+	).Scan(&headSeq, &prev)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("could not read the audit chain head: %w", err)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		headSeq = 0
+		prev = append([]byte(nil), AuditChainZeroPrev...)
+	}
+
+	log.Seq = headSeq + 1
+	log.PrevHash = prev
+	keyID, tag, err := chainer.Link(log, prev)
+	if err != nil {
+		return fmt.Errorf("could not compute the audit chain tag: %w", err)
+	}
+	log.ChainKeyID = keyID
+	log.EntryHash = tag
+
+	if _, err := tx.Exec(ctx, insert,
+		log.ID, log.Action, log.EntityType, log.EntityID, log.ActorID, log.ActorEmail,
+		details, log.IPAddress, log.CreatedAt, log.Seq, log.PrevHash, log.EntryHash, log.ChainKeyID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PostgresStore) VerifyAuditChain(ctx context.Context, from int64, limit int) (*AuditChainReport, error) {
+	var unchained int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM public.audit_logs WHERE seq IS NULL").Scan(&unchained); err != nil {
+		return nil, err
+	}
+
+	if from < 1 {
+		from = 1
+	}
+	// One more than asked for, so the report can say whether it stopped at the
+	// end of the chain or at its own limit. "Intact" over a truncated walk is a
+	// much weaker claim and must not read like the full one.
+	fetch := limit
+	if fetch > 0 {
+		fetch++
+	}
+
+	query := `
+		SELECT id, action, entity_type, entity_id, actor_id, actor_email, details,
+		       host(ip_address), created_at, seq, prev_hash, entry_hash, chain_key_id
+		FROM public.audit_logs
+		WHERE seq IS NOT NULL AND seq >= $1
+		ORDER BY seq ASC`
+	args := []any{from}
+	if fetch > 0 {
+		query += " LIMIT $2"
+		args = append(args, fetch)
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := make([]*AuditLog, 0, 256)
+	for rows.Next() {
+		l := &AuditLog{}
+		var details *string
+		if err := rows.Scan(&l.ID, &l.Action, &l.EntityType, &l.EntityID, &l.ActorID,
+			&l.ActorEmail, &details, &l.IPAddress, &l.CreatedAt, &l.Seq,
+			&l.PrevHash, &l.EntryHash, &l.ChainKeyID); err != nil {
+			return nil, err
+		}
+		if details != nil {
+			l.Details = *details
+		}
+		l.CreatedAt = l.CreatedAt.UTC()
+		entries = append(entries, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	truncated := false
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+		truncated = true
+	}
+	return verifyAuditChainOver(entries, s.chainer(), from, unchained, truncated), nil
 }
 
 func (s *PostgresStore) ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error) {

@@ -47,7 +47,7 @@ Six Go modules in a workspace (`go.work`, Go 1.26.6) plus a Vue frontend.
 | `gateways/{selfsigned,acme,vault}/` | CA adapters, each its own module and process, speaking one gRPC contract |
 | `agent/` | Host agent: generates keys locally, sends CSRs, installs and reloads |
 | `frontend/` | Vue 3 + Vite + Tailwind 4 + Pinia |
-| `migrations/` | 27 numbered `.sql` files, applied by `certpilot-core --migrate` |
+| `migrations/` | 31 numbered `.sql` files, applied by `certpilot-core --migrate` |
 | `docs/` | Written, current, and worth reading |
 
 **The API reference is published as a separate site** from
@@ -62,7 +62,7 @@ import), `renewal`, `discovery`, `ctlog`, `cloudsync`, `deploy`, `fleet`,
 `notifications`, `policy`, `posture`. They are started by `core/server` and
 publish to an in-process broker (`core/events`) that feeds the SSE endpoint.
 
-`core/api/` is 21 handler files behind ~101 routes in `router.go`.
+`core/api/` is 26 handler files behind 120 routes in `router.go`.
 
 ---
 
@@ -137,6 +137,16 @@ list). The last active admin cannot be demoted or suspended — the only way bac
 from that is SQL, which is what the screen exists to remove. Suspending revokes
 every session immediately. A generated password sets `must_change_password`,
 which raises a modal that cannot be dismissed.
+
+**The audit log is chained with a key the database does not hold.** Each entry
+carries a gapless `seq`, the previous entry's tag, and an HMAC-SHA256 tag over
+both, keyed from a subkey of `CERTPILOT_KEK`. So a database-only attacker can
+alter a row and cannot forge a tag that agrees with it. `details` is `text`, not
+`jsonb`, precisely because jsonb rewrites the bytes it is given and the tag
+would stop matching. Entries predating migration 031 are deliberately left
+unchained, and `GET /audit/verify` counts them rather than pretending they are
+covered. Writing takes a transaction-scoped advisory lock: without it two
+replicas chain from the same predecessor and one entry is lost.
 
 **Revocation tells the CA first and records only what the CA accepted.**
 `POST /certificates/:id/revoke` (admin). A row can never read `REVOKED` while
@@ -288,7 +298,8 @@ need a container runtime.
 
 - **The OIDC refresh token is in `localStorage`** — for federated sign-in only.
   Local password sessions use an httpOnly cookie and are unaffected.
-- Audit log is not hash-chained.
+- The audit chain has no external anchor — an attacker holding both the
+  database and the KEK can rewrite it wholesale, or truncate the newest entries.
 - No agent nonce store (replay window bounded by timestamp only).
 - OCSP checking is a bare GET, not a signed-response validation.
 - Key Vault and F5 deployers are unit-tested only.

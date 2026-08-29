@@ -88,6 +88,12 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		return nil, err
 	}
 
+	// The audit log is chained with a subkey of the same KEK. Wired here rather
+	// than at store construction because the store is built first — and wired
+	// unconditionally, because an audit log that is only sometimes
+	// tamper-evident is one nobody can reason about.
+	st.UseAuditChain(store.NewAuditChainer(keyring))
+
 	// 3. Plugin manager.
 	gwTLS := grpckit.TLSConfig{
 		CertFile: cfg.Plugins.TLS.CertFile,

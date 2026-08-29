@@ -25,6 +25,8 @@ import (
 // a data race out of an ordinary dashboard refresh.
 type MemoryStore struct {
 	mu             sync.RWMutex
+	auditChain     *AuditChainer
+	auditChainHead int64
 	certificates   map[string]*Certificate
 	caAuthorities  map[string]*CAAuthority
 	caAccounts     map[string]*CAAccount
@@ -870,15 +872,88 @@ func (m *MemoryStore) TouchDisplayToken(ctx context.Context, id string, seenAt t
 	return nil
 }
 
+func (m *MemoryStore) UseAuditChain(chainer *AuditChainer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditChain = chainer
+}
+
 func (m *MemoryStore) CreateAuditLog(ctx context.Context, log *AuditLog) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if log.ID == "" {
 		log.ID = uuid.New().String()
 	}
-	log.CreatedAt = time.Now()
+	// Truncated to microseconds even though nothing here needs it to be, so
+	// that an entry written to this store and one written to PostgreSQL cover
+	// the same bytes. A chain that only verifies in memory is exactly the class
+	// of defect this project keeps finding.
+	log.CreatedAt = time.Now().UTC().Truncate(time.Microsecond)
+
+	if m.auditChain != nil {
+		// The mutex is doing what the advisory lock does in PostgreSQL: the head
+		// read and the append are one atomic step, so concurrent writers cannot
+		// chain from the same predecessor.
+		// Counted, not derived from the slice length: this store seeds a
+		// sample entry, and any entry written before the chainer arrived is
+		// unchained. Numbering from the slice length would leave a permanent
+		// off-by-one that reads as a deleted record.
+		log.Seq = m.auditChainHead + 1
+		prev := append([]byte(nil), AuditChainZeroPrev...)
+		if len(m.auditLogs) > 0 {
+			// auditLogs is newest-first.
+			if head := m.auditLogs[0]; len(head.EntryHash) > 0 {
+				prev = append([]byte(nil), head.EntryHash...)
+			}
+		}
+		keyID, tag, err := m.auditChain.Link(log, prev)
+		if err != nil {
+			return err
+		}
+		log.PrevHash = prev
+		log.EntryHash = tag
+		log.ChainKeyID = keyID
+		m.auditChainHead = log.Seq
+	}
+
 	m.auditLogs = append([]*AuditLog{clone(log)}, m.auditLogs...)
 	return nil
+}
+
+func (m *MemoryStore) VerifyAuditChain(ctx context.Context, from int64, limit int) (*AuditChainReport, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if from < 1 {
+		from = 1
+	}
+
+	var unchained int64
+	// auditLogs is newest-first; the chain walks the other way.
+	ascending := make([]*AuditLog, 0, len(m.auditLogs))
+	for i := len(m.auditLogs) - 1; i >= 0; i-- {
+		l := m.auditLogs[i]
+		if l.Seq == 0 {
+			unchained++
+			continue
+		}
+		if l.Seq < from {
+			continue
+		}
+		// clone is a shallow struct copy, so the tags would otherwise be the
+		// store's own backing arrays handed to a caller that outlives the lock.
+		c := clone(l)
+		c.PrevHash = append([]byte(nil), l.PrevHash...)
+		c.EntryHash = append([]byte(nil), l.EntryHash...)
+		ascending = append(ascending, c)
+	}
+
+	truncated := false
+	if limit > 0 && len(ascending) > limit {
+		ascending = ascending[:limit]
+		truncated = true
+	}
+	return verifyAuditChainOver(ascending, m.auditChain, from, unchained, truncated), nil
 }
 
 func (m *MemoryStore) ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error) {

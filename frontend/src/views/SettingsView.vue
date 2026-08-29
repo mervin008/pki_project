@@ -9,6 +9,7 @@ import DataState from '@/components/common/DataState.vue'
 import NotificationChannels from '@/components/settings/NotificationChannels.vue'
 import MetadataFields from '@/components/settings/MetadataFields.vue'
 import UsersPanel from '@/components/settings/UsersPanel.vue'
+import AuditIntegrity from '@/components/settings/AuditIntegrity.vue'
 import {
   Server, Cpu, ShieldCheck, CircleCheck, CircleX, RotateCw, Palette, UserCog,
 } from 'lucide-vue-next'
@@ -160,6 +161,10 @@ function refreshAll() {
 
       <!-- Alert delivery -->
       <UsersPanel v-if="auth.isAdmin" />
+
+      <!-- Admin only, like the endpoint behind it: the people who could alter
+           the audit log are the ones this answer would implicate. -->
+      <AuditIntegrity v-if="auth.isAdmin" />
 
       <MetadataFields />
 
