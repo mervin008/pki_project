@@ -15,6 +15,7 @@
 package secrets
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -26,8 +27,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"strings"
 )
 
 // Context strings identify which field a ciphertext belongs to. They are bound
@@ -101,33 +100,12 @@ func NewKeyring(primary []byte, retired ...[]byte) (*Keyring, error) {
 
 // LoadKeyring reads CERTPILOT_KEK (required) and CERTPILOT_KEK_RETIRED (an
 // optional comma-separated list), both base64-encoded 32-byte keys.
+//
+// Kept as the environment provider spelled out, because it is the default and
+// because every existing deployment calls it. Anything wanting a key from
+// somewhere else goes through LoadKeyringFrom.
 func LoadKeyring() (*Keyring, error) {
-	primaryB64 := strings.TrimSpace(os.Getenv("CERTPILOT_KEK"))
-	if primaryB64 == "" {
-		return nil, ErrNoKey
-	}
-
-	primary, err := decodeKey(primaryB64)
-	if err != nil {
-		return nil, fmt.Errorf("secrets: CERTPILOT_KEK is invalid: %w", err)
-	}
-
-	var retired [][]byte
-	if raw := strings.TrimSpace(os.Getenv("CERTPILOT_KEK_RETIRED")); raw != "" {
-		for _, part := range strings.Split(raw, ",") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			k, err := decodeKey(part)
-			if err != nil {
-				return nil, fmt.Errorf("secrets: CERTPILOT_KEK_RETIRED contains an invalid key: %w", err)
-			}
-			retired = append(retired, k)
-		}
-	}
-
-	return NewKeyring(primary, retired...)
+	return LoadKeyringFrom(context.Background(), EnvProvider{})
 }
 
 // NewEphemeralKeyring generates a keyring backed by a random KEK that exists

@@ -106,6 +106,15 @@ policy. Never move it, and never run it against a database you did not create.
 **The server never migrates itself.** A schema change is something an operator
 runs, not a side effect of a replica restarting mid-deploy.
 
+**Where the KEK comes from is configurable** — `secrets.kek_provider` is `env`
+(default), `file`, or `vault`, in `pkg/secrets/provider.go`. Moving between them
+is a configuration change, not a migration: the same key value from a different
+source opens existing ciphertext. A key file writable by group or other is
+refused; world-readable is only warned about, because Kubernetes mounts secret
+volumes 0644. Only `env` falls back to an ephemeral key — a configured `file` or
+`vault` provider that returns nothing is fatal, or a misconfiguration would hide
+behind a successful start.
+
 **Private keys and CA credentials are sealed with `CERTPILOT_KEK`** before they
 reach the database (`pkg/secrets`, envelope encryption, `CPS1` magic). Losing the
 KEK makes every stored secret unrecoverable. The core refuses to start against a
@@ -329,7 +338,8 @@ need a container runtime.
 - The audit chain has no external anchor — an attacker holding both the
   database and the KEK can rewrite it wholesale, or truncate the newest entries.
 - Key Vault and F5 deployers are unit-tested only.
-- The KEK lives in an environment variable.
+- The KEK is held in the core's memory. It can be loaded from a file or from
+  Vault, but delegated unwrapping (transit/KMS) needs a `CPS2` envelope.
 - Deployment ordering is not expressible.
 - Discovery, CT and cloud-sync tables are thinly covered by the conformance suite.
 - Docker assets were fixed but never built — no container runtime on this machine.

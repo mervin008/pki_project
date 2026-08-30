@@ -92,7 +92,7 @@ notification channel's config cannot be made to open as a private key.
 
 ### The KEK
 
-Generate with `make generate-kek`. Supply as `CERTPILOT_KEK`.
+Generate with `make generate-kek`.
 
 > **It is not recoverable.** Lose it and every stored private key and CA
 > credential is gone. Put it in a secret manager — AWS Secrets Manager, Vault,
@@ -102,6 +102,48 @@ Generate with `make generate-kek`. Supply as `CERTPILOT_KEK`.
 The core refuses to start against a database without one. With the in-memory
 store it generates an ephemeral key and warns, because nothing there survives a
 restart anyway.
+
+**Where it comes from is configurable**, because that is a deployment decision
+rather than a code one. Three providers, and the key itself is validated in one
+place whichever supplied it:
+
+| `secrets.kek_provider` | |
+|:---|:---|
+| `env` *(default)* | `CERTPILOT_KEK`, and `CERTPILOT_KEK_RETIRED` for rotation |
+| `file` | `secrets.kek_file`. What every secret manager already speaks — a Docker secret, a Kubernetes secret volume, a systemd credential, `vault agent` templating |
+| `vault` | `secrets.vault.{address,path}`. KV v1 and v2 are both handled without being told which |
+
+```yaml
+secrets:
+  kek_provider: "file"
+  kek_file: "/run/secrets/certpilot_kek"
+  kek_retired_files:
+    - "/run/secrets/certpilot_kek.previous"
+```
+
+The default stays `env` because changing it would strand existing deployments on
+a restart — and the specific failure would be that nothing decrypts, which is
+the worst possible way to learn about a configuration change. **Moving between
+providers is a configuration change, not a migration:** the same key value from
+a different source produces the same keyring, and existing ciphertext opens
+normally.
+
+An environment variable is the weakest of the three. It is readable through
+`/proc/<pid>/environ` by anything running as the same user, inherited by every
+child process, present in core dumps and `docker inspect`, and tends to end up
+committed in an orchestrator manifest. None of that is true of a mounted file.
+
+A key file writable by group or other is **refused**, not warned about: anybody
+who can write it can replace the KEK, which after the next restart makes every
+stored secret unreadable and lets them seal new ones under a key they hold.
+World-*readable* is only a warning — it is wrong on a shared host, harmless in a
+single-tenant container, and Kubernetes mounts secret volumes `0644` by default,
+so refusing would break correct deployments.
+
+A configured provider that returns nothing is a fatal error. Only `env` falls
+back to an ephemeral key, and only alongside the in-memory store: a `file` or
+`vault` provider that produced nothing is a misconfiguration somebody has to
+fix, and quietly inventing a key would hide it behind a successful start-up.
 
 Rotation is supported through `CERTPILOT_KEK_RETIRED`. See
 [operations.md](operations.md#rotating-the-kek).
@@ -479,9 +521,18 @@ schedule. Not built.
 **Key Vault and F5 deployers are unit-tested only.** Written to their published
 APIs; never run against a real vault or appliance.
 
-**The KEK lives in an environment variable.** Loading it from a KMS or from
-Vault's transit engine — so that the core never holds the key material itself,
-only the ability to ask for unwrapping — would be materially better. Not built.
+**The KEK is held in the core's memory.** It can now be loaded from a file or
+from Vault rather than an environment variable, but wherever it comes from the
+process ends up holding it — which is inherent to a system that has to use it,
+and is listed as undefended in the threat model above.
+
+Delegated unwrapping would remove even that: Vault's transit engine, or a cloud
+KMS, where the core never sees key material and instead asks the service to
+unwrap each DEK. That is not a fourth provider, it is a change to the envelope
+format — `CPS1` has a fixed-width wrapped DEK and a transit ciphertext is a
+variable-length string — so it needs a `CPS2` envelope with the old one still
+readable. Worth doing, and deliberately not bundled with the provider work,
+because a mistake in that code is unrecoverable loss of every stored key.
 
 **Deployment ordering is not expressible.** "Staging, then production" cannot
 be declared; the canary is one-per-worker rather than exactly one.

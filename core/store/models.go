@@ -10,24 +10,24 @@ import (
 
 // CAAuthority represents a Certificate Authority record.
 type CAAuthority struct {
-	ID                      string     `json:"id"`
-	Name                    string     `json:"name"`
-	CAType                  string     `json:"ca_type"` // ROOT, INTERMEDIATE, ISSUING
-	SubjectDN               string     `json:"subject_dn"`
-	IssuerDN                string     `json:"issuer_dn"`
-	SerialNumber            string     `json:"serial_number,omitempty"`
-	NotBefore               time.Time  `json:"not_before"`
-	NotAfter                time.Time  `json:"not_after"`
-	DaysRemaining           int        `json:"days_remaining"`
-	KeyType                 string     `json:"key_type"`
-	KeySize                 int        `json:"key_size"`
-	FingerprintSHA256       string     `json:"fingerprint_sha256"`
-	CertificatePEM          string     `json:"certificate_pem"`
-	ParentCAID              *string    `json:"parent_ca_id,omitempty"`
-	CRLDistributionURL      string     `json:"crl_distribution_url,omitempty"`
-	OCSPResponderURL        string     `json:"ocsp_responder_url,omitempty"`
-	IsCRLFresh              bool       `json:"is_crl_fresh"`
-	CRLLastChecked          *time.Time `json:"crl_last_checked,omitempty"`
+	ID                 string     `json:"id"`
+	Name               string     `json:"name"`
+	CAType             string     `json:"ca_type"` // ROOT, INTERMEDIATE, ISSUING
+	SubjectDN          string     `json:"subject_dn"`
+	IssuerDN           string     `json:"issuer_dn"`
+	SerialNumber       string     `json:"serial_number,omitempty"`
+	NotBefore          time.Time  `json:"not_before"`
+	NotAfter           time.Time  `json:"not_after"`
+	DaysRemaining      int        `json:"days_remaining"`
+	KeyType            string     `json:"key_type"`
+	KeySize            int        `json:"key_size"`
+	FingerprintSHA256  string     `json:"fingerprint_sha256"`
+	CertificatePEM     string     `json:"certificate_pem"`
+	ParentCAID         *string    `json:"parent_ca_id,omitempty"`
+	CRLDistributionURL string     `json:"crl_distribution_url,omitempty"`
+	OCSPResponderURL   string     `json:"ocsp_responder_url,omitempty"`
+	IsCRLFresh         bool       `json:"is_crl_fresh"`
+	CRLLastChecked     *time.Time `json:"crl_last_checked,omitempty"`
 	// IsOCSPResponsive means a verified answer was obtained, not that an HTTP
 	// request succeeded. Before migration 033 it meant the latter, which any
 	// web server at that address could satisfy.
@@ -42,7 +42,7 @@ type CAAuthority struct {
 	// OCSPLastError says why the last check produced no verified answer. "The
 	// responder is unreachable" and "something answered and it was not the CA"
 	// are different problems, and a boolean cannot tell them apart.
-	OCSPLastError string `json:"ocsp_last_error,omitempty"`
+	OCSPLastError           string     `json:"ocsp_last_error,omitempty"`
 	CertificatesIssuedCount int64      `json:"certificates_issued_count"`
 	AlertThresholds         string     `json:"alert_thresholds,omitempty"` // JSON string
 	LastAlertSentAt         *time.Time `json:"last_alert_sent_at,omitempty"`

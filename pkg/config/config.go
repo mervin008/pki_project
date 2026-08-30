@@ -18,6 +18,53 @@ type CoreConfig struct {
 	PKI      PKIConfig      `yaml:"pki"`
 	Renewal  RenewalConfig  `yaml:"renewal"`
 	Logging  LoggingConfig  `yaml:"logging"`
+	Secrets  SecretsConfig  `yaml:"secrets"`
+}
+
+// SecretsConfig says where the key encryption key comes from.
+//
+// The KEK is the one secret CertPilot cannot function without and cannot
+// recover if it is lost: every certificate private key and CA credential in the
+// database is sealed under it. Which is why where it lives is a deployment
+// decision rather than a hard-coded one.
+type SecretsConfig struct {
+	// KEKProvider is "env" (the default), "file", or "vault".
+	//
+	// The default stays "env" because changing it would strand every existing
+	// deployment on a restart — with the specific failure being that nothing
+	// can be decrypted, which is the worst possible way to learn about a
+	// configuration change.
+	KEKProvider string `yaml:"kek_provider"`
+
+	// KEKFile and KEKRetiredFiles are used when the provider is "file". This
+	// is the shape every secret manager already speaks: a Docker secret, a
+	// Kubernetes secret volume, a systemd credential and `vault agent`
+	// templating all arrive as a file, and none of them need the value to pass
+	// through the process environment on the way.
+	KEKFile         string   `yaml:"kek_file"`
+	KEKRetiredFiles []string `yaml:"kek_retired_files"`
+
+	Vault VaultSecretsConfig `yaml:"vault"`
+}
+
+// VaultSecretsConfig reads the KEK from Vault's key/value store.
+type VaultSecretsConfig struct {
+	Address string `yaml:"address"`
+	// Path is the full API path, e.g. "secret/data/certpilot/kek" for KV v2.
+	// Both KV versions are handled without being told which.
+	Path string `yaml:"path"`
+	// Field defaults to "kek", RetiredField to "retired".
+	Field        string `yaml:"field"`
+	RetiredField string `yaml:"retired_field"`
+	// TokenFile is preferred over an inline token: it is what an AppRole login,
+	// `vault agent`, or a Kubernetes service account produces, and it can be
+	// rotated under a running process. VAULT_TOKEN is read as a last resort,
+	// for development.
+	Token     string `yaml:"token"`
+	TokenFile string `yaml:"token_file"`
+	Namespace string `yaml:"namespace"`
+	// CACert verifies Vault's own certificate. Empty uses the system roots.
+	CACert string `yaml:"ca_cert"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -241,6 +288,26 @@ func (c *CoreConfig) Validate() error {
 		return fmt.Errorf("config: auth.allow_anonymous no longer exists and must be removed. " +
 			"CertPilot now requires a sign-in everywhere, including locally: use a local " +
 			"account, or configure auth.jwks_url for an identity provider")
+	}
+
+	// Checked here rather than at start-up, so a typo is a configuration error
+	// on the way in rather than a fall back to the environment — which would
+	// look like it worked until somebody noticed the key was still in an env
+	// var they thought they had removed.
+	switch c.Secrets.KEKProvider {
+	case "", "env":
+	case "file":
+		if c.Secrets.KEKFile == "" {
+			return fmt.Errorf("config: secrets.kek_provider is \"file\" but secrets.kek_file is not set")
+		}
+	case "vault":
+		if c.Secrets.Vault.Address == "" || c.Secrets.Vault.Path == "" {
+			return fmt.Errorf("config: secrets.kek_provider is \"vault\" but secrets.vault.address " +
+				"or secrets.vault.path is not set")
+		}
+	default:
+		return fmt.Errorf("config: secrets.kek_provider %q is not one of env, file, vault",
+			c.Secrets.KEKProvider)
 	}
 
 	if c.Server.IsProduction() {
