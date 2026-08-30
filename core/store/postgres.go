@@ -302,6 +302,33 @@ func (s *PostgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 	).Scan(&cert.ID, &cert.CreatedAt, &cert.UpdatedAt)
 }
 
+// managedOrDefault fills in a management state the caller left blank.
+//
+// The column carries `default 'UNMANAGED'` and a CHECK that refuses anything
+// else, and passing an explicit empty string overrides the default rather than
+// falling back to it — so the CHECK rejects the row and the whole write fails.
+// The same shape as agents.heartbeat_interval_seconds, where an explicit zero
+// overrode `DEFAULT 300` and violated a positive check; see docs/database.md.
+//
+// UNMANAGED is the honest fill-in on all three tables that use it. A discovered,
+// logged or cloud-held certificate that nothing has matched to one CertPilot
+// manages is, precisely, unmanaged.
+func managedOrDefault(state string) string {
+	if strings.TrimSpace(state) == "" {
+		return DiscoveryUnmanaged
+	}
+	return state
+}
+
+// trustedOrDefault does the same for discovery's trust_state, which carries
+// `default 'UNKNOWN'` under the same trap.
+func trustedOrDefault(state string) string {
+	if strings.TrimSpace(state) == "" {
+		return TrustUnknown
+	}
+	return state
+}
+
 // metadataJSON encodes a metadata map for a jsonb column that is NOT NULL.
 // A nil map marshals to `null`, which the column refuses.
 func metadataJSON(m map[string]any) []byte {
@@ -1690,7 +1717,15 @@ func (s *PostgresStore) GetActiveAcknowledgement(ctx context.Context, entityType
 		// treat a real failure as "not acknowledged" and alert anyway.
 		return nil, nil
 	}
-	return a, err
+	if err != nil {
+		// nil, not the half-scanned struct. scanAcknowledgement returns a
+		// non-nil pointer alongside its error, so returning it here handed a
+		// caller an object *and* a failure — and a caller that checked only the
+		// pointer would read a database error as somebody having acknowledged
+		// the alert, which is the one direction this must never fail in.
+		return nil, err
+	}
+	return a, nil
 }
 
 func (s *PostgresStore) ListAcknowledgements(ctx context.Context, entityType, entityID string) ([]*AlertAcknowledgement, error) {
@@ -1958,7 +1993,8 @@ func (s *PostgresStore) CreateDiscoveryResults(ctx context.Context, results []*D
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
 			        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 			RETURNING id, created_at`,
-			r.ScanID, r.Host, r.Port, r.Reachable, nullIfEmpty(r.Error), r.ManagementState, r.TrustState,
+			r.ScanID, r.Host, r.Port, r.Reachable, nullIfEmpty(r.Error),
+			managedOrDefault(r.ManagementState), trustedOrDefault(r.TrustState),
 			r.MatchedCertificateID, nullIfEmpty(r.CommonName), nullIfEmpty(r.SubjectDN), sansJSON,
 			nullIfEmpty(r.IssuerDN), nullIfEmpty(r.SerialNumber), r.NotBefore, r.NotAfter,
 			nullIfEmpty(r.KeyType), r.KeySize, r.IsCA, nullIfEmpty(r.FingerprintSHA256),
@@ -2470,7 +2506,7 @@ func (s *PostgresStore) RecordCTCertificates(ctx context.Context, certs []*CTCer
 			ON CONFLICT (monitor_id, entry_id) DO NOTHING
 			RETURNING id, created_at, first_seen_at`,
 			c.MonitorID, c.EntryID, c.LoggedAt, nullIfEmpty(c.SerialNumber), nullIfEmpty(c.IssuerDN),
-			nullIfEmpty(c.CommonName), sansJSON, c.NotBefore, c.NotAfter, c.ManagementState,
+			nullIfEmpty(c.CommonName), sansJSON, c.NotBefore, c.NotAfter, managedOrDefault(c.ManagementState),
 			c.MatchedCertificateID, c.IsPrecertificate)
 
 		err = row.Scan(&c.ID, &c.CreatedAt, &c.FirstSeenAt)
@@ -2805,8 +2841,25 @@ func (s *PostgresStore) UpsertCloudCertificates(ctx context.Context, certs []*Cl
 				key_type = excluded.key_type, key_size = excluded.key_size,
 				fingerprint_sha256 = excluded.fingerprint_sha256,
 				certificate_pem = excluded.certificate_pem,
-				management_state = excluded.management_state,
-				matched_certificate_id = excluded.matched_certificate_id,
+				-- An import survives the next sync.
+				--
+				-- The provider goes on reporting the certificate as unmanaged,
+				-- because the provider has no idea it was adopted — so writing
+				-- excluded.management_state straight through reverted every
+				-- adopted certificate to UNMANAGED on the following sweep, six
+				-- hours later, and it reappeared as an unmanaged finding for
+				-- ever. The in-memory store had always preserved this, which is
+				-- exactly why nothing noticed: cloud_test.go called
+				-- NewMemoryStore directly and had never run against a database.
+				management_state = CASE
+					WHEN public.cloud_certificates.is_imported THEN 'MANAGED'
+					ELSE excluded.management_state END,
+				-- Likewise the link to what it was adopted as. coalesce and not
+				-- excluded-wins: the provider never supplies this, so letting it
+				-- win means letting NULL win.
+				matched_certificate_id = coalesce(
+					public.cloud_certificates.matched_certificate_id,
+					excluded.matched_certificate_id),
 				renewal_mode = excluded.renewal_mode, will_renew = excluded.will_renew,
 				attached = excluded.attached, attached_to = excluded.attached_to,
 				findings = excluded.findings, last_seen_at = excluded.last_seen_at,
@@ -2816,7 +2869,7 @@ func (s *PostgresStore) UpsertCloudCertificates(ctx context.Context, certs []*Cl
 			nullIfEmpty(c.CommonName), nullIfEmpty(c.SubjectDN), nullIfEmpty(c.IssuerDN),
 			nullIfEmpty(c.SerialNumber), sansJSON, c.NotBefore, c.NotAfter,
 			nullIfEmpty(c.KeyType), c.KeySize, nullIfEmpty(c.FingerprintSHA256),
-			nullIfEmpty(c.CertificatePEM), c.ManagementState, c.MatchedCertificateID,
+			nullIfEmpty(c.CertificatePEM), managedOrDefault(c.ManagementState), c.MatchedCertificateID,
 			nullIfEmpty(c.RenewalMode), c.WillRenew, c.Attached, attachedToJSON, findingsJSON,
 			c.LastSeenAt)
 

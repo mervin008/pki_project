@@ -47,7 +47,7 @@ Six Go modules in a workspace (`go.work`, Go 1.26.6) plus a Vue frontend.
 | `gateways/{selfsigned,acme,vault}/` | CA adapters, each its own module and process, speaking one gRPC contract |
 | `agent/` | Host agent: generates keys locally, sends CSRs, installs and reloads |
 | `frontend/` | Vue 3 + Vite + Tailwind 4 + Pinia |
-| `migrations/` | 34 numbered `.sql` files, applied by `certpilot-core --migrate` |
+| `migrations/` | 35 numbered `.sql` files, applied by `certpilot-core --migrate` |
 | `docs/` | Written, current, and worth reading |
 
 **The API reference is published as a separate site** from
@@ -271,6 +271,13 @@ and screenshotting has caught real defects that reading the code did not
 (uncoloured severity cells losing a CSS specificity fight, a red chip labelled
 "ISSUED", sentences rendered in an uppercase tracked label style).
 
+**Every store test runs against both implementations**, enforced by
+`TestStoreTestsRunAgainstBothImplementations` in `preflight_test.go`. Building a
+`MemoryStore` directly in a store test is a failure with a short allow-list —
+`discovery_test.go` and `cloud_test.go` did it for a year and hid four defects,
+including an adopted cloud certificate silently reverting to unmanaged on every
+sync while a test called `TestImportSurvivesTheNextSync` passed.
+
 **The four store defect classes**, all found the hard way, all worth checking
 when touching the store: a Go constant a CHECK constraint refuses; a model field
 a writer silently drops; empty string versus NULL; a parameter PostgreSQL types
@@ -358,7 +365,6 @@ need a container runtime.
 - The KEK is held in the core's memory. It can be loaded from a file or from
   Vault, but delegated unwrapping (transit/KMS) needs a `CPS2` envelope.
 - Deployment waves are per certificate; two rollouts do not coordinate.
-- Discovery, CT and cloud-sync tables are thinly covered by the conformance suite.
 - Docker assets were fixed but never built — no container runtime on this machine.
 
 ---

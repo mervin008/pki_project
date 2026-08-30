@@ -298,6 +298,17 @@ func (h *CloudHandler) ListCertificates(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
 
+	// Validated rather than passed through. connection_id lands in a uuid
+	// column, so a value that is not one makes PostgreSQL refuse the whole
+	// query — which arrived as a 500 carrying the raw driver error, telling the
+	// caller the column type and the SQLSTATE for what is a plain typo.
+	if raw := c.Query("connection_id"); raw != "" && !isUUID(raw) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "connection_id must be a uuid",
+		})
+		return
+	}
+
 	filter := store.CloudCertificateFilter{
 		ConnectionID:    c.Query("connection_id"),
 		ManagementState: strings.ToUpper(c.Query("management_state")),
