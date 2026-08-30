@@ -28,8 +28,21 @@ type CAAuthority struct {
 	OCSPResponderURL        string     `json:"ocsp_responder_url,omitempty"`
 	IsCRLFresh              bool       `json:"is_crl_fresh"`
 	CRLLastChecked          *time.Time `json:"crl_last_checked,omitempty"`
-	IsOCSPResponsive        bool       `json:"is_ocsp_responsive"`
-	OCSPLastChecked         *time.Time `json:"ocsp_last_checked,omitempty"`
+	// IsOCSPResponsive means a verified answer was obtained, not that an HTTP
+	// request succeeded. Before migration 033 it meant the latter, which any
+	// web server at that address could satisfy.
+	IsOCSPResponsive bool       `json:"is_ocsp_responsive"`
+	OCSPLastChecked  *time.Time `json:"ocsp_last_checked,omitempty"`
+	// OCSPStatus is what the responder said about this CA certificate: GOOD,
+	// REVOKED or UNKNOWN. Empty means never asked, which is not the same as
+	// UNKNOWN — that is the responder disclaiming knowledge of a certificate it
+	// ought to know about.
+	OCSPStatus    string     `json:"ocsp_status,omitempty"`
+	OCSPRevokedAt *time.Time `json:"ocsp_revoked_at,omitempty"`
+	// OCSPLastError says why the last check produced no verified answer. "The
+	// responder is unreachable" and "something answered and it was not the CA"
+	// are different problems, and a boolean cannot tell them apart.
+	OCSPLastError string `json:"ocsp_last_error,omitempty"`
 	CertificatesIssuedCount int64      `json:"certificates_issued_count"`
 	AlertThresholds         string     `json:"alert_thresholds,omitempty"` // JSON string
 	LastAlertSentAt         *time.Time `json:"last_alert_sent_at,omitempty"`

@@ -9,6 +9,7 @@ What CertPilot protects, how, and what it does not protect.
 - [Authorization](#authorization)
 - [Transport](#transport)
 - [Audit](#audit)
+- [Revocation checking](#revocation-checking)
 - [Known gaps](#known-gaps)
 
 Report vulnerabilities per [SECURITY.md](../SECURITY.md).
@@ -31,6 +32,7 @@ high-value target by construction.
 | A compromised agent host | An agent can request certificates only for names an operator granted it in advance, and only its own |
 | Network interception | Core↔gateway is mutual TLS 1.3; agent↔core is Ed25519-signed over HTTPS |
 | Replaying a captured agent request | The core records the signatures it has accepted and refuses a repeat on the endpoints where one changes something — issuance and claiming work |
+| An issuing CA revoked by its parent | Every health sweep asks that CA's OCSP responder and verifies the signature on the answer. A revoked CA is reported critical regardless of how much life it has left |
 | A leaked wall-display token | `GET` only, viewer role, never private keys, revocable, and its last use is recorded |
 | Tampering with the audit log | Every entry is chained with a keyed tag. The key is derived from `CERTPILOT_KEK` and never stored in the database, so a database-only attacker can alter a row but cannot forge a tag that agrees with it |
 
@@ -415,6 +417,53 @@ pruned chain is not an intact one.
 
 ---
 
+## Revocation checking
+
+Every CA health sweep asks whether the CA certificate **itself** has been
+revoked, and believes the answer only when it is signed.
+
+The OCSP URL in a certificate's authority information access extension is the
+responder for *that* certificate, run by the authority above it — so for an
+intermediate this question is "has my parent revoked me". That is the
+highest-consequence fact about an issuing CA: everything it ever signed becomes
+untrustworthy the moment it is revoked, with none of the warning that expiry
+gives. Nothing in CertPilot could see it before.
+
+[`pkg/revocation`](../pkg/revocation) builds a real OCSP request and verifies
+the response, which checks three things a fetch cannot:
+
+- it is signed by the issuing CA, or by a responder the issuer delegated to with
+  the `OCSPSigning` extended key usage
+- the signature is valid
+- the response is about **the certificate that was asked about**, not some other
+  one
+
+Then freshness, because a signature keeps verifying long after the statement
+stops being true: a "good" response captured before a revocation would otherwise
+stay convincing for ever. `thisUpdate` must be in the past and `nextUpdate`, when
+present, in the future. Its absence is not staleness — RFC 6960 says that means
+newer information is always available, which is what an on-demand responder does.
+
+**What this replaced.** A `GET` to the responder's base URL with no OCSP request
+in it, counted as healthy if the status code was under 500. A real responder
+answers that with 400, so `is_ocsp_responsive` read healthy for any web server
+reachable at the address — a captive portal, a proxy error page, a host
+repurposed years ago. It reported on reachability and was displayed as though it
+reported on revocation.
+
+A failed check never clears a recorded revocation. A responder going down does
+not un-revoke a CA, and the status is re-applied on every sweep rather than
+recomputed from expiry — otherwise a known-revoked CA quietly returns to
+`HEALTHY` the moment its responder blips.
+
+The request's issuer-name hash is SHA-1, and deliberately: it identifies the
+issuer inside the request and authenticates nothing. RFC 6960 defines it, and
+responders index by it, so a SHA-256 request is widely answered "unknown" —
+which would look exactly like a revocation problem. The security of the exchange
+rests entirely on the signature over the response.
+
+---
+
 ## Known gaps
 
 Listed because a security document that only lists strengths is marketing.
@@ -426,9 +475,6 @@ from any point forward, or truncate the newest entries and leave something
 internally consistent. Detecting either needs the head tag published somewhere
 append-only — a second system, an object-lock bucket, a printed page — on a
 schedule. Not built.
-
-**The OCSP check is a bare GET.** It records whether a responder answered, not
-a parsed and verified OCSP response with a validated signature.
 
 **Key Vault and F5 deployers are unit-tested only.** Written to their published
 APIs; never run against a real vault or appliance.

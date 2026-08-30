@@ -47,7 +47,7 @@ Six Go modules in a workspace (`go.work`, Go 1.26.6) plus a Vue frontend.
 | `gateways/{selfsigned,acme,vault}/` | CA adapters, each its own module and process, speaking one gRPC contract |
 | `agent/` | Host agent: generates keys locally, sends CSRs, installs and reloads |
 | `frontend/` | Vue 3 + Vite + Tailwind 4 + Pinia |
-| `migrations/` | 32 numbered `.sql` files, applied by `certpilot-core --migrate` |
+| `migrations/` | 33 numbered `.sql` files, applied by `certpilot-core --migrate` |
 | `docs/` | Written, current, and worth reading |
 
 **The API reference is published as a separate site** from
@@ -164,6 +164,16 @@ the certificate still answers handshakes — the schema enforces that `status =
 'REVOKED'` and `revoked_at is not null` agree. `DELETE` now refuses a live
 certificate and points at revoke; `?forget=true` is the deliberate override for
 a certificate you want to stop tracking while it stays live.
+
+**The CA health sweep asks whether each CA has been revoked, and verifies the
+signature.** The OCSP URL in a certificate's AIA is the *parent's* responder, so
+for an intermediate the question is "has my parent revoked me" —
+`pkg/revocation` builds a real request and `ocsp.ParseResponseForCert` checks the
+signature, the delegation, and that the answer is about the right certificate.
+A revoked CA is forced to `CRITICAL` on every sweep from the *recorded* status,
+not from the check's own result: `CheckCA` recomputes status from expiry each
+time, so keying off the result let a known-revoked CA return to `HEALTHY` the
+moment its responder blipped. A failed check never clears a recorded revocation.
 
 **A replayed agent request is refused, and the signature is the nonce.** Ed25519
 is deterministic, so an identical request carries an identical signature; the
@@ -318,7 +328,6 @@ need a container runtime.
 
 - The audit chain has no external anchor — an attacker holding both the
   database and the KEK can rewrite it wholesale, or truncate the newest entries.
-- OCSP checking is a bare GET, not a signed-response validation.
 - Key Vault and F5 deployers are unit-tested only.
 - The KEK lives in an environment variable.
 - Deployment ordering is not expressible.

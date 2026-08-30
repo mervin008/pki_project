@@ -501,7 +501,8 @@ func caColumns(includePEM bool) string {
 		fingerprint_sha256, ` + pem + `, parent_ca_id, coalesce(crl_distribution_url, ''),
 		coalesce(ocsp_responder_url, ''), coalesce(is_crl_fresh, false), crl_last_checked,
 		coalesce(is_ocsp_responsive, false),
-		ocsp_last_checked, coalesce(certificates_issued_count, 0),
+		ocsp_last_checked, coalesce(ocsp_status, ''), ocsp_revoked_at,
+		coalesce(ocsp_last_error, ''), coalesce(certificates_issued_count, 0),
 		coalesce(alert_thresholds, '[]'::jsonb),
 		last_alert_sent_at, last_alert_threshold, status, ca_account_id,
 		owner_team, owner_email,
@@ -517,7 +518,8 @@ func scanCAAuthority(row pgx.Row) (*CAAuthority, error) {
 		&ca.NotBefore, &ca.NotAfter, &ca.DaysRemaining, &ca.KeyType, &ca.KeySize,
 		&ca.FingerprintSHA256, &ca.CertificatePEM, &ca.ParentCAID, &ca.CRLDistributionURL,
 		&ca.OCSPResponderURL, &ca.IsCRLFresh, &ca.CRLLastChecked, &ca.IsOCSPResponsive,
-		&ca.OCSPLastChecked, &ca.CertificatesIssuedCount, &alertsJSON,
+		&ca.OCSPLastChecked, &ca.OCSPStatus, &ca.OCSPRevokedAt, &ca.OCSPLastError,
+		&ca.CertificatesIssuedCount, &alertsJSON,
 		&ca.LastAlertSentAt, &ca.LastAlertThreshold, &ca.Status, &ca.CAAccountID,
 		&ca.OwnerTeam, &ca.OwnerEmail,
 		&tagsJSON, &ca.Notes, &ca.Source, &ca.LastSeenAt, &ca.CreatedAt, &ca.UpdatedAt,
@@ -678,7 +680,9 @@ func (s *PostgresStore) UpdateCAAuthority(ctx context.Context, ca *CAAuthority) 
 			last_alert_sent_at = $22, last_alert_threshold = $23,
 			status = $24, ca_account_id = $25, tags = $26, notes = $27,
 			owner_team = $28, owner_email = $29,
-			source = $30, last_seen_at = $31, updated_at = now()
+			source = $30, last_seen_at = $31,
+			ocsp_status = $32, ocsp_revoked_at = $33, ocsp_last_error = $34,
+			updated_at = now()
 		WHERE id = $1
 	`
 	if strings.TrimSpace(ca.Source) == "" {
@@ -694,6 +698,11 @@ func (s *PostgresStore) UpdateCAAuthority(ctx context.Context, ca *CAAuthority) 
 		ca.LastAlertSentAt, ca.LastAlertThreshold,
 		ca.Status, ca.CAAccountID, jsonbOrNil(ca.Tags), ca.Notes,
 		ca.OwnerTeam, ca.OwnerEmail, ca.Source, ca.LastSeenAt,
+		// nullIfEmpty because ocsp_status carries a CHECK that refuses the
+		// empty string. "Never asked" is NULL, and it is a different fact from
+		// UNKNOWN — which is the responder disclaiming knowledge of a
+		// certificate it ought to know about.
+		nullIfEmpty(ca.OCSPStatus), ca.OCSPRevokedAt, nullIfEmpty(ca.OCSPLastError),
 	)
 	return err
 }

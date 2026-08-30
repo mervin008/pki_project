@@ -53,7 +53,18 @@ export const useCasStore = defineStore('cas', () => {
   const byUrgency = computed(() =>
     [...authorities.value].sort((a, b) => {
       const bySeverity = compareSeverity(caSeverity(a.status), caSeverity(b.status))
-      return bySeverity !== 0 ? bySeverity : a.days_remaining - b.days_remaining
+      if (bySeverity !== 0) return bySeverity
+
+      // A revoked CA outranks one that is merely close to expiring, even one
+      // closer. Days remaining is the wrong comparison for it: it is not 729
+      // days away from being a problem, it is a problem now — everything it
+      // ever signed stopped being trustworthy the moment its parent revoked
+      // it. Sorting it by expiry put it below a CA with 18 days left.
+      const aRevoked = a.ocsp_status === 'REVOKED'
+      const bRevoked = b.ocsp_status === 'REVOKED'
+      if (aRevoked !== bRevoked) return aRevoked ? -1 : 1
+
+      return a.days_remaining - b.days_remaining
     }),
   )
 

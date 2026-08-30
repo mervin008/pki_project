@@ -305,10 +305,35 @@ const worst = computed<Severity>(() => {
 
             <div>
               <dt class="label-micro">Revocation</dt>
-              <dd v-if="ca.crl_distribution_url" class="ca-fact-value">
+              <!-- Revoked outranks everything else this cell could say. A CA
+                   revoked by the authority above it makes every certificate it
+                   ever signed untrustworthy, and CRL freshness is not the
+                   headline next to that. -->
+              <!-- The severity class goes on a span, not on the dd.
+                   `.ca-fact-value` sets a colour and is unlayered scoped CSS,
+                   while the severity utilities live in @layer components — and
+                   a layered rule loses to an unlayered one whatever its
+                   specificity, so the tripled class does not save it. Put on
+                   the dd this rendered grey, which is the same defect the
+                   comment above those utilities describes. Found by
+                   screenshotting it. -->
+              <dd v-if="ca.ocsp_status === 'REVOKED'" class="ca-fact-value">
+                <span class="sev-critical">REVOKED</span>
+                <span v-if="ca.ocsp_revoked_at" class="ca-fact-note">
+                  {{ formatDate(ca.ocsp_revoked_at) }}
+                </span>
+              </dd>
+              <dd v-else-if="ca.crl_distribution_url" class="ca-fact-value">
                 <span :class="ca.is_crl_fresh ? '' : 'sev-warning'">
                   CRL {{ ca.is_crl_fresh ? 'fresh' : 'stale' }}
                 </span>
+                <!-- Only shown once there is something to say. A responder
+                     that has never been asked is not a responder that failed. -->
+                <span
+                  v-if="ca.ocsp_responder_url && ca.ocsp_last_checked && !ca.is_ocsp_responsive"
+                  class="ca-fact-note sev-warning"
+                  :title="ca.ocsp_last_error"
+                >OCSP unanswered</span>
               </dd>
               <!-- Distinct from "stale": a CA that publishes no CRL cannot have
                    a stale one, and conflating the two invents a problem. -->
@@ -624,6 +649,15 @@ const worst = computed<Severity>(() => {
   font-size: var(--fs-small);
   color: var(--text-secondary);
   margin-top: 0.1rem;
+}
+
+/* A qualifier on the fact above it — when a CA was revoked, or that the
+   responder did not answer. Quieter than the fact so the row still reads at a
+   glance, but present, because both are things somebody has to act on. */
+.ca-fact-note {
+  margin-left: 0.35rem;
+  font-size: var(--fs-micro);
+  color: var(--text-muted);
 }
 
 .ca-link {
