@@ -763,3 +763,107 @@ func sampleAuthority(name, caType string) *CAAuthority {
 		Status:            "HEALTHY",
 	}
 }
+
+// ── Agent replay guard ──────────────────────────────────
+
+// The claim must be atomic, and both implementations must agree on what atomic
+// means. Two copies of one captured request can reach two replicas in the same
+// millisecond; a read-then-write lets both through, and on the endpoint that
+// issues certificates that is a second certificate.
+func TestAnAgentRequestSignatureIsClaimedOnce(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		agent := sampleAgentFor(t, s, "replay-guard")
+		expires := time.Now().Add(5 * time.Minute)
+
+		fresh, err := s.ClaimAgentRequestSignature(ctx, agent, []byte("a-signature-digest"), expires)
+		if err != nil {
+			t.Fatalf("first claim: %v", err)
+		}
+		if !fresh {
+			t.Fatal("the first time a signature is seen it must be accepted")
+		}
+
+		again, err := s.ClaimAgentRequestSignature(ctx, agent, []byte("a-signature-digest"), expires)
+		if err != nil {
+			t.Fatalf("second claim: %v", err)
+		}
+		if again {
+			t.Fatal("a signature already seen must be refused; this is the whole guard")
+		}
+	})
+}
+
+// The same bytes from a different agent are a different request. Keying on the
+// digest alone would let one agent's traffic block another's.
+func TestAgentRequestSignaturesAreScopedToTheAgent(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		first := sampleAgentFor(t, s, "replay-scope-a")
+		second := sampleAgentFor(t, s, "replay-scope-b")
+		expires := time.Now().Add(5 * time.Minute)
+
+		if _, err := s.ClaimAgentRequestSignature(ctx, first, []byte("same-digest"), expires); err != nil {
+			t.Fatal(err)
+		}
+		fresh, err := s.ClaimAgentRequestSignature(ctx, second, []byte("same-digest"), expires)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !fresh {
+			t.Fatal("one agent's signature must not block another's")
+		}
+	})
+}
+
+func TestExpiredAgentRequestSignaturesAreSwept(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		agent := sampleAgentFor(t, s, "replay-sweep")
+
+		if _, err := s.ClaimAgentRequestSignature(ctx, agent, []byte("stale"),
+			time.Now().Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ClaimAgentRequestSignature(ctx, agent, []byte("live"),
+			time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+
+		removed, err := s.SweepAgentRequestSignatures(ctx, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if removed != 1 {
+			t.Fatalf("expected 1 expired row swept, got %d", removed)
+		}
+
+		// The live one is still remembered.
+		if fresh, err := s.ClaimAgentRequestSignature(ctx, agent, []byte("live"),
+			time.Now().Add(time.Hour)); err != nil || fresh {
+			t.Errorf("the unexpired row was swept as well (fresh=%v err=%v)", fresh, err)
+		}
+	})
+}
+
+// sampleAgentFor creates an agent and returns its id.
+//
+// A real row rather than an invented id, because the replay table references
+// agents(id): an in-memory store that accepted a dangling reference would agree
+// with itself while PostgreSQL refused the insert. That is the shape of every
+// class-B defect this suite exists to find.
+func sampleAgentFor(t *testing.T, s Store, name string) string {
+	t.Helper()
+	agent := &Agent{
+		Name:      name,
+		Hostname:  name + ".example.test",
+		Platform:  "linux/amd64",
+		PublicKey: "-----BEGIN PUBLIC KEY-----\n" + name + "\n-----END PUBLIC KEY-----",
+		KeyID:     "key-" + name,
+		Status:    AgentActive,
+	}
+	if err := s.CreateAgent(context.Background(), agent); err != nil {
+		t.Fatalf("CreateAgent: %v", err)
+	}
+	return agent.ID
+}

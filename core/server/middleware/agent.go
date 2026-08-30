@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,6 +27,11 @@ const (
 	AuthMethodAgent = "agent"
 	// CodeAgentRevoked marks the one 403 an agent must never retry.
 	CodeAgentRevoked = "agent_revoked"
+	// CodeAgentReplay marks a request the core has already seen. Distinct from
+	// an ordinary 401 because the agent's response should be different: its own
+	// retries sign afresh and never collide, so seeing this means something
+	// else is re-sending its traffic.
+	CodeAgentReplay = "agent_replay"
 )
 
 // maxAgentBody bounds a signed request.
@@ -138,6 +144,46 @@ func AgentAuth(st store.Store) gin.HandlerFunc {
 			return
 		}
 
+		// Replay, last of all.
+		//
+		// After the signature, because writing a row before verifying one would
+		// let anybody who can reach this endpoint fill the table with unsigned
+		// garbage — a replay defence turned into a way to exhaust the disk.
+		// After the status check, because a revoked agent must be told it is
+		// revoked whatever else is true of its request; being told "you already
+		// sent this" leaves it retrying a withdrawn credential for ever.
+		//
+		// The signature is the nonce. Ed25519 is deterministic, so two
+		// identical requests carry identical signatures, and a signature covers
+		// the method, path, timestamp and body it was made for. That is the
+		// uniqueness a separate nonce header would have given, without a
+		// protocol version every deployed agent would have to catch up with.
+		if replayGuarded(c.Request.URL.Path) {
+			digest := sha256.Sum256([]byte(signature))
+			fresh, err := st.ClaimAgentRequestSignature(c.Request.Context(), agentID, digest[:],
+				time.Unix(timestamp, 0).Add(agentauth.DefaultTolerance))
+			if err != nil {
+				// Fail closed. Being unable to tell a first request from a
+				// replay is not a reason to assume the friendlier of the two on
+				// the endpoint that issues certificates.
+				slog.Error("could not check an agent request for replay; refusing it",
+					"agent", agentID, "path", c.Request.URL.Path, "error", err)
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+					"error": "this request could not be checked against recent ones and was not accepted",
+				})
+				return
+			}
+			if !fresh {
+				slog.Warn("refused a replayed agent request",
+					"agent", agentID, "path", c.Request.URL.Path, "ip", c.ClientIP())
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+					"error": "this request has already been made; it was not accepted a second time",
+					"code":  CodeAgentReplay,
+				})
+				return
+			}
+		}
+
 		c.Set(ContextAgentID, agent.ID)
 		c.Set(ContextAuthMethod, AuthMethodAgent)
 		c.Next()
@@ -150,3 +196,44 @@ func AgentAuth(st store.Store) gin.HandlerFunc {
 // commonest cause of a signature that will not verify, and an agent that can
 // see the difference can say so instead of reporting "unauthorized" forever.
 func AgentClock() time.Time { return time.Now() }
+
+// replayExempt lists the agent endpoints where refusing a repeat would be
+// wrong, and everything not listed is guarded.
+//
+// The list is exemptions rather than opt-ins on purpose. An agent route added
+// tomorrow is protected without anybody remembering to protect it, which is the
+// only way this stays true — the same reasoning that keeps display tokens
+// refused by default on everything but GET.
+//
+// Why exempt anything at all: a signature covers a one-second timestamp, so two
+// genuinely distinct requests with identical bodies in the same second are
+// byte-identical and the core cannot tell them apart. On a report that is the
+// wrong answer — an agent retrying a heartbeat after a network timeout re-sends
+// the request it already signed, and refusing it turns a recovered blip into a
+// failure. On an endpoint that issues a certificate it is the right answer,
+// because the cost of being wrong runs the other way: a second certificate
+// against the CA's rate limit, into the inventory, and for a public CA into the
+// CT logs.
+var replayExempt = map[string]struct{}{
+	// Idempotent reports. Replaying one re-states something already true.
+	"/api/v1/agent/heartbeat":          {},
+	"/api/v1/agent/inventory":          {},
+	"/api/v1/agent/installations":      {},
+	"/api/v1/agent/deployments/result": {},
+}
+
+func replayGuarded(path string) bool {
+	_, exempt := replayExempt[path]
+	return !exempt
+}
+
+// ReplayExemptPaths exposes the exemption list so a test can hold it against
+// the routes that actually exist. Returns a copy: an exemption added at runtime
+// would be an exemption nobody reviewed.
+func ReplayExemptPaths() map[string]struct{} {
+	out := make(map[string]struct{}, len(replayExempt))
+	for path := range replayExempt {
+		out[path] = struct{}{}
+	}
+	return out
+}

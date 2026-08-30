@@ -47,7 +47,7 @@ Six Go modules in a workspace (`go.work`, Go 1.26.6) plus a Vue frontend.
 | `gateways/{selfsigned,acme,vault}/` | CA adapters, each its own module and process, speaking one gRPC contract |
 | `agent/` | Host agent: generates keys locally, sends CSRs, installs and reloads |
 | `frontend/` | Vue 3 + Vite + Tailwind 4 + Pinia |
-| `migrations/` | 31 numbered `.sql` files, applied by `certpilot-core --migrate` |
+| `migrations/` | 32 numbered `.sql` files, applied by `certpilot-core --migrate` |
 | `docs/` | Written, current, and worth reading |
 
 **The API reference is published as a separate site** from
@@ -164,6 +164,16 @@ the certificate still answers handshakes — the schema enforces that `status =
 'REVOKED'` and `revoked_at is not null` agree. `DELETE` now refuses a live
 certificate and points at revoke; `?forget=true` is the deliberate override for
 a certificate you want to stop tracking while it stays live.
+
+**A replayed agent request is refused, and the signature is the nonce.** Ed25519
+is deterministic, so an identical request carries an identical signature; the
+core stores the ones it has accepted (`agent_request_signatures`) and refuses a
+repeat. No protocol change, so deployed agents are unaffected. Guarded by
+default with an *exemption* list in `middleware/agent.go` — heartbeat, inventory,
+installations, deployments/result — because a one-second timestamp means an
+agent's own retry is byte-identical to a replay, and refusing that on a report
+turns a recovered blip into a failure. Checked after the revocation check, so a
+withdrawn credential is always told so.
 
 **`key_custody` on a certificate says who holds the private key** — `CERTPILOT`,
 `AGENT`, or `EXTERNAL`. Provenance (`discovered_via`) cannot answer that
@@ -308,7 +318,6 @@ need a container runtime.
 
 - The audit chain has no external anchor — an attacker holding both the
   database and the KEK can rewrite it wholesale, or truncate the newest entries.
-- No agent nonce store (replay window bounded by timestamp only).
 - OCSP checking is a bare GET, not a signed-response validation.
 - Key Vault and F5 deployers are unit-tested only.
 - The KEK lives in an environment variable.

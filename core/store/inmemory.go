@@ -27,18 +27,21 @@ type MemoryStore struct {
 	mu             sync.RWMutex
 	auditChain     *AuditChainer
 	auditChainHead int64
-	certificates   map[string]*Certificate
-	caAuthorities  map[string]*CAAuthority
-	caAccounts     map[string]*CAAccount
-	targets        map[string]*DeploymentTarget
-	policies       map[string]*Policy
-	displayTokens  map[string]*DisplayToken
-	metadataFields map[string]*MetadataField
-	users          map[string]*User
-	sessions       map[string]*Session
-	passwordHashes map[string]string
-	loginFailures  map[string]*loginState
-	notifChannels  map[string]*NotificationChannel
+	// agentSignatures is the replay guard, mirroring the table PostgreSQL uses.
+	// Present here so the conformance suite can hold both to the same rule.
+	agentSignatures map[agentSignatureKey]time.Time
+	certificates    map[string]*Certificate
+	caAuthorities   map[string]*CAAuthority
+	caAccounts      map[string]*CAAccount
+	targets         map[string]*DeploymentTarget
+	policies        map[string]*Policy
+	displayTokens   map[string]*DisplayToken
+	metadataFields  map[string]*MetadataField
+	users           map[string]*User
+	sessions        map[string]*Session
+	passwordHashes  map[string]string
+	loginFailures   map[string]*loginState
+	notifChannels   map[string]*NotificationChannel
 	// acks is append-only, newest last. Who acknowledged what and when is the
 	// record an incident review reads, so an acknowledgement is never
 	// overwritten by the next one.
@@ -3029,6 +3032,39 @@ func (m *MemoryStore) ConsumeAgentEnrolToken(ctx context.Context, id string, now
 	t.Uses++
 	t.UpdatedAt = time.Now()
 	return true, nil
+}
+
+// agentSignature is one seen request, keyed the way the database keys it.
+type agentSignatureKey struct {
+	agentID string
+	hash    string
+}
+
+func (m *MemoryStore) ClaimAgentRequestSignature(ctx context.Context, agentID string, signatureHash []byte, expiresAt time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.agentSignatures == nil {
+		m.agentSignatures = make(map[agentSignatureKey]time.Time)
+	}
+	key := agentSignatureKey{agentID: agentID, hash: string(signatureHash)}
+	if _, seen := m.agentSignatures[key]; seen {
+		return false, nil
+	}
+	m.agentSignatures[key] = expiresAt
+	return true, nil
+}
+
+func (m *MemoryStore) SweepAgentRequestSignatures(ctx context.Context, now time.Time) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var removed int64
+	for key, expires := range m.agentSignatures {
+		if !expires.After(now) {
+			delete(m.agentSignatures, key)
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 func (m *MemoryStore) RevokeAgentEnrolToken(ctx context.Context, id string, revokedBy *string) error {

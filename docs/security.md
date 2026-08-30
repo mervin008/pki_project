@@ -30,6 +30,7 @@ high-value target by construction.
 | A compromised gateway host | A gateway holds one CA account's credentials for one call. It cannot read the database or enumerate certificates |
 | A compromised agent host | An agent can request certificates only for names an operator granted it in advance, and only its own |
 | Network interception | Core↔gateway is mutual TLS 1.3; agent↔core is Ed25519-signed over HTTPS |
+| Replaying a captured agent request | The core records the signatures it has accepted and refuses a repeat on the endpoints where one changes something — issuance and claiming work |
 | A leaked wall-display token | `GET` only, viewer role, never private keys, revocable, and its last use is recorded |
 | Tampering with the audit log | Every entry is chained with a keyed tag. The key is derived from `CERTPILOT_KEK` and never stored in the database, so a database-only attacker can alter a row but cannot forge a tag that agrees with it |
 
@@ -256,9 +257,40 @@ certpilot-agent-v1
 Headers: `X-CertPilot-Agent`, `X-CertPilot-Timestamp`, `X-CertPilot-Signature`.
 Tolerance is five minutes.
 
-There is deliberately **no nonce store**. Replay within the tolerance window is
-possible and the requests are idempotent reports; a nonce table would add a
-write per heartbeat across a fleet to prevent a replay that changes nothing.
+**Replay.** A request captured off the wire can be sent again inside the
+tolerance window, and the signature still verifies — so the core remembers the
+signatures it has already accepted and refuses a repeat.
+
+There is no new header and no protocol version. Ed25519 is deterministic, so two
+identical requests carry identical signatures, and a signature already covers
+the method, path, timestamp and body it was made for. Storing it *is* the nonce
+store, and it works with agents already deployed. The row is written only after
+the signature verifies: writing first would let anybody who can reach the
+endpoint fill the table with unsigned garbage.
+
+It is checked after the revocation check, so a withdrawn credential is always
+told it was withdrawn rather than told it repeated itself — otherwise the agent
+retries for as long as the host stays up.
+
+**Reports are exempt, and the list is exemptions rather than opt-ins** so that a
+route added tomorrow is guarded without anybody remembering to guard it:
+
+| Endpoint | |
+|:---|:---|
+| `POST /agent/certificates` | **Guarded.** A replay gets a second certificate for the same names — against the CA's rate limit, into the inventory, and for a public CA into the CT logs |
+| `POST /agent/deployments/claim` | **Guarded.** A replay leases the same work twice |
+| `heartbeat`, `inventory`, `installations`, `deployments/result` | Exempt. Idempotent reports |
+
+The exemptions exist because a signature covers a *one-second* timestamp, so two
+genuinely distinct requests with identical bodies in the same second are
+byte-identical and the core cannot tell them apart. On a report, refusing the
+second is the wrong answer: an agent retrying after a network timeout re-sends
+bytes it already signed, and refusing turns a recovered blip into a failure. On
+an endpoint that issues a certificate the cost runs the other way, so it is
+refused.
+
+Rows are swept on the fleet monitor's tick once their window has closed, at
+which point the timestamp check refuses the request on its own.
 
 ---
 
@@ -394,10 +426,6 @@ from any point forward, or truncate the newest entries and leave something
 internally consistent. Detecting either needs the head tag published somewhere
 append-only — a second system, an object-lock bucket, a printed page — on a
 schedule. Not built.
-
-**No nonce store for agent requests.** Replay inside the five-minute window is
-possible. The requests are idempotent reports, so the impact is a duplicate
-heartbeat.
 
 **The OCSP check is a bare GET.** It records whether a responder answered, not
 a parsed and verified OCSP response with a validated signature.

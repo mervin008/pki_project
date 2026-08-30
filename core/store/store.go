@@ -547,6 +547,18 @@ type Store interface {
 	ConsumeAgentEnrolToken(ctx context.Context, id string, now time.Time) (bool, error)
 	RevokeAgentEnrolToken(ctx context.Context, id string, revokedBy *string) error
 
+	// ClaimAgentRequestSignature records a signature and reports whether this
+	// is the first time it has been seen. False means the request is a replay.
+	//
+	// Atomic for the same reason ConsumeAgentEnrolToken is: two copies of one
+	// captured request can arrive at two replicas in the same millisecond, and
+	// a read-then-write would let both through.
+	ClaimAgentRequestSignature(ctx context.Context, agentID string, signatureHash []byte, expiresAt time.Time) (bool, error)
+	// SweepAgentRequestSignatures drops rows past their expiry. Once the
+	// timestamp window has closed the request is refused on its own, so the row
+	// is no longer protecting anything.
+	SweepAgentRequestSignatures(ctx context.Context, now time.Time) (int64, error)
+
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)

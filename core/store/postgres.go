@@ -3996,6 +3996,30 @@ func (s *PostgresStore) ConsumeAgentEnrolToken(ctx context.Context, id string, n
 	return tag.RowsAffected() == 1, nil
 }
 
+func (s *PostgresStore) ClaimAgentRequestSignature(ctx context.Context, agentID string, signatureHash []byte, expiresAt time.Time) (bool, error) {
+	// ON CONFLICT DO NOTHING rather than a SELECT then an INSERT. Two copies of
+	// one captured request can reach two replicas in the same millisecond, and
+	// with a read-then-write both would find nothing and both would proceed.
+	// Here the primary key decides, and exactly one insert reports a row.
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO public.agent_request_signatures (agent_id, signature_hash, expires_at)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (agent_id, signature_hash) DO NOTHING`, agentID, signatureHash, expiresAt)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (s *PostgresStore) SweepAgentRequestSignatures(ctx context.Context, now time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		"DELETE FROM public.agent_request_signatures WHERE expires_at <= $1", now)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (s *PostgresStore) RevokeAgentEnrolToken(ctx context.Context, id string, revokedBy *string) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE public.agent_enrol_tokens
