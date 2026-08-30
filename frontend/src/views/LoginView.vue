@@ -81,7 +81,7 @@ async function signIn() {
 
       <!-- Nothing is offered before the core has said how it authenticates. A
            button that cannot work is worse than a moment's wait. -->
-      <div v-if="auth.loading" class="login-wait">
+      <div v-if="auth.loading" class="login-wait" role="status">
         <span class="login-bar" />
         <span class="label-micro">Asking the API how to sign in</span>
       </div>
@@ -131,7 +131,12 @@ async function signIn() {
         </template>
       </template>
 
-      <div v-if="failure || auth.error" role="alert" class="login-notice login-notice--error">
+      <div
+        v-if="failure || auth.error"
+        role="alert"
+        aria-live="assertive"
+        class="login-notice login-notice--error"
+      >
         <AlertTriangle class="w-4 h-4 shrink-0 sev-critical" />
         <div>
           <p class="label-rail sev-critical">Sign-in could not start</p>
@@ -147,9 +152,9 @@ async function signIn() {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 100vh;
+  min-height: 100dvh;
   background: var(--ink-page);
-  padding: 1.5rem;
+  padding: var(--sp-loose);
 }
 
 .login-panel {
@@ -160,7 +165,7 @@ async function signIn() {
   padding: 1.75rem;
   display: flex;
   flex-direction: column;
-  gap: 1rem;
+  gap: var(--sp-base);
 }
 
 .login-mark {
@@ -192,7 +197,7 @@ async function signIn() {
 .login-form {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: var(--sp-snug);
 }
 
 .login-field {
@@ -235,6 +240,44 @@ async function signIn() {
   background: var(--line);
 }
 
+.login-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.625rem 1rem;
+  background: var(--signal);
+  color: var(--ink-page);
+  border: 1px solid var(--signal);
+  border-radius: 2px;
+  font-size: var(--fs-small);
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+
+.login-button:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+/* Acknowledges the press. Without it the only feedback that a click landed is
+   the label changing, which arrives a network round trip later — long enough
+   that people submit twice. */
+.login-button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+/*
+ * The secondary action, and it must not look like the primary one.
+ *
+ * This modifier used to be declared *above* `.login-button`. Both selectors are
+ * one class, so source order decided it and the base rule won: single sign-on
+ * rendered as a second filled blue button identical to the password submit,
+ * with no visual hierarchy between the two at all.
+ */
 .login-button--alt {
   background: transparent;
   color: var(--text-primary);
@@ -246,24 +289,9 @@ async function signIn() {
   filter: none;
 }
 
-.login-button {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  width: 100%;
-  padding: 0.625rem 1rem;
-  background: var(--signal);
-  color: var(--ink-page);
-  border: none;
-  border-radius: 2px;
-  font-size: var(--fs-small);
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.login-button:hover:not(:disabled) {
-  filter: brightness(1.1);
+@media (prefers-reduced-motion: reduce) {
+  .login-button { transition: none; }
+  .login-button:active:not(:disabled) { transform: none; }
 }
 
 .login-button:disabled {
@@ -273,23 +301,16 @@ async function signIn() {
 
 .login-notice {
   display: flex;
-  gap: 0.625rem;
+  gap: var(--sp-snug);
   padding: 0.75rem;
-  border: 1px solid var(--sev-warning);
-  background: var(--sev-warning-wash);
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  background: var(--ink-raised);
 }
 
 .login-notice--error {
-  border-color: var(--sev-critical);
+  border-left-color: var(--sev-critical);
   background: var(--sev-critical-wash);
-}
-
-.login-continue {
-  display: inline-block;
-  margin-top: 0.5rem;
-  font-size: var(--fs-small);
-  color: var(--signal);
-  text-decoration: underline;
 }
 
 .login-wait {

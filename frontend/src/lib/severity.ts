@@ -119,12 +119,12 @@ export function compareSeverity(a: Severity, b: Severity): number {
 }
 
 /**
- * Console class for a severity, for the converted views.
+ * Console class for a severity.
  *
- * These resolve to the `--sev-*` tokens in main.css. The daisyUI helpers below
- * are what the not-yet-converted views still use; both read the same palette,
- * so the two halves of the app agree about what critical looks like while the
- * conversion is in progress.
+ * Resolves to the `--sev-*` tokens in main.css. This is now the only way a
+ * severity becomes a colour anywhere in the frontend — the parallel set of
+ * daisyUI helpers that existed during the conversion is gone, so there is no
+ * longer a second palette for a view to pick up by accident.
  */
 export function sevClass(severity: Severity): string {
   return `sev-${severity}`
@@ -157,48 +157,6 @@ export function sevLabel(severity: Severity): string {
       return 'OK'
     default:
       return 'UNKN'
-  }
-}
-
-/** daisyUI badge class for a severity. */
-export function severityBadge(severity: Severity): string {
-  switch (severity) {
-    case 'critical':
-      return 'badge-error'
-    case 'warning':
-      return 'badge-warning'
-    case 'ok':
-      return 'badge-success'
-    default:
-      return 'badge-ghost'
-  }
-}
-
-/** daisyUI text-colour class for a severity. */
-export function severityText(severity: Severity): string {
-  switch (severity) {
-    case 'critical':
-      return 'text-error'
-    case 'warning':
-      return 'text-warning'
-    case 'ok':
-      return 'text-success'
-    default:
-      return 'text-base-content/60'
-  }
-}
-
-/** Border/stripe class, for the severity rail on CA rows. */
-export function severityBorder(severity: Severity): string {
-  switch (severity) {
-    case 'critical':
-      return 'border-error'
-    case 'warning':
-      return 'border-warning'
-    case 'ok':
-      return 'border-success'
-    default:
-      return 'border-base-300'
   }
 }
 
@@ -236,56 +194,69 @@ export function statusLabel(status: string | null | undefined): string {
 }
 
 /**
- * Resolves theme colours to concrete values for chart.js, which cannot consume
- * CSS custom properties.
+ * Resolves theme colours to concrete values for chart.js.
  *
- * Charts previously hardcoded hex values copied from a daisyUI v4 palette, so
- * they stayed light-themed no matter what the rest of the page did. Reading the
- * computed values means one palette follows the theme toggle.
+ * chart.js draws to a canvas and cannot consume CSS custom properties, so every
+ * colour has to be read out as a concrete value first.
+ *
+ * These read the `--sev-*` design tokens — the same ones the tables and chips
+ * use. They previously read daisyUI's `--color-*`, which meant the charts had
+ * their own palette: a slice could be a different red from the row it
+ * summarised, and when daisyUI was removed the variables would have resolved to
+ * nothing and every chart would have drawn in transparent black.
  *
  * Call this from a `watch` on the theme, not once at module load, or the charts
  * keep the palette they were born with.
  */
 export function themePalette(): Record<string, string> {
   const fallback = {
-    success: '#36d399',
-    warning: '#fbbd23',
-    error: '#f87272',
-    info: '#3abff8',
-    primary: '#570df8',
-    secondary: '#f000b8',
-    accent: '#37cdbe',
-    neutral: '#3d4451',
+    ok: '#58a06f',
+    warning: '#ffa726',
+    critical: '#ff4d3d',
+    unknown: '#6b7480',
+    signal: '#5ac8fa',
   }
 
   if (typeof window === 'undefined') return fallback
 
   const styles = getComputedStyle(document.documentElement)
-  const read = (name: string, fb: string) => {
-    const value = styles.getPropertyValue(name).trim()
-    return value || fb
-  }
+  const read = (name: string, fb: string) => styles.getPropertyValue(name).trim() || fb
 
   return {
-    success: read('--color-success', fallback.success),
-    warning: read('--color-warning', fallback.warning),
-    error: read('--color-error', fallback.error),
-    info: read('--color-info', fallback.info),
-    primary: read('--color-primary', fallback.primary),
-    secondary: read('--color-secondary', fallback.secondary),
-    accent: read('--color-accent', fallback.accent),
-    neutral: read('--color-neutral', fallback.neutral),
+    ok: read('--sev-ok', fallback.ok),
+    warning: read('--sev-warning', fallback.warning),
+    critical: read('--sev-critical', fallback.critical),
+    unknown: read('--sev-unknown', fallback.unknown),
+    signal: read('--signal', fallback.signal),
   }
 }
 
 /** Chart colours in severity order: ok, warning, critical, unknown. */
 export function severityPalette(): string[] {
   const p = themePalette()
-  return [p.success, p.warning, p.error, p.neutral]
+  return [p.ok, p.warning, p.critical, p.unknown]
 }
 
-/** A categorical palette for non-severity breakdowns, e.g. certificates per CA. */
+/**
+ * A palette for non-severity breakdowns, e.g. certificates per CA.
+ *
+ * Deliberately not a rainbow. A categorical chart on this product must not
+ * introduce warm hues that read as severity to someone scanning past it, so
+ * this is the signal blue stepped by lightness and nothing else.
+ */
 export function categoricalPalette(): string[] {
   const p = themePalette()
-  return [p.info, p.primary, p.accent, p.secondary, p.success, p.warning]
+  return [
+    p.signal,
+    color(p.signal, 0.75),
+    color(p.signal, 0.55),
+    color(p.signal, 0.4),
+    p.unknown,
+    color(p.unknown, 0.6),
+  ]
+}
+
+/** Fades a colour towards the page ground, for categorical steps. */
+function color(base: string, alpha: number): string {
+  return `color-mix(in srgb, ${base} ${Math.round(alpha * 100)}%, transparent)`
 }

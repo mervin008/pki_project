@@ -3,13 +3,14 @@ import { computed, onMounted, ref } from 'vue'
 import { useApi } from '@/composables/useApi'
 import { useCasStore } from '@/stores/cas'
 import DataState from '@/components/common/DataState.vue'
+import PanelBox from '@/components/ui/PanelBox.vue'
+import Readout from '@/components/ui/Readout.vue'
+import SevChip from '@/components/ui/SevChip.vue'
 import {
   ShieldCheck, Plus, ChevronDown, ChevronRight, Lock, Server, Stamp,
   RotateCw, CircleCheck, CircleX,
 } from 'lucide-vue-next'
-import {
-  caSeverity, severityBadge, severityBorder, severityText, statusLabel,
-} from '@/lib/severity'
+import { caSeverity, sevClass, statusLabel } from '@/lib/severity'
 import { formatDate, formatDateTime, formatDays, truncate } from '@/lib/format'
 import type { CaAuthority } from '@/lib/types'
 
@@ -90,7 +91,7 @@ async function importCA() {
     form.value = blankForm()
     await cas.refresh()
   } catch (err) {
-    // Surfaced in the modal rather than an alert() the operator cannot copy.
+    // Surfaced in the dialog rather than an alert() the operator cannot copy.
     importError.value = err instanceof Error ? err.message : String(err)
   } finally {
     importing.value = false
@@ -116,25 +117,25 @@ async function checkNow(ca: CaAuthority) {
 </script>
 
 <template>
-  <div class="space-y-6">
-    <div class="flex items-center justify-between gap-4 flex-wrap">
-      <p class="text-sm text-base-content/60">
+  <div class="flex flex-col gap-3">
+    <div class="toolbar justify-between">
+      <p class="prose-ui text-[length:var(--fs-small)] text-[color:var(--text-muted)]">
         Certificate authorities under management, most urgent first
       </p>
-      <div class="flex items-center gap-2">
-        <button class="btn btn-ghost btn-sm gap-1.5" :disabled="cas.loading" @click="cas.refresh()">
-          <RotateCw class="w-3.5 h-3.5" :class="cas.loading && 'animate-spin'" />
+      <div class="toolbar">
+        <button class="btn-console" :disabled="cas.loading" @click="cas.refresh()">
+          <RotateCw class="w-3 h-3" :class="cas.loading && 'animate-spin'" />
           Refresh
         </button>
-        <button class="btn btn-primary btn-sm gap-2" @click="showImport = true">
-          <Plus class="w-4 h-4" /> Import CA
+        <button class="btn-console" data-variant="signal" @click="showImport = true">
+          <Plus class="w-3 h-3" /> Import CA
         </button>
       </div>
     </div>
 
-    <div v-if="checkError" role="alert" class="alert alert-error">
-      <CircleX class="w-5 h-5 shrink-0" />
-      <span class="text-sm">{{ checkError }}</span>
+    <div v-if="checkError" role="alert" class="notice" data-tone="critical">
+      <CircleX class="w-4 h-4 notice-icon" />
+      <span>{{ checkError }}</span>
     </div>
 
     <DataState
@@ -143,221 +144,275 @@ async function checkNow(ca: CaAuthority) {
       :loaded="cas.loaded"
       @retry="cas.refresh()"
     >
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
-          <div class="stat-title text-xs">Total CAs</div>
-          <div class="stat-value text-xl tabular-nums">{{ authorities.length }}</div>
-        </div>
-        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
-          <div class="stat-title text-xs">Root</div>
-          <div class="stat-value text-xl tabular-nums">{{ rootCount }}</div>
-        </div>
-        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
-          <div class="stat-title text-xs">Intermediate</div>
-          <div class="stat-value text-xl tabular-nums">{{ intermediateCount }}</div>
-        </div>
-        <div class="stat bg-base-100 rounded-xl border border-base-300 p-4">
-          <div class="stat-title text-xs">Issuing</div>
-          <div class="stat-value text-xl tabular-nums">{{ issuingCount }}</div>
-        </div>
-      </div>
+      <div class="flex flex-col gap-3">
+        <PanelBox label="Hierarchy">
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-3">
+            <Readout :value="authorities.length" label="Total CAs" />
+            <Readout :value="rootCount" label="Root" />
+            <Readout :value="intermediateCount" label="Intermediate" />
+            <Readout :value="issuingCount" label="Issuing" />
+          </div>
+        </PanelBox>
 
-      <div v-if="byUrgency.length" class="space-y-3">
-        <div
-          v-for="ca in byUrgency"
-          :key="ca.id"
-          class="card bg-base-100 border border-base-300 border-l-4"
-          :class="severityBorder(caSeverity(ca.status))"
+        <PanelBox
+          v-if="byUrgency.length"
+          label="Authorities"
+          :note="`${byUrgency.length} MONITORED`"
+          flush
         >
-          <div class="card-body p-4">
-            <div
-              class="flex items-center justify-between gap-3 cursor-pointer"
-              role="button"
-              tabindex="0"
-              @click="toggleExpand(ca.id)"
-              @keydown.enter="toggleExpand(ca.id)"
-              @keydown.space.prevent="toggleExpand(ca.id)"
-            >
-              <div class="flex items-center gap-3 min-w-0">
-                <div class="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
-                  <component :is="typeIcon(ca.ca_type)" class="w-4 h-4 text-primary" />
-                </div>
-                <div class="min-w-0">
-                  <div class="font-bold text-sm truncate">{{ ca.name }}</div>
-                  <div class="text-[11px] text-base-content/60 truncate">
-                    {{ statusLabel(ca.ca_type) }} · {{ ca.key_type }}<template v-if="ca.key_size">-{{ ca.key_size }}</template>
-                  </div>
-                </div>
-              </div>
-              <div class="flex items-center gap-3 shrink-0">
-                <span
-                  class="text-xs font-mono tabular-nums"
-                  :class="severityText(caSeverity(ca.status))"
-                >
-                  {{ formatDays(ca.days_remaining) }}
-                </span>
-                <span class="badge badge-sm" :class="severityBadge(caSeverity(ca.status))">
-                  {{ statusLabel(ca.status) }}
-                </span>
-                <ChevronDown v-if="expandedCa === ca.id" class="w-4 h-4 opacity-50" />
-                <ChevronRight v-else class="w-4 h-4 opacity-50" />
-              </div>
-            </div>
+          <div class="overflow-x-auto">
+            <table class="tbl">
+              <thead>
+                <tr>
+                  <th class="rail"></th>
+                  <th>Authority</th>
+                  <th>Type</th>
+                  <th>Key</th>
+                  <th class="num">Remaining</th>
+                  <th class="num">Issued</th>
+                  <th>State</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <template v-for="ca in byUrgency" :key="ca.id">
+                  <tr
+                    data-clickable="true"
+                    :data-selected="expandedCa === ca.id"
+                    role="button"
+                    tabindex="0"
+                    :aria-expanded="expandedCa === ca.id"
+                    @click="toggleExpand(ca.id)"
+                    @keydown.enter="toggleExpand(ca.id)"
+                    @keydown.space.prevent="toggleExpand(ca.id)"
+                  >
+                    <td class="rail" :class="`sev-bg-${caSeverity(ca.status)}`"></td>
+                    <td class="cell-primary">
+                      <span class="flex items-center gap-2 min-w-0">
+                        <component
+                          :is="typeIcon(ca.ca_type)"
+                          class="w-3.5 h-3.5 shrink-0 text-[color:var(--text-muted)]"
+                        />
+                        <span class="truncate">{{ ca.name }}</span>
+                      </span>
+                    </td>
+                    <td>{{ statusLabel(ca.ca_type) }}</td>
+                    <td>
+                      {{ ca.key_type }}<template v-if="ca.key_size">-{{ ca.key_size }}</template>
+                    </td>
+                    <td class="num" :class="sevClass(caSeverity(ca.status))">
+                      {{ formatDays(ca.days_remaining) }}
+                    </td>
+                    <td class="num">{{ ca.certificates_issued_count }}</td>
+                    <td>
+                      <SevChip
+                        :severity="caSeverity(ca.status)"
+                        :label="statusLabel(ca.status)"
+                      />
+                    </td>
+                    <td class="num">
+                      <ChevronDown
+                        v-if="expandedCa === ca.id"
+                        class="w-3.5 h-3.5 inline text-[color:var(--text-muted)]"
+                      />
+                      <ChevronRight
+                        v-else
+                        class="w-3.5 h-3.5 inline text-[color:var(--text-muted)]"
+                      />
+                    </td>
+                  </tr>
 
-            <div v-if="expandedCa === ca.id" class="mt-4 pt-4 border-t border-base-300 space-y-4">
-              <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
-                <div>
-                  <div class="text-base-content/60 mb-1">Expires</div>
-                  <div class="font-mono">{{ formatDate(ca.not_after) }}</div>
-                </div>
-                <div>
-                  <div class="text-base-content/60 mb-1">Certificates issued</div>
-                  <div class="font-bold tabular-nums">{{ ca.certificates_issued_count }}</div>
-                </div>
-                <div>
-                  <div class="text-base-content/60 mb-1">CRL</div>
-                  <div v-if="ca.crl_distribution_url" class="flex items-center gap-1">
-                    <CircleCheck v-if="ca.is_crl_fresh" class="w-3.5 h-3.5 text-success" />
-                    <CircleX v-else class="w-3.5 h-3.5 text-error" />
-                    <span>{{ ca.is_crl_fresh ? 'Fresh' : 'Stale' }}</span>
-                  </div>
-                  <div v-else class="opacity-60">Not published</div>
-                </div>
-                <div>
-                  <div class="text-base-content/60 mb-1">Last checked</div>
-                  <div class="font-mono">{{ formatDateTime(ca.crl_last_checked) }}</div>
-                </div>
-                <div class="col-span-2">
-                  <div class="text-base-content/60 mb-1">Subject</div>
-                  <div class="font-mono break-all">{{ truncate(ca.subject_dn, 72) }}</div>
-                </div>
-                <div class="col-span-2">
-                  <div class="text-base-content/60 mb-1">Issuer</div>
-                  <div class="font-mono break-all">{{ truncate(ca.issuer_dn, 72) }}</div>
-                </div>
-                <div class="col-span-2 md:col-span-4">
-                  <div class="text-base-content/60 mb-1">SHA-256 fingerprint</div>
-                  <div class="font-mono text-[10px] break-all">{{ ca.fingerprint_sha256 }}</div>
-                </div>
-              </div>
+                  <tr v-if="expandedCa === ca.id" :key="`${ca.id}-detail`">
+                    <td class="rail" :class="`sev-bg-${caSeverity(ca.status)}`"></td>
+                    <td colspan="7" class="!whitespace-normal !py-3">
+                      <div class="flex flex-col gap-3">
+                        <dl class="kv md:grid-cols-[auto_1fr_auto_1fr] md:gap-x-5">
+                          <dt>Expires</dt>
+                          <dd>{{ formatDate(ca.not_after) }}</dd>
 
-              <div class="flex items-center gap-2">
-                <button
-                  class="btn btn-outline btn-xs gap-1.5"
-                  :disabled="checking === ca.id"
-                  @click.stop="checkNow(ca)"
-                >
-                  <RotateCw class="w-3 h-3" :class="checking === ca.id && 'animate-spin'" />
-                  Check now
-                </button>
-                <span v-if="ca.last_alert_sent_at" class="text-[11px] opacity-60">
-                  Last alert at the {{ ca.last_alert_threshold }}-day threshold,
-                  {{ formatDateTime(ca.last_alert_sent_at) }}
-                </span>
-              </div>
+                          <dt>Certificates issued</dt>
+                          <dd>{{ ca.certificates_issued_count }}</dd>
+
+                          <dt>CRL</dt>
+                          <dd>
+                            <span v-if="ca.crl_distribution_url" class="flex items-center gap-1.5">
+                              <CircleCheck
+                                v-if="ca.is_crl_fresh"
+                                class="w-3.5 h-3.5 sev-ok"
+                              />
+                              <CircleX v-else class="w-3.5 h-3.5 sev-critical" />
+                              <span :class="ca.is_crl_fresh ? 'sev-ok' : 'sev-critical'">
+                                {{ ca.is_crl_fresh ? 'Fresh' : 'Stale' }}
+                              </span>
+                            </span>
+                            <span v-else class="text-[color:var(--text-muted)]">Not published</span>
+                          </dd>
+
+                          <dt>Last checked</dt>
+                          <dd>{{ formatDateTime(ca.crl_last_checked) }}</dd>
+
+                          <dt>Subject</dt>
+                          <dd>{{ truncate(ca.subject_dn, 96) }}</dd>
+
+                          <dt>Issuer</dt>
+                          <dd>{{ truncate(ca.issuer_dn, 96) }}</dd>
+
+                          <dt>SHA-256</dt>
+                          <dd class="text-[length:var(--fs-micro)]">{{ ca.fingerprint_sha256 }}</dd>
+                        </dl>
+
+                        <div class="toolbar">
+                          <button
+                            class="btn-console"
+                            :disabled="checking === ca.id"
+                            @click.stop="checkNow(ca)"
+                          >
+                            <span v-if="checking === ca.id" class="spinner-console"></span>
+                            <RotateCw v-else class="w-3 h-3" />
+                            Check now
+                          </button>
+                          <span
+                            v-if="ca.last_alert_sent_at"
+                            class="field-help"
+                          >
+                            Last alert at the {{ ca.last_alert_threshold }}-day threshold,
+                            {{ formatDateTime(ca.last_alert_sent_at) }}
+                          </span>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </PanelBox>
+
+        <!--
+          Says why it is empty, not that all is well. "No certificate authorities
+          yet" on a monitoring product must never be mistakeable for a clean
+          bill of health: the screen is blank because nothing was imported.
+        -->
+        <PanelBox v-else label="Authorities">
+          <div class="empty-console">
+            <strong>No certificate authorities are being monitored.</strong>
+            This page is empty because nothing has been imported yet, not because
+            the estate is healthy. Import a CA certificate to start tracking its
+            expiry, CRL freshness, and the certificates it issues.
+            <div class="mt-3">
+              <button class="btn-console" data-variant="signal" @click="showImport = true">
+                <Plus class="w-3 h-3" /> Import CA
+              </button>
             </div>
           </div>
-        </div>
-      </div>
-
-      <div v-else class="card bg-base-100 border border-base-300">
-        <div class="card-body items-center text-center py-12">
-          <ShieldCheck class="w-10 h-10 opacity-30" />
-          <h3 class="font-bold text-sm">No certificate authorities yet</h3>
-          <p class="text-xs opacity-60 max-w-sm">
-            Import a CA certificate to start monitoring its expiry, CRL freshness, and the
-            certificates it issues.
-          </p>
-          <button class="btn btn-primary btn-sm gap-2 mt-2" @click="showImport = true">
-            <Plus class="w-4 h-4" /> Import CA
-          </button>
-        </div>
+        </PanelBox>
       </div>
     </DataState>
 
-    <!-- Import modal -->
-    <dialog class="modal" :class="{ 'modal-open': showImport }">
-      <div class="modal-box max-w-lg">
-        <h3 class="text-base font-bold mb-1">Import certificate authority</h3>
-        <p class="text-xs opacity-60 mb-4">
-          CertPilot monitors existing CAs rather than generating them. Paste the authority's
-          certificate; subject, validity, key details and revocation URLs are read from it.
-        </p>
+    <!-- Import dialog -->
+    <div
+      v-if="showImport"
+      class="dialog-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="import-ca-title"
+      @click.self="showImport = false"
+      @keydown.esc="showImport = false"
+    >
+      <div class="dialog-panel">
+        <header class="panel-head">
+          <span id="import-ca-title" class="label-rail">Import certificate authority</span>
+        </header>
 
-        <div v-if="importError" role="alert" class="alert alert-error mb-3">
-          <CircleX class="w-4 h-4 shrink-0" />
-          <span class="text-xs break-words">{{ importError }}</span>
-        </div>
+        <form @submit.prevent="importCA">
+          <div class="dialog-body flex flex-col gap-3">
+            <p class="field-help">
+              CertPilot monitors existing CAs rather than generating them. Paste the
+              authority's certificate; subject, validity, key details and revocation
+              URLs are read from it.
+            </p>
 
-        <form class="space-y-3" @submit.prevent="importCA">
-          <div class="form-control">
-            <label class="label" for="ca-name"><span class="label-text text-xs">Name</span></label>
-            <input
-              id="ca-name" v-model="form.name" type="text" required
-              placeholder="e.g. Corporate Issuing CA"
-              class="input input-bordered input-sm"
-            />
-          </div>
+            <div v-if="importError" role="alert" class="notice" data-tone="critical">
+              <CircleX class="w-4 h-4 notice-icon" />
+              <span class="break-words">{{ importError }}</span>
+            </div>
 
-          <div class="form-control">
-            <label class="label" for="ca-pem">
-              <span class="label-text text-xs">Certificate (PEM)</span>
-            </label>
-            <textarea
-              id="ca-pem" v-model="form.certificate_pem" required rows="6"
-              placeholder="-----BEGIN CERTIFICATE-----&#10;…&#10;-----END CERTIFICATE-----"
-              class="textarea textarea-bordered textarea-sm font-mono text-[11px]"
-            ></textarea>
-          </div>
-
-          <div class="form-control">
-            <label class="label" for="ca-parent">
-              <span class="label-text text-xs">Parent CA</span>
-              <span class="label-text-alt text-[10px] opacity-60">Leave empty for a root</span>
-            </label>
-            <select id="ca-parent" v-model="form.parent_ca_id" class="select select-bordered select-sm">
-              <option value="">None — this is a root</option>
-              <option v-for="p in parentOptions" :key="p.id" :value="p.id">{{ p.name }}</option>
-            </select>
-          </div>
-
-          <details class="collapse collapse-arrow border border-base-300 rounded-lg">
-            <summary class="collapse-title text-xs font-medium py-2 min-h-0">
-              Revocation endpoints and notes
-            </summary>
-            <div class="collapse-content space-y-3">
-              <p class="text-[11px] opacity-60">
-                Read from the certificate when left empty.
-              </p>
+            <div class="field">
+              <label class="label-micro" for="ca-name">Name</label>
               <input
-                v-model="form.crl_distribution_url" type="url" placeholder="CRL distribution URL"
-                class="input input-bordered input-sm w-full"
+                id="ca-name" v-model="form.name" type="text" required
+                placeholder="e.g. Corporate Issuing CA"
+                class="input-console"
               />
-              <input
-                v-model="form.ocsp_responder_url" type="url" placeholder="OCSP responder URL"
-                class="input input-bordered input-sm w-full"
-              />
+            </div>
+
+            <div class="field">
+              <label class="label-micro" for="ca-pem">Certificate (PEM)</label>
               <textarea
-                v-model="form.notes" rows="2" placeholder="Notes"
-                class="textarea textarea-bordered textarea-sm w-full"
+                id="ca-pem" v-model="form.certificate_pem" required rows="7" data-pem
+                placeholder="-----BEGIN CERTIFICATE-----&#10;…&#10;-----END CERTIFICATE-----"
+                class="textarea-console"
               ></textarea>
             </div>
-          </details>
 
-          <div class="modal-action">
-            <button type="button" class="btn btn-ghost btn-sm" @click="showImport = false">
+            <div class="field">
+              <label class="label-micro" for="ca-parent">Parent CA</label>
+              <select id="ca-parent" v-model="form.parent_ca_id" class="select-console">
+                <option value="">None — this is a root</option>
+                <option v-for="p in parentOptions" :key="p.id" :value="p.id">{{ p.name }}</option>
+              </select>
+              <span class="field-help">Leave as "none" for a root authority.</span>
+            </div>
+
+            <details class="border border-[color:var(--line)]">
+              <summary
+                class="label-micro cursor-pointer select-none px-2.5 py-2 bg-[color:var(--ink-rail)]"
+              >
+                Revocation endpoints and notes
+              </summary>
+              <div class="flex flex-col gap-3 p-2.5">
+                <p class="field-help">Read from the certificate when left empty.</p>
+                <div class="field">
+                  <label class="label-micro" for="ca-crl">CRL distribution URL</label>
+                  <input
+                    id="ca-crl" v-model="form.crl_distribution_url" type="url"
+                    class="input-console"
+                  />
+                </div>
+                <div class="field">
+                  <label class="label-micro" for="ca-ocsp">OCSP responder URL</label>
+                  <input
+                    id="ca-ocsp" v-model="form.ocsp_responder_url" type="url"
+                    class="input-console"
+                  />
+                </div>
+                <div class="field">
+                  <label class="label-micro" for="ca-notes">Notes</label>
+                  <textarea
+                    id="ca-notes" v-model="form.notes" rows="2"
+                    class="textarea-console !min-h-0"
+                  ></textarea>
+                </div>
+              </div>
+            </details>
+          </div>
+
+          <div class="dialog-foot">
+            <button type="button" class="btn-console" @click="showImport = false">
               Cancel
             </button>
-            <button type="submit" class="btn btn-primary btn-sm" :disabled="importing">
-              <span v-if="importing" class="loading loading-spinner loading-xs"></span>
+            <button
+              type="submit"
+              class="btn-console"
+              data-variant="signal"
+              :disabled="importing"
+            >
+              <span v-if="importing" class="spinner-console"></span>
               Import
             </button>
           </div>
         </form>
       </div>
-      <form method="dialog" class="modal-backdrop" @click="showImport = false">
-        <button>close</button>
-      </form>
-    </dialog>
+    </div>
   </div>
 </template>

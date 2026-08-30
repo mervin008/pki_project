@@ -46,9 +46,9 @@ const label = computed(() => {
 const tone = computed(() => {
   switch (stream.status.value) {
     case 'live':
-      return { dot: 'bg-success', text: 'text-base-content/70', ring: 'border-base-300' }
+      return { dot: 'sev-bg-ok', text: 'text-[color:var(--text-secondary)]', ring: 'border-[color:var(--line)]' }
     case 'connecting':
-      return { dot: 'bg-base-content/40', text: 'text-base-content/60', ring: 'border-base-300' }
+      return { dot: 'sev-bg-unknown', text: 'text-[color:var(--text-muted)]', ring: 'border-[color:var(--line)]' }
     case 'reconnecting':
       return { dot: 'bg-warning', text: 'text-warning', ring: 'border-warning/40' }
     case 'stale':
@@ -74,7 +74,7 @@ function humanAge(seconds: number): string {
 <template>
   <button
     type="button"
-    class="flex items-center gap-2 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors hover:bg-base-200"
+    class="flex items-center gap-2 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors hover:bg-[color:var(--ink-hover)]"
     :class="[tone.ring, tone.text]"
     :title="detail"
     :aria-label="`Live connection: ${label}. ${detail}`"

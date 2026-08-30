@@ -287,7 +287,11 @@ differently than expected. See [`docs/database.md`](docs/database.md).
 
 ## Frontend
 
-Vue 3, Pinia, Tailwind 4, daisyUI (being removed), chart.js, lucide icons.
+Vue 3, Pinia, Tailwind 4, chart.js, lucide icons. **daisyUI is gone** — the
+conversion finished, the plugin and both retheme blocks were removed from
+`main.css`, and the dependency was dropped. The stylesheet halved as a result
+(143 kB to 65 kB). If you find a `btn`, `card`, `badge`, `modal` or `alert`
+class anywhere, it is dead markup, not a component.
 
 **The design is an operations console, not an admin template.** Three rules, all
 enforced in `src/assets/styles/main.css`:
@@ -315,12 +319,22 @@ Sign-in is OpenID Connect, authorization code with PKCE, in `lib/oidc.ts`. The
 frontend reads the issuer and client id from `/auth/config` rather than from
 build-time environment variables, so one instance is described by one file.
 
-**Converted to the console idiom:** `DashboardView`, `CaHealthView`,
-`CertificatesView`, plus the shell (`CommandRail`), `DataState`, and the `ui/`
-and `metadata/` components.
-**Still daisyUI:** `PkiOverviewView`, `GatewaysView`, `DiscoveryView`,
-`PoliciesView`, `SettingsView`, `DisplayView`. They follow the palette because
-daisyUI's theme tokens were overridden, but they are proportional-font and airy.
+**Every view is on the console idiom.** The six that were still daisyUI —
+`PkiOverviewView`, `GatewaysView`, `DiscoveryView`, `PoliciesView`,
+`SettingsView`, `DisplayView` — were converted, along with the settings
+components and `ConnectionIndicator`.
+
+The primitives that conversion needed live in `main.css` under CONSOLE
+PRIMITIVES: `.select-console`, `.textarea-console`, `.check-console`,
+`.toggle-console`, `.field`, `.notice` (replaces `alert`), `.tag`, `.toolbar`,
+`.dialog-*` (replaces `modal`), `.tabs-console`, `.empty-console`, `.skel`,
+`.spinner-console`, `.meter` and `.kv`. Three token groups back them:
+`--dur-*`/`--ease-out` for motion and `--sp-*` for spacing rhythm.
+
+**`.tag` is not `.chip`.** `.chip` carries severity and is bordered in the
+severity colour; `.tag` is inert metadata — a key type, a gateway kind. They
+were being used interchangeably, which is how a red-bordered chip reading
+"ISSUED" reached the screen once already.
 
 `DisplayView` is the unattended wall screen: no chrome, authenticates with a
 kiosk display token, and must degrade loudly when the feed dies.
