@@ -63,7 +63,19 @@ type targetRequest struct {
 	TargetType  string         `json:"target_type" binding:"required"`
 	Config      map[string]any `json:"config"`
 	IsEnabled   *bool          `json:"is_enabled"`
+	// DeployOrder is the rollout wave. A pointer so that omitting it on an edit
+	// leaves the existing wave alone — a form that posts zero for "not
+	// specified" would silently move a production target into the first wave,
+	// which is the one place this field must never drift.
+	DeployOrder *int `json:"deploy_order"`
 }
+
+// maxDeployOrder bounds the wave number.
+//
+// Not a technical limit. Waves are a sequence somebody has to be able to hold
+// in their head during an incident, and an estate with two hundred of them has
+// expressed something nobody can reason about.
+const maxDeployOrder = 100
 
 // CreateTarget handles POST /api/v1/deployment-targets.
 //
@@ -88,6 +100,17 @@ func (h *DeploymentHandler) CreateTarget(c *gin.Context) {
 		enabled = *req.IsEnabled
 	}
 
+	order := 0
+	if req.DeployOrder != nil {
+		if *req.DeployOrder < 0 || *req.DeployOrder > maxDeployOrder {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("deploy_order must be between 0 and %d", maxDeployOrder),
+			})
+			return
+		}
+		order = *req.DeployOrder
+	}
+
 	actor, _ := actorOf(c)
 	target := &store.DeploymentTarget{
 		Name:              strings.TrimSpace(req.Name),
@@ -96,6 +119,7 @@ func (h *DeploymentHandler) CreateTarget(c *gin.Context) {
 		ConfigEncrypted:   sealed,
 		IsEnabled:         enabled,
 		DeploysPrivateKey: deploysKey,
+		DeployOrder:       order,
 		CloudConnectionID: connectionRef(req.Config),
 		CreatedBy:         actor,
 	}
@@ -108,8 +132,8 @@ func (h *DeploymentHandler) CreateTarget(c *gin.Context) {
 	// keys to a new place on Tuesday" is exactly the sentence an audit log
 	// exists to be able to produce.
 	h.audit(c, "deployment_target.created", target.ID, fmt.Sprintf(
-		`{"name":%q,"target_type":%q,"deploys_private_key":%t}`,
-		target.Name, target.TargetType, target.DeploysPrivateKey))
+		`{"name":%q,"target_type":%q,"deploys_private_key":%t,"deploy_order":%d}`,
+		target.Name, target.TargetType, target.DeploysPrivateKey, target.DeployOrder))
 
 	c.JSON(http.StatusCreated, gin.H{"data": target})
 }
@@ -139,6 +163,15 @@ func (h *DeploymentHandler) UpdateTarget(c *gin.Context) {
 	if req.IsEnabled != nil {
 		existing.IsEnabled = *req.IsEnabled
 	}
+	if req.DeployOrder != nil {
+		if *req.DeployOrder < 0 || *req.DeployOrder > maxDeployOrder {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("deploy_order must be between 0 and %d", maxDeployOrder),
+			})
+			return
+		}
+		existing.DeployOrder = *req.DeployOrder
+	}
 
 	if len(req.Config) > 0 {
 		sealed, deploysKey, err := h.sealConfig(c.Request.Context(), existing.TargetType, req.Config)
@@ -163,7 +196,10 @@ func (h *DeploymentHandler) UpdateTarget(c *gin.Context) {
 		return
 	}
 	h.audit(c, "deployment_target.updated", existing.ID, fmt.Sprintf(
-		`{"name":%q,"deploys_private_key":%t}`, existing.Name, existing.DeploysPrivateKey))
+		// The wave is audited because moving a target between waves changes what
+		// reaches production without anything else about the target changing.
+		`{"name":%q,"deploys_private_key":%t,"deploy_order":%d}`,
+		existing.Name, existing.DeploysPrivateKey, existing.DeployOrder))
 
 	c.JSON(http.StatusOK, gin.H{"data": existing})
 }

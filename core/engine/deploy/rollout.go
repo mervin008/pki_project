@@ -63,6 +63,28 @@ func EnqueueFor(ctx context.Context, s store.Store, cert *store.Certificate,
 	automatic := reason == store.DeployReasonRenewal
 	now := time.Now()
 
+	// Each job carries the wave its target was in when the rollout began.
+	//
+	// Read once here rather than joined at claim time, and that is the point:
+	// a rollout is a plan, and re-reading the target mid-rollout would let
+	// somebody reorder a wave that is halfway through. The failure that
+	// prevents is production taking a certificate staging never accepted,
+	// because staging's wave changed underneath it.
+	waves := make(map[string]int, len(bindings))
+	for _, binding := range bindings {
+		target, err := s.GetDeploymentTarget(ctx, binding.TargetID)
+		if err != nil {
+			// Not fatal, and not silent. A target that cannot be read is one
+			// this rollout cannot place in the order, and defaulting it to the
+			// first wave is the safe direction — it goes early, behind
+			// nothing, rather than jumping ahead of a canary.
+			slog.Warn("could not read a deployment target's wave; treating it as the first",
+				"target", binding.TargetID, "certificate", cert.ID, "error", err)
+			continue
+		}
+		waves[binding.TargetID] = target.DeployOrder
+	}
+
 	for _, binding := range bindings {
 		switch {
 		case !binding.IsEnabled:
@@ -88,6 +110,7 @@ func EnqueueFor(ctx context.Context, s store.Store, cert *store.Certificate,
 			// as it stands when the job runs; see the note on Bundle.
 			Fingerprint: cert.FingerprintSHA256,
 			NotAfter:    cert.NotAfter,
+			DeployOrder: waves[binding.TargetID],
 			TriggeredBy: actor,
 			ActorEmail:  actorEmail,
 		}

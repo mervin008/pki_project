@@ -867,3 +867,287 @@ func sampleAgentFor(t *testing.T, s Store, name string) string {
 	}
 	return agent.ID
 }
+
+// ── Deployment waves ────────────────────────────────────
+
+// The wave gate is two NOT EXISTS clauses in two SQL claim statements and a
+// hand-written mirror in the in-memory store. That is precisely the shape that
+// drifts: the memory version agrees with itself while a real rollout lets
+// production overtake staging. So the rule is asserted against both.
+
+func waveFixture(t *testing.T, s Store, waves ...int) (certID string, targetIDs []string) {
+	t.Helper()
+	ctx := context.Background()
+
+	cert := sampleCertificate("waves")
+	if err := s.CreateCertificate(ctx, cert); err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+
+	for i, wave := range waves {
+		target := &DeploymentTarget{
+			Name:        fmt.Sprintf("wave-%d-target-%d", wave, i),
+			TargetType:  "webhook",
+			IsEnabled:   true,
+			DeployOrder: wave,
+		}
+		if err := s.CreateDeploymentTarget(ctx, target); err != nil {
+			t.Fatalf("CreateDeploymentTarget: %v", err)
+		}
+		binding := &CertificateDeployment{
+			CertificateID: cert.ID, TargetID: target.ID, IsEnabled: true, DeployOnRenewal: true,
+		}
+		if err := s.CreateCertificateDeployment(ctx, binding); err != nil {
+			t.Fatalf("CreateCertificateDeployment: %v", err)
+		}
+		if _, err := s.EnqueueDeployment(ctx, &DeploymentJob{
+			DeploymentID: binding.ID, CertificateID: cert.ID, TargetID: target.ID,
+			Reason: DeployReasonManual, Status: DeployPending,
+			RunAfter: time.Now().Add(-time.Minute), DeployOrder: wave,
+		}); err != nil {
+			t.Fatalf("EnqueueDeployment: %v", err)
+		}
+		targetIDs = append(targetIDs, target.ID)
+	}
+	return cert.ID, targetIDs
+}
+
+// The declared order is the order the queue works in.
+func TestALaterWaveIsNotClaimedWhileAnEarlierOneIsOutstanding(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		_, targets := waveFixture(t, s, 0, 1, 1)
+
+		first, err := s.ClaimDeploymentJob(ctx, "worker-1", time.Minute, time.Now())
+		if err != nil || first == nil {
+			t.Fatalf("wave 0 must be claimable: %v", err)
+		}
+		if first.TargetID != targets[0] {
+			t.Fatalf("claimed a wave-1 target before wave 0 had run")
+		}
+
+		// The second worker is the one that used to make the canary
+		// one-per-worker. It must find nothing.
+		second, err := s.ClaimDeploymentJob(ctx, "worker-2", time.Minute, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second != nil {
+			t.Fatalf("worker-2 claimed target %s while wave 0 was still running", second.TargetID)
+		}
+	})
+}
+
+// Once the earlier wave has succeeded, the rest go — and go in parallel.
+func TestALaterWaveRunsOnceTheEarlierOneSucceeds(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		_, targets := waveFixture(t, s, 0, 1, 1)
+
+		canary, err := s.ClaimDeploymentJob(ctx, "worker-1", time.Minute, time.Now())
+		if err != nil || canary == nil {
+			t.Fatalf("wave 0 must be claimable: %v", err)
+		}
+		if err := s.CompleteDeploymentJob(ctx, canary.ID, DeploySucceeded,
+			DeploymentAttempt{Number: 1, StartedAt: time.Now(), Worker: "worker-1"},
+			time.Now(), false); err != nil {
+			t.Fatal(err)
+		}
+
+		claimed := map[string]bool{}
+		for i := 0; i < 2; i++ {
+			job, err := s.ClaimDeploymentJob(ctx, fmt.Sprintf("worker-%d", i), time.Minute, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if job == nil {
+				t.Fatalf("only %d of the two wave-1 targets became claimable after wave 0 passed", i)
+			}
+			claimed[job.TargetID] = true
+		}
+		for _, id := range targets[1:] {
+			if !claimed[id] {
+				t.Errorf("target %s never ran after wave 0 succeeded", id)
+			}
+		}
+	})
+}
+
+// The reason to declare an order at all. A certificate the first wave would not
+// accept must not reach the ones behind it, and must stay stopped rather than
+// resuming on a timer — deliberately stricter than the same-wave rule, where a
+// terminally failed job stops blocking its peers.
+func TestAFailedEarlierWaveStopsTheRollout(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		waveFixture(t, s, 0, 1)
+
+		canary, err := s.ClaimDeploymentJob(ctx, "worker-1", time.Minute, time.Now())
+		if err != nil || canary == nil {
+			t.Fatalf("wave 0 must be claimable: %v", err)
+		}
+		if err := s.CompleteDeploymentJob(ctx, canary.ID, DeployFailed,
+			DeploymentAttempt{Number: 1, StartedAt: time.Now(), Worker: "worker-1"},
+			time.Now(), true); err != nil {
+			t.Fatal(err)
+		}
+
+		next, err := s.ClaimDeploymentJob(ctx, "worker-1", time.Minute, time.Now().Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next != nil {
+			t.Fatalf("wave 1 ran after wave 0 gave up: a certificate staging refused reached %s",
+				next.TargetID)
+		}
+	})
+}
+
+// Everything in one wave is the default, and every deployment that existed
+// before waves did. It must behave exactly as it did.
+func TestASingleWaveIsStillParallel(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		waveFixture(t, s, 0, 0, 0)
+
+		for i := 0; i < 3; i++ {
+			job, err := s.ClaimDeploymentJob(ctx, fmt.Sprintf("worker-%d", i), time.Minute, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if job == nil {
+				t.Fatalf("only %d of three same-wave jobs were claimable; waves must not serialise the default", i)
+			}
+		}
+	})
+}
+
+// The wave has to survive the round trip, or the gate reads zero for everything
+// and quietly does nothing. This is the class-B check for the new column.
+func TestADeploymentJobsWaveIsPersisted(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		_, _ = waveFixture(t, s, 3)
+
+		jobs, _, err := s.ListDeploymentJobs(ctx, DeploymentJobFilter{Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(jobs) == 0 {
+			t.Fatal("no jobs were listed")
+		}
+		if jobs[0].DeployOrder != 3 {
+			t.Errorf("deploy_order read back as %d, want 3 — the writer dropped it", jobs[0].DeployOrder)
+		}
+	})
+}
+
+// Likewise on the target, which is where an operator sets it.
+func TestADeploymentTargetsWaveIsPersisted(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+
+		target := &DeploymentTarget{
+			Name: "prod-lb", TargetType: "webhook", IsEnabled: true, DeployOrder: 2,
+		}
+		if err := s.CreateDeploymentTarget(ctx, target); err != nil {
+			t.Fatal(err)
+		}
+		read, err := s.GetDeploymentTarget(ctx, target.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if read.DeployOrder != 2 {
+			t.Errorf("deploy_order read back as %d after create, want 2", read.DeployOrder)
+		}
+
+		read.DeployOrder = 5
+		if err := s.UpdateDeploymentTarget(ctx, read); err != nil {
+			t.Fatal(err)
+		}
+		again, err := s.GetDeploymentTarget(ctx, target.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again.DeployOrder != 5 {
+			t.Errorf("deploy_order read back as %d after update, want 5", again.DeployOrder)
+		}
+	})
+}
+
+// The defect live testing found. `status = 'FAILED'` matched any failure ever
+// recorded, so one bad afternoon in staging blocked production for ever —
+// including after staging had been fixed and deployed successfully since. A
+// terminally failed job cannot be cancelled either, so there was no way out.
+//
+// The question has to be "is that place currently broken", not "has it ever
+// been", and the way out has to be the obvious one: fix it and deploy again.
+func TestAHistoricalFailureDoesNotBlockAWaveForEver(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		certID, targets := waveFixture(t, s, 0, 1)
+
+		// Staging fails and gives up.
+		canary, err := s.ClaimDeploymentJob(ctx, "worker-1", time.Minute, time.Now())
+		if err != nil || canary == nil {
+			t.Fatalf("wave 0 must be claimable: %v", err)
+		}
+		if err := s.CompleteDeploymentJob(ctx, canary.ID, DeployFailed,
+			DeploymentAttempt{Number: 1, StartedAt: time.Now(), Worker: "worker-1"},
+			time.Now(), true); err != nil {
+			t.Fatal(err)
+		}
+		if next, _ := s.ClaimDeploymentJob(ctx, "worker-1", time.Minute, time.Now()); next != nil {
+			t.Fatalf("setup: wave 1 ran while wave 0 was broken (%s)", next.TargetID)
+		}
+
+		// Somebody fixes staging and deploys again. The new job is a later one
+		// for the same binding, so the old failure stops counting.
+		bindings, err := s.ListCertificateDeployments(ctx, certID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stagingBinding string
+		for _, b := range bindings {
+			if b.TargetID == targets[0] {
+				stagingBinding = b.ID
+			}
+		}
+		if stagingBinding == "" {
+			t.Fatal("could not find the staging binding")
+		}
+		// A perceptible gap, because "latest" is decided by created_at and the
+		// in-memory store can otherwise stamp both in the same instant.
+		time.Sleep(2 * time.Millisecond)
+		if _, err := s.EnqueueDeployment(ctx, &DeploymentJob{
+			DeploymentID: stagingBinding, CertificateID: certID, TargetID: targets[0],
+			Reason: DeployReasonManual, Status: DeployPending,
+			RunAfter: time.Now().Add(-time.Minute), DeployOrder: 0,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		retry, err := s.ClaimDeploymentJob(ctx, "worker-1", time.Minute, time.Now())
+		if err != nil || retry == nil {
+			t.Fatalf("the retried staging job must be claimable: %v", err)
+		}
+		if err := s.CompleteDeploymentJob(ctx, retry.ID, DeploySucceeded,
+			DeploymentAttempt{Number: 1, StartedAt: time.Now(), Worker: "worker-1"},
+			time.Now(), false); err != nil {
+			t.Fatal(err)
+		}
+
+		// Production must now be reachable. Before the fix it never was again.
+		next, err := s.ClaimDeploymentJob(ctx, "worker-1", time.Minute, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next == nil {
+			t.Fatal("production stayed blocked after staging was fixed and deployed successfully; " +
+				"the wave gate is counting a historical failure")
+		}
+		if next.TargetID != targets[1] {
+			t.Fatalf("expected the production target, got %s", next.TargetID)
+		}
+	})
+}

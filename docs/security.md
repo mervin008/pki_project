@@ -534,5 +534,9 @@ variable-length string — so it needs a `CPS2` envelope with the old one still
 readable. Worth doing, and deliberately not bundled with the provider work,
 because a mistake in that code is unrecoverable loss of every stored key.
 
-**Deployment ordering is not expressible.** "Staging, then production" cannot
-be declared; the canary is one-per-worker rather than exactly one.
+**Deployment waves stop at the job level, not the estate level.** A wave holds
+per certificate. Two certificates rolling out at once do not coordinate, so
+"nothing reaches production while anything is failing in staging" is not
+expressible — only "this certificate does not reach production while it is
+failing in staging". That is the useful half, and the other half needs a notion
+of an estate-wide rollout that does not exist.

@@ -325,6 +325,14 @@ type DeploymentTarget struct {
 	// — without the KEK, and without decrypting anything.
 	DeploysPrivateKey bool `json:"deploys_private_key"`
 
+	// DeployOrder is which rollout wave this target belongs to. Lower goes
+	// first, and a wave does not start until every earlier one has finished.
+	//
+	// Zero for everything by default, which is one wave and the behaviour that
+	// existed before waves did. A canary is a target on its own in the lowest
+	// wave: one target, exactly one attempt, declared rather than inferred.
+	DeployOrder int `json:"deploy_order"`
+
 	// CloudConnectionID names the account whose credentials this target
 	// borrows, for the target types that borrow one.
 	//
@@ -1330,6 +1338,13 @@ type DeploymentJob struct {
 
 	LastError  string              `json:"last_error,omitempty"`
 	AttemptLog []DeploymentAttempt `json:"attempt_log"`
+
+	// DeployOrder is the wave this job belongs to, copied from the target when
+	// the rollout was enqueued. Copied rather than looked up, so that
+	// reordering a target cannot change the plan of a rollout already under
+	// way — which is how production ends up with a certificate staging never
+	// accepted.
+	DeployOrder int `json:"deploy_order"`
 
 	// Fingerprint is what this job is trying to install, captured at enqueue.
 	// Not read off the certificate at run time: a job enqueued by a renewal is

@@ -2635,7 +2635,7 @@ func (m *MemoryStore) ClaimDeploymentJob(ctx context.Context, worker string, lea
 		if target, ok := m.targets[job.TargetID]; ok && target.AgentID != nil {
 			continue
 		}
-		if m.heldBackByAFailure(job) {
+		if m.heldBackByAFailure(job) || m.heldBackByAnEarlierWave(job) {
 			continue
 		}
 		if best == nil || moreUrgentDeployment(job, best) {
@@ -2660,9 +2660,14 @@ func (m *MemoryStore) ClaimDeploymentJob(ctx context.Context, worker string, lea
 	return clone(best), nil
 }
 
-// moreUrgentDeployment ranks by the expiry being raced, matching the queue's
-// ORDER BY, so the screen agrees with what is actually happening next.
+// moreUrgentDeployment ranks by wave and then by the expiry being raced,
+// matching the queue's ORDER BY, so the screen agrees with what is actually
+// happening next.
 func moreUrgentDeployment(a, b *DeploymentJob) bool {
+	// Wave first. The order an operator declared outranks the arithmetic.
+	if a.DeployOrder != b.DeployOrder {
+		return a.DeployOrder < b.DeployOrder
+	}
 	switch {
 	case a.NotAfter == nil && b.NotAfter == nil:
 		return a.RunAfter.Before(b.RunAfter)
@@ -3463,7 +3468,7 @@ func (m *MemoryStore) ClaimAgentDeploymentJobs(ctx context.Context, agentID, wor
 	for _, job := range m.deploymentJobs {
 		ready := (job.Status == DeployPending && !job.RunAfter.After(now)) ||
 			(job.Status == DeployRunning && job.LockedUntil != nil && job.LockedUntil.Before(now))
-		if ready && mine[job.TargetID] && !m.heldBackByAFailure(job) {
+		if ready && mine[job.TargetID] && !m.heldBackByAFailure(job) && !m.heldBackByAnEarlierWave(job) {
 			claimable = append(claimable, job)
 		}
 	}
@@ -3547,6 +3552,47 @@ func (m *MemoryStore) heldBackByAFailure(job *DeploymentJob) bool {
 			continue
 		}
 		if other.Outstanding() && other.LastError != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// isLatestJobForBinding reports whether nothing newer has been queued for the
+// same place, which is what turns "has ever failed" into "is currently broken".
+func (m *MemoryStore) isLatestJobForBinding(job *DeploymentJob) bool {
+	for _, other := range m.deploymentJobs {
+		if other.DeploymentID == job.DeploymentID && other.CreatedAt.After(job.CreatedAt) {
+			return false
+		}
+	}
+	return true
+}
+
+// heldBackByAnEarlierWave mirrors the two wave predicates in the SQL claims.
+//
+// Written once and used by both the core and agent claim paths here, because
+// the SQL has the same rule in two statements and an in-memory store that
+// enforced it in one would agree with itself while a real deployment let an
+// agent target overtake its wave.
+func (m *MemoryStore) heldBackByAnEarlierWave(job *DeploymentJob) bool {
+	for _, other := range m.deploymentJobs {
+		if other.CertificateID != job.CertificateID || other.DeployOrder >= job.DeployOrder {
+			continue
+		}
+		// Still working: wait for it.
+		if other.Outstanding() {
+			return true
+		}
+		// Gave up: stop. Stricter than the same-wave rule on purpose — the
+		// point of declaring "staging, then production" is that a certificate
+		// staging would not accept must not reach production.
+		//
+		// Only if it is still the latest job for that place. Any failure ever
+		// recorded would block production for ever, including after staging had
+		// been fixed and deployed successfully since — and a terminally failed
+		// job cannot be cancelled, so there was no way out.
+		if other.Status == DeployFailed && m.isLatestJobForBinding(other) {
 			return true
 		}
 	}

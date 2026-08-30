@@ -867,14 +867,15 @@ func (s *PostgresStore) DeleteCAAccount(ctx context.Context, id string) error {
 // the table cannot be picked up by the list query and missed by the detail one.
 const deploymentTargetColumns = `id, name, coalesce(description, ''), target_type,
 		coalesce(config_encrypted, ''), coalesce(is_enabled, true), coalesce(deploys_private_key, false),
-		cloud_connection_id, agent_id,
+		coalesce(deploy_order, 0), cloud_connection_id, agent_id,
 		last_deployment_at, last_deployment_status, coalesce(last_deployment_error, ''), last_success_at,
 		created_by, created_at, updated_at`
 
 func scanDeploymentTarget(row pgx.Row) (*DeploymentTarget, error) {
 	t := &DeploymentTarget{}
 	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.TargetType,
-		&t.ConfigEncrypted, &t.IsEnabled, &t.DeploysPrivateKey, &t.CloudConnectionID, &t.AgentID,
+		&t.ConfigEncrypted, &t.IsEnabled, &t.DeploysPrivateKey, &t.DeployOrder,
+		&t.CloudConnectionID, &t.AgentID,
 		&t.LastDeploymentAt, &t.LastDeploymentStatus, &t.LastDeploymentError, &t.LastSuccessAt,
 		&t.CreatedBy, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
@@ -915,12 +916,12 @@ func (s *PostgresStore) CreateDeploymentTarget(ctx context.Context, target *Depl
 	return s.pool.QueryRow(ctx, `
 		INSERT INTO public.deployment_targets
 			(name, description, target_type, config_encrypted, is_enabled, deploys_private_key,
-			 cloud_connection_id, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 deploy_order, cloud_connection_id, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id, created_at, updated_at`,
 		target.Name, nullIfEmpty(target.Description), target.TargetType,
 		nullIfEmpty(target.ConfigEncrypted), target.IsEnabled, target.DeploysPrivateKey,
-		target.CloudConnectionID, target.CreatedBy,
+		target.DeployOrder, target.CloudConnectionID, target.CreatedBy,
 	).Scan(&target.ID, &target.CreatedAt, &target.UpdatedAt)
 }
 
@@ -928,11 +929,12 @@ func (s *PostgresStore) UpdateDeploymentTarget(ctx context.Context, target *Depl
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE public.deployment_targets
 		SET name = $2, description = $3, target_type = $4, config_encrypted = $5,
-		    is_enabled = $6, deploys_private_key = $7, cloud_connection_id = $8, updated_at = now()
+		    is_enabled = $6, deploys_private_key = $7, cloud_connection_id = $8,
+		    deploy_order = $9, updated_at = now()
 		WHERE id = $1`,
 		target.ID, target.Name, nullIfEmpty(target.Description), target.TargetType,
 		nullIfEmpty(target.ConfigEncrypted), target.IsEnabled, target.DeploysPrivateKey,
-		target.CloudConnectionID)
+		target.CloudConnectionID, target.DeployOrder)
 	if err != nil {
 		return err
 	}
@@ -3429,7 +3431,7 @@ func (s *PostgresStore) GetEndpointsServingCertificate(ctx context.Context, cert
 const deploymentJobColumns = `id, deployment_id, certificate_id, target_id, reason, status,
 		run_after, coalesce(attempts, 0), locked_by, locked_until,
 		coalesce(last_error, ''), coalesce(attempt_log, '[]'::jsonb),
-		coalesce(fingerprint, ''), not_after, escalated_at,
+		coalesce(deploy_order, 0), coalesce(fingerprint, ''), not_after, escalated_at,
 		triggered_by, actor_email, started_at, completed_at, created_at, updated_at`
 
 func scanDeploymentJob(row pgx.Row) (*DeploymentJob, error) {
@@ -3439,7 +3441,7 @@ func scanDeploymentJob(row pgx.Row) (*DeploymentJob, error) {
 		&j.ID, &j.DeploymentID, &j.CertificateID, &j.TargetID, &j.Reason, &j.Status,
 		&j.RunAfter, &j.Attempts, &j.LockedBy, &j.LockedUntil,
 		&j.LastError, &logJSON,
-		&j.Fingerprint, &j.NotAfter, &j.EscalatedAt,
+		&j.DeployOrder, &j.Fingerprint, &j.NotAfter, &j.EscalatedAt,
 		&j.TriggeredBy, &j.ActorEmail, &j.StartedAt, &j.CompletedAt, &j.CreatedAt, &j.UpdatedAt,
 	)
 	if err != nil {
@@ -3464,12 +3466,12 @@ func (s *PostgresStore) EnqueueDeployment(ctx context.Context, job *DeploymentJo
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO public.deployment_jobs
 			(deployment_id, certificate_id, target_id, reason, status, run_after,
-			 fingerprint, not_after, triggered_by, actor_email)
-		VALUES ($1, $2, $3, $4, 'PENDING', $5, $6, $7, $8, $9)
+			 deploy_order, fingerprint, not_after, triggered_by, actor_email)
+		VALUES ($1, $2, $3, $4, 'PENDING', $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (deployment_id) WHERE status IN ('PENDING', 'RUNNING') DO NOTHING
 		RETURNING `+deploymentJobColumns,
 		job.DeploymentID, job.CertificateID, job.TargetID, job.Reason, job.RunAfter,
-		nullIfEmpty(job.Fingerprint), job.NotAfter, job.TriggeredBy, job.ActorEmail)
+		job.DeployOrder, nullIfEmpty(job.Fingerprint), job.NotAfter, job.TriggeredBy, job.ActorEmail)
 
 	created, err := scanDeploymentJob(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -3545,7 +3547,50 @@ func (s *PostgresStore) ClaimDeploymentJob(ctx context.Context, worker string, l
 			        AND f.id <> c.id
 			        AND f.status IN ('PENDING', 'RUNNING')
 			        AND coalesce(f.last_error, '') <> ''))
-			ORDER BY c.not_after ASC NULLS LAST, c.run_after ASC
+			  -- Waves. A job waits while anything for the same certificate in
+			  -- an earlier wave is still outstanding.
+			  --
+			  -- Race-free in the safe direction: a worker that reads an earlier
+			  -- job before the transaction claiming it has committed still sees
+			  -- it as PENDING, and waits. The failure mode is a delay, never an
+			  -- overtake.
+			  AND NOT EXISTS (
+			      SELECT 1 FROM public.deployment_jobs w
+			      WHERE w.certificate_id = c.certificate_id
+			        AND w.deploy_order < c.deploy_order
+			        AND w.status IN ('PENDING', 'RUNNING'))
+			  -- An earlier wave that gave up stops the ones behind it, and this
+			  -- is deliberately stricter than the same-wave rule above.
+			  --
+			  -- Within a wave a terminally failed job stops blocking, so one
+			  -- dead target does not hold up its peers. Across waves the
+			  -- opposite is right: the entire point of declaring "staging, then
+			  -- production" is that a certificate staging would not accept must
+			  -- not reach production.
+			  --
+			  -- Only the *latest* job for that binding counts, and the inner
+			  -- NOT EXISTS is what says so. Without it the clause matched any
+			  -- failure ever recorded, so one bad afternoon in staging blocked
+			  -- production for ever — including after staging had been fixed
+			  -- and had deployed successfully twice since. A terminally failed
+			  -- job cannot be cancelled either, so there was no way out at all.
+			  -- Found by running it.
+			  --
+			  -- Scoped this way the question is "is that place currently
+			  -- broken", which is what an operator means, and the way out is
+			  -- the obvious one: fix staging and deploy again.
+			  AND NOT EXISTS (
+			      SELECT 1 FROM public.deployment_jobs w
+			      WHERE w.certificate_id = c.certificate_id
+			        AND w.deploy_order < c.deploy_order
+			        AND w.status = 'FAILED'
+			        AND NOT EXISTS (
+			            SELECT 1 FROM public.deployment_jobs newer
+			            WHERE newer.deployment_id = w.deployment_id
+			              AND newer.created_at > w.created_at))
+			-- Wave first, so the order the operator declared is the order the
+			-- queue works in. Expiry breaks ties within a wave, as before.
+			ORDER BY c.deploy_order ASC, c.not_after ASC NULLS LAST, c.run_after ASC
 			FOR UPDATE OF c SKIP LOCKED
 			LIMIT 1
 		)
@@ -4732,7 +4777,27 @@ func (s *PostgresStore) ClaimAgentDeploymentJobs(ctx context.Context, agentID, w
 			        AND f.id <> c.id
 			        AND f.status IN ('PENDING', 'RUNNING')
 			        AND coalesce(f.last_error, '') <> ''))
-			ORDER BY c.not_after ASC NULLS LAST, c.run_after ASC
+			-- Waves, on the same terms as the core worker's claim. An agent
+			-- target is still a target: without this an agent in wave 2 would
+			-- poll and install while wave 1 was still being attempted from the
+			-- core, and the declared order would hold for half the estate.
+			AND NOT EXISTS (
+			      SELECT 1 FROM public.deployment_jobs w
+			      WHERE w.certificate_id = c.certificate_id
+			        AND w.deploy_order < c.deploy_order
+			        AND w.status IN ('PENDING', 'RUNNING'))
+			  -- Latest-job-only, for the same reason as the core claim: a
+			  -- historical failure must not block a place for ever.
+			  AND NOT EXISTS (
+			      SELECT 1 FROM public.deployment_jobs w
+			      WHERE w.certificate_id = c.certificate_id
+			        AND w.deploy_order < c.deploy_order
+			        AND w.status = 'FAILED'
+			        AND NOT EXISTS (
+			            SELECT 1 FROM public.deployment_jobs newer
+			            WHERE newer.deployment_id = w.deployment_id
+			              AND newer.created_at > w.created_at))
+			ORDER BY c.deploy_order ASC, c.not_after ASC NULLS LAST, c.run_after ASC
 			-- OF c, not bare FOR UPDATE. A bare one in a joined subquery locks
 			-- the deployment_targets row as well, so every agent polling for
 			-- work would take a row lock on its own target and an operator

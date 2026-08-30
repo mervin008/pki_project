@@ -47,7 +47,7 @@ Six Go modules in a workspace (`go.work`, Go 1.26.6) plus a Vue frontend.
 | `gateways/{selfsigned,acme,vault}/` | CA adapters, each its own module and process, speaking one gRPC contract |
 | `agent/` | Host agent: generates keys locally, sends CSRs, installs and reloads |
 | `frontend/` | Vue 3 + Vite + Tailwind 4 + Pinia |
-| `migrations/` | 33 numbered `.sql` files, applied by `certpilot-core --migrate` |
+| `migrations/` | 34 numbered `.sql` files, applied by `certpilot-core --migrate` |
 | `docs/` | Written, current, and worth reading |
 
 **The API reference is published as a separate site** from
@@ -211,6 +211,23 @@ is deliberate: a certificate's *urgency* combines its status with its own
 `renewal_lead_days`, because the core leaves a certificate `ISSUED` until a
 renewal sweep moves it while `/dashboard/stats` already counts it as expiring.
 
+**Deployment order is declared on the target, carried by the job.**
+`deployment_targets.deploy_order` — lower first, zero by default, which is one
+wave and the behaviour that existed before. A job copies the wave at enqueue
+rather than joining it at claim time, so reordering a target cannot change a
+rollout already under way. A canary is a target on its own in the lowest wave:
+exactly one attempt, declared rather than inferred.
+
+Two gates, in `ClaimDeploymentJob` **and** `ClaimAgentDeploymentJobs` — an agent
+target is still a target, and gating one path only would let the declared order
+hold for half the estate. Within a wave a terminally failed job stops blocking
+its peers; across waves it does not, because the point of "staging, then
+production" is that a certificate staging refused must not reach production.
+That cross-wave gate counts only the *latest* job per binding: keyed on
+`status = 'FAILED'` alone it blocked production for ever after one bad
+afternoon, and a terminally failed job cannot be cancelled, so there was no way
+out. The way out is to fix the target and deploy again.
+
 **Durable queues** (renewal, deployment) use a partial unique index plus
 `ON CONFLICT DO NOTHING` and `FOR UPDATE SKIP LOCKED`. No leader election; any
 replica can run them.
@@ -340,7 +357,7 @@ need a container runtime.
 - Key Vault and F5 deployers are unit-tested only.
 - The KEK is held in the core's memory. It can be loaded from a file or from
   Vault, but delegated unwrapping (transit/KMS) needs a `CPS2` envelope.
-- Deployment ordering is not expressible.
+- Deployment waves are per certificate; two rollouts do not coordinate.
 - Discovery, CT and cloud-sync tables are thinly covered by the conformance suite.
 - Docker assets were fixed but never built — no container runtime on this machine.
 
