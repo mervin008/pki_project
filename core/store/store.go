@@ -28,6 +28,58 @@ type Store interface {
 	// ArchiveMetadataField retires a field without deleting it, so the values
 	// certificates already hold keep something that can label them.
 	ArchiveMetadataField(ctx context.Context, id string) error
+
+	// ── Users ───────────────────────────────────────────────────────────────
+	//
+	// ResolveUser is called on every authenticated request, so it both reads
+	// and writes: a subject with no row is given one, which is what makes a
+	// first sign-in work without an invitation step. It returns the stored
+	// user, whose role is the one that governs the request — the token's own
+	// role claim is not consulted.
+	ResolveUser(ctx context.Context, identity UserIdentity, bootstrapAdmins []string) (*User, error)
+	GetUser(ctx context.Context, id string) (*User, error)
+	ListUsers(ctx context.Context) ([]*User, error)
+	// SetUserRole and SetUserStatus are the administrative half, kept separate
+	// from ResolveUser so that a sign-in can never change a role.
+	SetUserRole(ctx context.Context, id, role string) (*User, error)
+	SetUserStatus(ctx context.Context, id, status string) (*User, error)
+	// TouchUser records that a subject was seen, without the cost of a write
+	// on every single request. See the postgres implementation.
+	TouchUser(ctx context.Context, id string, seenAt time.Time) error
+
+	// ── Local accounts and sessions ─────────────────────────────────────────
+	//
+	// AuthenticatePassword does the whole sign-in in one place: it finds the
+	// account, checks the lock, verifies the password, and records the outcome.
+	// Split across the caller it would be four round trips with a race in the
+	// middle of them, and the lockout counter is only meaningful if the check
+	// and the increment cannot be interleaved.
+	AuthenticatePassword(ctx context.Context, email, password string) (*User, LoginOutcome, error)
+	SetUserPassword(ctx context.Context, id, password string, mustChange bool) error
+	UserByEmail(ctx context.Context, email string) (*User, error)
+	CountUsers(ctx context.Context) (int, error)
+	// CountPasswordAccounts is what bootstrap keys off, not CountUsers.
+	// An instance upgraded from a token-only build has users but no passwords,
+	// and keying off the table being empty would leave nobody able to sign in.
+	CountPasswordAccounts(ctx context.Context) (int, error)
+
+	CreateSession(ctx context.Context, userID, tokenHash string, expiresAt time.Time, userAgent, ip string) (*Session, error)
+	// SessionByHash returns the session and its user together: every
+	// authenticated request needs both, and two queries would let a session
+	// outlive a suspension by the width of the gap between them.
+	SessionByHash(ctx context.Context, tokenHash string) (*Session, *User, error)
+	RevokeSession(ctx context.Context, tokenHash string) error
+	// RevokeSessionsForUser ends every session an account holds, which is what
+	// suspending somebody has to do to mean anything.
+	RevokeSessionsForUser(ctx context.Context, userID string) (int, error)
+	TouchSession(ctx context.Context, id string, seenAt time.Time, ip string) error
+
+	// MarkCertificateRevoked records a revocation that the CA has already
+	// accepted. It is deliberately not called until the gateway has confirmed:
+	// a row marked REVOKED while the certificate is still live at the CA is the
+	// exact failure the old DELETE produced, and it is worse than no record at
+	// all because it stops anybody looking.
+	MarkCertificateRevoked(ctx context.Context, id string, reason int, actorID string) (*Certificate, error)
 	DeleteCertificate(ctx context.Context, id string) error
 	GetCertificatesDueForRenewal(ctx context.Context, leadDays int) ([]*Certificate, error)
 	// GetCertificatePrivateKey reads the sealed private key for one
@@ -495,9 +547,32 @@ type Store interface {
 	ConsumeAgentEnrolToken(ctx context.Context, id string, now time.Time) (bool, error)
 	RevokeAgentEnrolToken(ctx context.Context, id string, revokedBy *string) error
 
+	// ClaimAgentRequestSignature records a signature and reports whether this
+	// is the first time it has been seen. False means the request is a replay.
+	//
+	// Atomic for the same reason ConsumeAgentEnrolToken is: two copies of one
+	// captured request can arrive at two replicas in the same millisecond, and
+	// a read-then-write would let both through.
+	ClaimAgentRequestSignature(ctx context.Context, agentID string, signatureHash []byte, expiresAt time.Time) (bool, error)
+	// SweepAgentRequestSignatures drops rows past their expiry. Once the
+	// timestamp window has closed the request is refused on its own, so the row
+	// is no longer protecting anything.
+	SweepAgentRequestSignatures(ctx context.Context, now time.Time) (int64, error)
+
 	// ── Audit Logs ──────────────────────────────────────────
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
 	ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error)
+
+	// UseAuditChain installs the key that makes new audit entries
+	// tamper-evident. It is on the interface rather than a constructor argument
+	// because the store is built before the keyring is loaded, and on the
+	// interface rather than one implementation because a store that chains only
+	// in memory would let the conformance suite agree with itself while the
+	// real database wrote nothing.
+	UseAuditChain(chainer *AuditChainer)
+	// VerifyAuditChain walks the chain from a sequence number and reports the
+	// first break. A limit of zero walks to the end.
+	VerifyAuditChain(ctx context.Context, from int64, limit int) (*AuditChainReport, error)
 
 	// ── Dashboard ───────────────────────────────────────────
 	GetDashboardStats(ctx context.Context) (*DashboardStats, error)

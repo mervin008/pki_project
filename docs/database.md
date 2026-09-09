@@ -346,9 +346,11 @@ hand-maintained `schema_test.sql` would drift from `migrations/`, and the suite
 would go on passing while the two diverged, which is the exact failure this
 exercise exists to end.
 
-### What the suite found on its first run
+### What the suite has found
 
-Three things, none of which any existing test could have caught.
+Eight things, none of which any existing test could have caught. Three came on
+its first run and the rest arrived later, which is the more useful lesson — the
+suite earns its keep on every schema change, not once.
 
 **The schema did not apply to plain PostgreSQL at all.** Migration 001
 references `auth.users`, `auth.jwt()` and a `supabase_realtime` publication.
@@ -363,6 +365,41 @@ would shadow the genuine one and break every RLS policy in the database.
 positive — but passing an explicit zero overrides the default and violates the
 check. The in-memory store applied a floor; PostgreSQL did not. Class B, in the
 direction where the database writer is the one missing something.
+
+**`CreateCertificate` silently dropped every revocation column.** Found on the
+first run *after* migration 030 added them, and worth recording because the
+suite caught it in both directions at once. The writer never named `revoked_at`,
+`revocation_reason` or `revoked_by`, so importing a certificate that is already
+revoked set `status = 'REVOKED'`, dropped the timestamp, and had the whole
+insert refused by 030's consistency CHECK. Class B — a model field a writer
+drops — presenting as class A: a value the Go code produces that the schema
+rejects. The in-memory store has no CHECK to violate, so it accepted the
+inconsistent pair and agreed with itself for as long as the suite ran without a
+database. `make test` was green throughout.
+
+**Four more, the day `discovery_test.go` and `cloud_test.go` started running
+against PostgreSQL at all.** Both had always called `NewMemoryStore()` directly
+rather than going through `forEachStore`, so every assertion in them had only
+ever been made against the implementation with no CHECK constraints, no foreign
+keys and no uuid columns. `preflight_test.go` now fails if another one is
+written.
+
+- `UpsertCloudCertificates` and `CreateDiscoveryResults` passed an explicit
+  empty `management_state`, which **overrides** `default 'UNMANAGED'` rather
+  than falling back to it — so the CHECK refused the row. The same trap as
+  `agents.heartbeat_interval_seconds` above, in three more tables.
+- `cloud_connections.name` was unique case-**sensitively** in PostgreSQL and
+  case-insensitively in memory, so "prod-eu" and "PROD-EU" were one connection
+  in the tests and two in production, both syncing the same account.
+- **An adopted cloud certificate reverted to unmanaged on the next sync.** The
+  upsert wrote `management_state = excluded.management_state`, and the provider
+  goes on reporting the certificate as unmanaged because it has no idea it was
+  adopted. The in-memory store had always preserved it, which is exactly why
+  nothing noticed. A test named `TestImportSurvivesTheNextSync` had been
+  asserting the opposite of what production did.
+- `GetActiveAcknowledgement` returned a half-scanned struct **alongside** its
+  error, so a caller checking only the pointer would read a database failure as
+  somebody having acknowledged the alert.
 
 **Migration 002 was never rerunnable.** PostgreSQL has no
 `add constraint if not exists`, so re-applying the file failed on

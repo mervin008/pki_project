@@ -1,7 +1,9 @@
 package api
 
 import (
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -19,6 +21,16 @@ func unexpectedQuery(c *gin.Context, allowed ...string) string {
 	for _, name := range allowed {
 		known[name] = true
 	}
+	// display_token is a credential, not a filter. A wall display that cannot
+	// set headers presents it in the query string — which is the whole reason
+	// the query form exists — and this guard was rejecting it as an unknown
+	// filter, so `GET /certificates?display_token=...` was a 400 for exactly
+	// the client the parameter was added for.
+	//
+	// Exempted here rather than in each caller's allow-list because the next
+	// endpoint to adopt this guard would otherwise reintroduce the same bug,
+	// and would do so silently: the failure only appears for kiosk clients.
+	known["display_token"] = true
 	for name := range c.Request.URL.Query() {
 		if !known[name] {
 			return name
@@ -77,4 +89,26 @@ func dedupeNames(names []string) []string {
 		out = append(out, n)
 	}
 	return out
+}
+
+// boolQuery reads an explicit opt-in from the query string.
+//
+// Only "true" counts. A parameter that is present but says something else is
+// not an opt-in, and treating "?forget=maybe" as consent for an irreversible
+// operation is the kind of leniency that gets used by accident.
+func boolQuery(c *gin.Context, name string) bool {
+	return c.Query(name) == "true"
+}
+
+// randomIndex returns a uniform index below n, from the cryptographic source.
+//
+// crypto/rand rather than math/rand: this picks characters for passwords that
+// are handed to people, and a predictable sequence there is a credential an
+// attacker can regenerate.
+func randomIndex(n int) (int, error) {
+	value, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		return 0, err
+	}
+	return int(value.Int64()), nil
 }

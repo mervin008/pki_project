@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,18 +189,39 @@ func TestMissingAndMalformedHeaders(t *testing.T) {
 	}
 }
 
-func TestAnonymousAccessOnlyAppliesWithNoHeader(t *testing.T) {
-	a := newTestAuth(t, config.AuthConfig{AllowAnonymous: true})
+// TestThereIsNoAnonymousAccess replaces the test that asserted the opposite.
+//
+// A request with no credential used to be admin when allow_anonymous was set,
+// gated to development on a loopback address. The gate worked; the feature was
+// still wrong. Every local session ran as an unnamed superuser, so the
+// authorisation paths were the least exercised code in the system and the audit
+// log attributed everything to a subject nobody could be asked about — which is
+// exactly how a uuid-only actor column survived until migration 028.
+func TestThereIsNoAnonymousAccess(t *testing.T) {
+	// Set anyway, to prove it is inert rather than merely unset by default.
+	a := newTestAuth(t, config.AuthConfig{JWTSecret: testSecret, AllowAnonymous: true})
 
 	w := runRequest(a, "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 when anonymous access is enabled", w.Code)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 — a request with no credential was served (body: %s)",
+			w.Code, w.Body.String())
 	}
+}
 
-	var body map[string]string
-	_ = json.Unmarshal(w.Body.Bytes(), &body)
-	if body["role"] != RoleAdmin {
-		t.Fatalf("anonymous role = %q, want admin", body["role"])
+// TestAllowAnonymousIsRefusedByConfiguration. The flag being inert is not
+// enough: an operator who has it set believes their instance is open, and would
+// otherwise not learn otherwise until somebody was unexpectedly refused.
+func TestAllowAnonymousIsRefusedByConfiguration(t *testing.T) {
+	cfg := &config.CoreConfig{
+		Server: config.ServerConfig{Host: "127.0.0.1", Mode: "development"},
+		Auth:   config.AuthConfig{AllowAnonymous: true, JWTSecret: testSecret},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted auth.allow_anonymous")
+	}
+	if !strings.Contains(err.Error(), "allow_anonymous") {
+		t.Fatalf("the error does not name the setting: %v", err)
 	}
 }
 
@@ -279,9 +301,20 @@ func TestRequireRole(t *testing.T) {
 	}
 }
 
-func TestNewAuthenticatorRequiresAVerificationMethod(t *testing.T) {
-	if _, err := NewAuthenticator(context.Background(), config.AuthConfig{}); err == nil {
-		t.Fatal("expected an error when no verification method is configured")
+// TestAnAuthenticatorNeedsNoTokenVerifier. A deployment using only local
+// accounts signs in with a password and a session cookie, so there is nothing
+// for the bearer path to verify against — and that is a complete configuration,
+// not a broken one. What must still fail is a *token* arriving with nothing to
+// check it against, which Verify refuses on its own.
+func TestAnAuthenticatorNeedsNoTokenVerifier(t *testing.T) {
+	a, err := NewAuthenticator(context.Background(), config.AuthConfig{})
+	if err != nil {
+		t.Fatalf("NewAuthenticator with no verifier: %v", err)
+	}
+
+	w := runRequest(a, "Bearer "+signHS256(t, validClaims(RoleAdmin)))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 — a token was accepted with nothing to verify it against", w.Code)
 	}
 }
 

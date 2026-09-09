@@ -189,6 +189,57 @@ deployer returned would report the reload it did not wait for.
 
 ---
 
+## Rollout order
+
+A target names the wave it goes in, and a wave does not start until every
+earlier wave has finished:
+
+```
+PUT /api/v1/deployment-targets/:id   {"deploy_order": 1}
+```
+
+Lower goes first. Zero is the default and is what every target has unless
+somebody says otherwise, which is one wave and exactly the behaviour that
+existed before waves did — same-wave targets deploy in parallel.
+
+```
+wave 0   staging-lb          ──▶ must succeed
+wave 1   production-lb-01  ──┐
+         production-lb-02  ──┼──▶ then these, in parallel
+         production-lb-03  ──┘
+```
+
+**A canary is a target on its own in the lowest wave.** One target, exactly one
+attempt, and the rest follow only once it has worked. Before waves the queue
+paused a rollout after a failure, which is a reaction rather than a plan: every
+replica claimed a job before anything had failed, so the first attempt landed on
+as many targets at once as there were workers.
+
+The wave is copied onto each job when the rollout is enqueued, not looked up
+when it runs. A rollout carries the plan as it stood when it began — otherwise
+reordering a target could change a rollout that is halfway through, which is how
+production takes a certificate staging never accepted.
+
+Agent-deployed targets are gated the same way. An agent polls for its own work,
+and without the same rule a host in wave 2 would install while wave 1 was still
+being attempted from the core.
+
+### When an earlier wave fails
+
+Deliberately stricter than the same-wave rule. Within a wave, a target that
+gives up stops holding up its peers; across waves it does not, because the whole
+point of declaring "staging, then production" is that a certificate staging
+would not accept must not reach production.
+
+The way out is the obvious one: **fix the target and deploy again.** The gate
+counts only the most recent job for each place, so a staging deployment that now
+succeeds releases the waves behind it. It does not count failures from previous
+rollouts — an earlier version did, which meant one bad afternoon in staging
+blocked production permanently, with no way back because a terminally failed job
+cannot be cancelled.
+
+---
+
 ## When a rollout halts
 
 If one target fails, **the rest of that certificate's rollout stops.**

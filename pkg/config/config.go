@@ -18,6 +18,53 @@ type CoreConfig struct {
 	PKI      PKIConfig      `yaml:"pki"`
 	Renewal  RenewalConfig  `yaml:"renewal"`
 	Logging  LoggingConfig  `yaml:"logging"`
+	Secrets  SecretsConfig  `yaml:"secrets"`
+}
+
+// SecretsConfig says where the key encryption key comes from.
+//
+// The KEK is the one secret CertPilot cannot function without and cannot
+// recover if it is lost: every certificate private key and CA credential in the
+// database is sealed under it. Which is why where it lives is a deployment
+// decision rather than a hard-coded one.
+type SecretsConfig struct {
+	// KEKProvider is "env" (the default), "file", or "vault".
+	//
+	// The default stays "env" because changing it would strand every existing
+	// deployment on a restart — with the specific failure being that nothing
+	// can be decrypted, which is the worst possible way to learn about a
+	// configuration change.
+	KEKProvider string `yaml:"kek_provider"`
+
+	// KEKFile and KEKRetiredFiles are used when the provider is "file". This
+	// is the shape every secret manager already speaks: a Docker secret, a
+	// Kubernetes secret volume, a systemd credential and `vault agent`
+	// templating all arrive as a file, and none of them need the value to pass
+	// through the process environment on the way.
+	KEKFile         string   `yaml:"kek_file"`
+	KEKRetiredFiles []string `yaml:"kek_retired_files"`
+
+	Vault VaultSecretsConfig `yaml:"vault"`
+}
+
+// VaultSecretsConfig reads the KEK from Vault's key/value store.
+type VaultSecretsConfig struct {
+	Address string `yaml:"address"`
+	// Path is the full API path, e.g. "secret/data/certpilot/kek" for KV v2.
+	// Both KV versions are handled without being told which.
+	Path string `yaml:"path"`
+	// Field defaults to "kek", RetiredField to "retired".
+	Field        string `yaml:"field"`
+	RetiredField string `yaml:"retired_field"`
+	// TokenFile is preferred over an inline token: it is what an AppRole login,
+	// `vault agent`, or a Kubernetes service account produces, and it can be
+	// rotated under a running process. VAULT_TOKEN is read as a last resort,
+	// for development.
+	Token     string `yaml:"token"`
+	TokenFile string `yaml:"token_file"`
+	Namespace string `yaml:"namespace"`
+	// CACert verifies Vault's own certificate. Empty uses the system roots.
+	CACert string `yaml:"ca_cert"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -53,10 +100,55 @@ type AuthConfig struct {
 	// RoleClaim names the claim inside app_metadata carrying the CertPilot
 	// role. Defaults to "certpilot_role".
 	RoleClaim string `yaml:"role_claim"`
-	// AllowAnonymous disables authentication entirely. It is refused unless
-	// the server is in development mode and bound to a loopback address, and
-	// exists so a first-run evaluation does not require an identity provider.
+	// AllowAnonymous is retained only so that setting it fails loudly.
+	//
+	// It used to treat a request with no Authorization header as admin, gated
+	// to development mode on a loopback address. The gate held, but the
+	// feature was still wrong: it meant every local session ran as an unnamed
+	// superuser, so the authorisation paths were the least exercised code in
+	// the system and the audit log attributed everything to a subject nobody
+	// could be asked about. The uuid-subject defect fixed in migration 028
+	// survived for precisely that reason.
+	//
+	// The field stays because silently ignoring it would be worse than
+	// removing it: an operator who has this set believes their instance is
+	// open and would not learn otherwise until somebody was refused.
 	AllowAnonymous bool `yaml:"allow_anonymous"`
+
+	// ClientID is the public client the browser authenticates as, using
+	// authorization code with PKCE. There is deliberately no client secret: a
+	// single-page application cannot keep one, and a secret shipped to a
+	// browser is a secret published.
+	//
+	// The core serves this to the frontend from /auth/config rather than the
+	// frontend carrying its own build-time copy. One instance is then
+	// described by one file, and an operator cannot rebuild the UI against a
+	// provider the API does not accept — a mismatch that presents as a
+	// successful login followed by 401 on every request.
+	ClientID string `yaml:"client_id"`
+
+	// Scopes requested at authorization. openid is always sent; profile and
+	// email are what populate a user's name and address here.
+	Scopes []string `yaml:"scopes"`
+
+	// RateLimitPerSecond and RateLimitBurst bound how fast one caller may make
+	// requests. Zero means the built-in defaults; negative disables the limit,
+	// which is a thing to do deliberately when something in front of the
+	// application already shapes traffic.
+	RateLimitPerSecond float64 `yaml:"rate_limit_per_second"`
+	RateLimitBurst     float64 `yaml:"rate_limit_burst"`
+
+	// BootstrapAdmins are email addresses promoted to admin the first time
+	// they sign in.
+	//
+	// Somebody has to be able to grant the first role, and every alternative
+	// is worse. "First sign-in wins" hands the estate to whoever reaches the
+	// URL first, which on an instance that is reachable before it is announced
+	// is not necessarily anyone you know. Naming the addresses makes the grant
+	// deliberate, reviewable in the same file as everything else, and safe to
+	// leave in place: it is matched only when the user has no row yet, so it
+	// cannot silently restore an admin somebody deliberately demoted.
+	BootstrapAdmins []string `yaml:"bootstrap_admins"`
 }
 
 // SupabaseConfig holds Supabase connection details.
@@ -167,6 +259,11 @@ func LoadCoreConfig(path string) (*CoreConfig, error) {
 	if cfg.Auth.RoleClaim == "" {
 		cfg.Auth.RoleClaim = "certpilot_role"
 	}
+	if len(cfg.Auth.Scopes) == 0 {
+		// openid is what makes it an OIDC request at all; the other two are
+		// what let a users list show a name instead of an opaque subject.
+		cfg.Auth.Scopes = []string{"openid", "profile", "email"}
+	}
 	// Supabase publishes its JWKS at a predictable path, so a project URL is
 	// enough to prefer asymmetric verification over the shared secret.
 	if cfg.Auth.JWKSURL == "" && cfg.Supabase.URL != "" {
@@ -185,13 +282,35 @@ func LoadCoreConfig(path string) (*CoreConfig, error) {
 // These checks exist because the dangerous settings here are all ones that look
 // harmless in a development config and then travel to production unnoticed.
 func (c *CoreConfig) Validate() error {
+	// Refused everywhere, not only in production. There is no mode in which
+	// CertPilot serves an unauthenticated caller any more.
+	if c.Auth.AllowAnonymous {
+		return fmt.Errorf("config: auth.allow_anonymous no longer exists and must be removed. " +
+			"CertPilot now requires a sign-in everywhere, including locally: use a local " +
+			"account, or configure auth.jwks_url for an identity provider")
+	}
+
+	// Checked here rather than at start-up, so a typo is a configuration error
+	// on the way in rather than a fall back to the environment — which would
+	// look like it worked until somebody noticed the key was still in an env
+	// var they thought they had removed.
+	switch c.Secrets.KEKProvider {
+	case "", "env":
+	case "file":
+		if c.Secrets.KEKFile == "" {
+			return fmt.Errorf("config: secrets.kek_provider is \"file\" but secrets.kek_file is not set")
+		}
+	case "vault":
+		if c.Secrets.Vault.Address == "" || c.Secrets.Vault.Path == "" {
+			return fmt.Errorf("config: secrets.kek_provider is \"vault\" but secrets.vault.address " +
+				"or secrets.vault.path is not set")
+		}
+	default:
+		return fmt.Errorf("config: secrets.kek_provider %q is not one of env, file, vault",
+			c.Secrets.KEKProvider)
+	}
+
 	if c.Server.IsProduction() {
-		if c.Auth.AllowAnonymous {
-			return fmt.Errorf("config: auth.allow_anonymous cannot be enabled in production mode")
-		}
-		if c.Auth.JWKSURL == "" && c.Auth.JWTSecret == "" {
-			return fmt.Errorf("config: production mode requires auth.jwks_url or auth.jwt_secret")
-		}
 		if c.Plugins.TLS.Insecure {
 			return fmt.Errorf("config: plugins.tls.insecure cannot be enabled in production mode; " +
 				"the gateway channel carries private keys and CA credentials")
@@ -201,10 +320,6 @@ func (c *CoreConfig) Validate() error {
 				return fmt.Errorf("config: server.allowed_origins cannot contain \"*\" in production mode")
 			}
 		}
-	}
-
-	if c.Auth.AllowAnonymous && !isLoopback(c.Server.Host) {
-		return fmt.Errorf("config: auth.allow_anonymous requires server.host to be a loopback address, got %q", c.Server.Host)
 	}
 
 	return nil

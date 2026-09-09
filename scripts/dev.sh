@@ -166,8 +166,29 @@ fi
 printf 'Starting API on :8080...\n'
 # With no config.dev.yaml, the core selects its in-memory local-development
 # defaults and permits the loopback gateway above without TLS.
-go run ./core/cmd/ --config=config.dev.yaml &
+#
+# The output is teed rather than left to scroll. On a first run the core prints
+# an administrator password exactly once, and it is the only thing standing
+# between the operator and an instance they cannot sign into — losing it among
+# a hundred engine start-up lines means dropping the database and starting over.
+go run ./core/cmd/ --config=config.dev.yaml 2>&1 | tee "$state_dir/core.log" &
 core_pid=$!
+
+# Captured to a file of its own, so a second `make dev` can still tell somebody
+# what the password was. Not a secret store — a note, in a gitignored directory,
+# for a credential that only ever reaches a local database.
+(
+  for _ in {1..600}; do
+    if grep -q 'An administrator account has been created' "$state_dir/core.log" 2>/dev/null; then
+      grep -A 4 'An administrator account has been created' "$state_dir/core.log" \
+        | grep -E 'email:|password:' \
+        | sed 's/^│ *//' > "$state_dir/dev-admin"
+      chmod 600 "$state_dir/dev-admin"
+      break
+    fi
+    sleep 0.5
+  done
+) &
 
 printf 'Starting frontend on :3000...\n'
 (cd frontend && npm run dev) &

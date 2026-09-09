@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { Bell, Monitor, RefreshCw, SunMoon } from 'lucide-vue-next'
+import { Bell, LogOut, Monitor, RefreshCw, SunMoon } from 'lucide-vue-next'
 import { useAlertsStore } from '@/stores/alerts'
 import { useAuthStore } from '@/stores/auth'
 import { useCasStore } from '@/stores/cas'
@@ -28,6 +28,14 @@ import { formatRelative, formatTime } from '@/lib/format'
 const route = useRoute()
 const alerts = useAlertsStore()
 const auth = useAuthStore()
+
+// Names the person and the role together. A screen showing a name but not a
+// role invites somebody to attempt an action their session cannot perform and
+// read the refusal as a fault.
+const identityTitle = computed(() => {
+  if (!auth.isAuthenticated) return 'Not signed in'
+  return `${auth.displayName} · ${auth.role} · click to sign out`
+})
 const cas = useCasStore()
 const theme = useThemeStore()
 const stream = useEventStream()
@@ -207,9 +215,27 @@ onBeforeUnmount(() => {
         <SunMoon class="w-3.5 h-3.5" />
       </button>
 
-      <span class="rail-role" :title="auth.user?.email ?? 'Anonymous (development)'">
-        {{ auth.role }}
-      </span>
+      <!-- Who the API thinks you are, and the role it will actually enforce.
+           Shown together on purpose: a screen that displays a name but not a
+           role invites somebody to attempt an action their session cannot
+           perform and read the refusal as a fault. -->
+      <div class="rail-identity" :title="identityTitle">
+        <span class="rail-role">{{ auth.role }}</span>
+        <span v-if="auth.me?.email" class="rail-who">{{ auth.me.email }}</span>
+      </div>
+
+      <!-- Labelled, not an icon alone. Signing out of a console that can export
+           private keys is not a control to make somebody hunt for, and an
+           unlabelled glyph in a row of unlabelled glyphs is exactly that. -->
+      <button
+        v-if="auth.isAuthenticated"
+        class="rail-signout"
+        title="Sign out"
+        @click="auth.signOut()"
+      >
+        <LogOut class="w-3.5 h-3.5" />
+        <span>Sign out</span>
+      </button>
     </div>
   </header>
 </template>
@@ -394,6 +420,47 @@ onBeforeUnmount(() => {
   padding: 0.75rem 0.25rem;
   font-size: var(--fs-small);
   color: var(--text-muted);
+}
+
+.rail-signout {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0 0.5rem;
+  height: 22px;
+  align-self: center;
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  color: var(--text-secondary);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.rail-signout:hover {
+  background: var(--ink-hover);
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+
+.rail-identity {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  line-height: 1.15;
+  min-width: 0;
+}
+
+.rail-who {
+  font-size: var(--fs-micro);
+  color: var(--text-muted);
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .rail-role {

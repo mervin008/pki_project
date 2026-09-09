@@ -15,17 +15,18 @@
 package secrets
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"strings"
 )
 
 // Context strings identify which field a ciphertext belongs to. They are bound
@@ -99,33 +100,12 @@ func NewKeyring(primary []byte, retired ...[]byte) (*Keyring, error) {
 
 // LoadKeyring reads CERTPILOT_KEK (required) and CERTPILOT_KEK_RETIRED (an
 // optional comma-separated list), both base64-encoded 32-byte keys.
+//
+// Kept as the environment provider spelled out, because it is the default and
+// because every existing deployment calls it. Anything wanting a key from
+// somewhere else goes through LoadKeyringFrom.
 func LoadKeyring() (*Keyring, error) {
-	primaryB64 := strings.TrimSpace(os.Getenv("CERTPILOT_KEK"))
-	if primaryB64 == "" {
-		return nil, ErrNoKey
-	}
-
-	primary, err := decodeKey(primaryB64)
-	if err != nil {
-		return nil, fmt.Errorf("secrets: CERTPILOT_KEK is invalid: %w", err)
-	}
-
-	var retired [][]byte
-	if raw := strings.TrimSpace(os.Getenv("CERTPILOT_KEK_RETIRED")); raw != "" {
-		for _, part := range strings.Split(raw, ",") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			k, err := decodeKey(part)
-			if err != nil {
-				return nil, fmt.Errorf("secrets: CERTPILOT_KEK_RETIRED contains an invalid key: %w", err)
-			}
-			retired = append(retired, k)
-		}
-	}
-
-	return NewKeyring(primary, retired...)
+	return LoadKeyringFrom(context.Background(), EnvProvider{})
 }
 
 // NewEphemeralKeyring generates a keyring backed by a random KEK that exists
@@ -345,4 +325,83 @@ func zero(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// ── Keyed authentication ────────────────────────────────
+
+// PurposeAuditChain domain-separates the audit log's chain key. A purpose
+// string is bound into the subkey derivation, so a tag computed for one
+// purpose can never be replayed as a valid tag for another.
+const PurposeAuditChain = "audit-chain"
+
+// MACSize is the length in bytes of a tag returned by MAC.
+const MACSize = sha256.Size
+
+// MAC authenticates data under a subkey derived from the primary KEK and
+// returns the tag alongside the identifier of the key that produced it.
+//
+// The identifier is what makes rotation survivable. A tag computed today and
+// checked after a KEK rotation is still verifiable, because VerifyMAC looks the
+// original key up in the keyring by that identifier — exactly as Decrypt does
+// for an envelope. Without it, rotating the KEK would invalidate every audit
+// chain link ever written, which is a strong reason never to rotate.
+//
+// The KEK itself never leaves the keyring: callers get a tag, not key material.
+// That boundary is the whole point for the audit log — the key lives in the
+// core's environment and not in the database, so somebody holding a database
+// dump can rewrite a row but cannot produce a tag that agrees with it.
+func (kr *Keyring) MAC(purpose string, data []byte) (keyIDHex string, tag []byte, err error) {
+	if kr == nil {
+		return "", nil, ErrNoKey
+	}
+	kek, ok := kr.keks[kr.primaryID]
+	if !ok {
+		return "", nil, ErrNoKey
+	}
+	return kr.PrimaryKeyID(), mac(kek, purpose, data), nil
+}
+
+// VerifyMAC recomputes the tag with the KEK named by keyIDHex and compares in
+// constant time.
+//
+// An unknown identifier returns ErrUnknownKey rather than false. The two mean
+// different things to an operator reading the result: a mismatch says the
+// record was altered, while an unknown key says this core cannot answer the
+// question because the KEK that wrote the record was never given to it.
+func (kr *Keyring) VerifyMAC(keyIDHex, purpose string, data, tag []byte) (bool, error) {
+	if kr == nil {
+		return false, ErrNoKey
+	}
+
+	raw, err := hex.DecodeString(keyIDHex)
+	if err != nil || len(raw) != keyIDSize {
+		return false, ErrUnknownKey
+	}
+	var id [keyIDSize]byte
+	copy(id[:], raw)
+
+	kek, ok := kr.keks[id]
+	if !ok {
+		return false, ErrUnknownKey
+	}
+	return subtle.ConstantTimeCompare(mac(kek, purpose, data), tag) == 1, nil
+}
+
+// mac derives a purpose-specific subkey from the KEK and authenticates data
+// under it.
+//
+// Two layers of HMAC rather than one: the KEK is also the wrapping key for
+// every stored secret, and using it directly as a MAC key would mean one key
+// serving two cryptographic roles. The derivation keeps them separate, so a
+// weakness in one construction cannot be carried into the other.
+func mac(kek []byte, purpose string, data []byte) []byte {
+	derive := hmac.New(sha256.New, kek)
+	derive.Write([]byte("certpilot/subkey\x00"))
+	derive.Write([]byte(purpose))
+	subkey := derive.Sum(nil)
+	defer zero(subkey)
+
+	h := hmac.New(sha256.New, subkey)
+	h.Write(data)
+	return h.Sum(nil)
 }

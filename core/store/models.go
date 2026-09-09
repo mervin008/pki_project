@@ -10,26 +10,39 @@ import (
 
 // CAAuthority represents a Certificate Authority record.
 type CAAuthority struct {
-	ID                      string     `json:"id"`
-	Name                    string     `json:"name"`
-	CAType                  string     `json:"ca_type"` // ROOT, INTERMEDIATE, ISSUING
-	SubjectDN               string     `json:"subject_dn"`
-	IssuerDN                string     `json:"issuer_dn"`
-	SerialNumber            string     `json:"serial_number,omitempty"`
-	NotBefore               time.Time  `json:"not_before"`
-	NotAfter                time.Time  `json:"not_after"`
-	DaysRemaining           int        `json:"days_remaining"`
-	KeyType                 string     `json:"key_type"`
-	KeySize                 int        `json:"key_size"`
-	FingerprintSHA256       string     `json:"fingerprint_sha256"`
-	CertificatePEM          string     `json:"certificate_pem"`
-	ParentCAID              *string    `json:"parent_ca_id,omitempty"`
-	CRLDistributionURL      string     `json:"crl_distribution_url,omitempty"`
-	OCSPResponderURL        string     `json:"ocsp_responder_url,omitempty"`
-	IsCRLFresh              bool       `json:"is_crl_fresh"`
-	CRLLastChecked          *time.Time `json:"crl_last_checked,omitempty"`
-	IsOCSPResponsive        bool       `json:"is_ocsp_responsive"`
-	OCSPLastChecked         *time.Time `json:"ocsp_last_checked,omitempty"`
+	ID                 string     `json:"id"`
+	Name               string     `json:"name"`
+	CAType             string     `json:"ca_type"` // ROOT, INTERMEDIATE, ISSUING
+	SubjectDN          string     `json:"subject_dn"`
+	IssuerDN           string     `json:"issuer_dn"`
+	SerialNumber       string     `json:"serial_number,omitempty"`
+	NotBefore          time.Time  `json:"not_before"`
+	NotAfter           time.Time  `json:"not_after"`
+	DaysRemaining      int        `json:"days_remaining"`
+	KeyType            string     `json:"key_type"`
+	KeySize            int        `json:"key_size"`
+	FingerprintSHA256  string     `json:"fingerprint_sha256"`
+	CertificatePEM     string     `json:"certificate_pem"`
+	ParentCAID         *string    `json:"parent_ca_id,omitempty"`
+	CRLDistributionURL string     `json:"crl_distribution_url,omitempty"`
+	OCSPResponderURL   string     `json:"ocsp_responder_url,omitempty"`
+	IsCRLFresh         bool       `json:"is_crl_fresh"`
+	CRLLastChecked     *time.Time `json:"crl_last_checked,omitempty"`
+	// IsOCSPResponsive means a verified answer was obtained, not that an HTTP
+	// request succeeded. Before migration 033 it meant the latter, which any
+	// web server at that address could satisfy.
+	IsOCSPResponsive bool       `json:"is_ocsp_responsive"`
+	OCSPLastChecked  *time.Time `json:"ocsp_last_checked,omitempty"`
+	// OCSPStatus is what the responder said about this CA certificate: GOOD,
+	// REVOKED or UNKNOWN. Empty means never asked, which is not the same as
+	// UNKNOWN — that is the responder disclaiming knowledge of a certificate it
+	// ought to know about.
+	OCSPStatus    string     `json:"ocsp_status,omitempty"`
+	OCSPRevokedAt *time.Time `json:"ocsp_revoked_at,omitempty"`
+	// OCSPLastError says why the last check produced no verified answer. "The
+	// responder is unreachable" and "something answered and it was not the CA"
+	// are different problems, and a boolean cannot tell them apart.
+	OCSPLastError           string     `json:"ocsp_last_error,omitempty"`
 	CertificatesIssuedCount int64      `json:"certificates_issued_count"`
 	AlertThresholds         string     `json:"alert_thresholds,omitempty"` // JSON string
 	LastAlertSentAt         *time.Time `json:"last_alert_sent_at,omitempty"`
@@ -262,6 +275,16 @@ type Certificate struct {
 	PostureRequirements   json.RawMessage `json:"posture_requirements,omitempty"`
 	QuantumReadinessScore *int            `json:"quantum_readiness_score,omitempty"`
 	QuantumAssessedAt     *time.Time      `json:"quantum_assessed_at,omitempty"`
+
+	// Revocation. RevokedAt and Status must agree — the schema enforces it,
+	// because a row carrying a revocation timestamp while still reading ISSUED
+	// is the disagreement that makes somebody trust the wrong one.
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	// RevocationReason is the RFC 5280 CRLReason, stored as the integer the
+	// standard defines because that is what reaches the CRL and the OCSP
+	// responder.
+	RevocationReason *int   `json:"revocation_reason,omitempty"`
+	RevokedBy        string `json:"revoked_by,omitempty"`
 	// VerifyAfter is when the next check may run, set on a successful renewal
 	// to now plus a grace period: a deployment done by hand does not happen in
 	// the same second as the issuance.
@@ -301,6 +324,14 @@ type DeploymentTarget struct {
 	// organisation ship private keys" is answerable by reading the target list
 	// — without the KEK, and without decrypting anything.
 	DeploysPrivateKey bool `json:"deploys_private_key"`
+
+	// DeployOrder is which rollout wave this target belongs to. Lower goes
+	// first, and a wave does not start until every earlier one has finished.
+	//
+	// Zero for everything by default, which is one wave and the behaviour that
+	// existed before waves did. A canary is a target on its own in the lowest
+	// wave: one target, exactly one attempt, declared rather than inferred.
+	DeployOrder int `json:"deploy_order"`
 
 	// CloudConnectionID names the account whose credentials this target
 	// borrows, for the target types that borrow one.
@@ -358,6 +389,20 @@ type AuditLog struct {
 	Details    string    `json:"details,omitempty"` // JSON string
 	IPAddress  *string   `json:"ip_address,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
+
+	// Seq is the entry's position in the tamper-evidence chain, assigned by the
+	// store. Gapless, so a deleted entry shows up as a hole rather than simply
+	// not being there. Zero for entries written before the chain existed.
+	Seq int64 `json:"seq,omitempty"`
+	// EntryHash is this entry's keyed tag; PrevHash is the tag of the entry
+	// before it. PrevHash is not serialised because it is only meaningful while
+	// walking the chain, and a caller that wants to check the record should ask
+	// the verifier rather than reassemble the walk itself.
+	EntryHash []byte `json:"entry_hash,omitempty"`
+	PrevHash  []byte `json:"-"`
+	// ChainKeyID names the KEK whose subkey produced EntryHash, so a chain
+	// written before a key rotation stays verifiable afterwards.
+	ChainKeyID string `json:"-"`
 }
 
 // DisplayToken is a long-lived, read-only credential for an unattended screen.
@@ -1294,6 +1339,13 @@ type DeploymentJob struct {
 	LastError  string              `json:"last_error,omitempty"`
 	AttemptLog []DeploymentAttempt `json:"attempt_log"`
 
+	// DeployOrder is the wave this job belongs to, copied from the target when
+	// the rollout was enqueued. Copied rather than looked up, so that
+	// reordering a target cannot change the plan of a rollout already under
+	// way — which is how production ends up with a certificate staging never
+	// accepted.
+	DeployOrder int `json:"deploy_order"`
+
 	// Fingerprint is what this job is trying to install, captured at enqueue.
 	// Not read off the certificate at run time: a job enqueued by a renewal is
 	// for that renewal's certificate, and if a newer one exists there is a
@@ -1945,4 +1997,174 @@ func (f *MetadataField) HasOption(value string) bool {
 		}
 	}
 	return false
+}
+
+// User is CertPilot's own record of a person who has signed in.
+//
+// The identity provider remains the authority on who somebody is; this is the
+// authority on what they may do here. Roles used to come from a claim on the
+// token, which meant that promoting a colleague required an administrator of
+// the identity provider and took effect only when that person's token next
+// refreshed — the wrong ownership for a team that runs the CA hierarchy but
+// rarely runs Okta.
+type User struct {
+	ID string `json:"id"`
+	// Issuer and Subject together are the identity. A subject is unique only
+	// within the issuer that minted it, so neither half means anything alone.
+	Issuer  string `json:"issuer"`
+	Subject string `json:"subject"`
+
+	Email       string `json:"email,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+
+	Role   string `json:"role"`
+	Status string `json:"status"`
+	// RoleSource distinguishes a deliberate grant from a default and from a
+	// bootstrap, so a users list can be read without guessing.
+	RoleSource string `json:"role_source"`
+	// MustChangePassword marks a credential the holder did not choose — the
+	// generated one printed at first start. Not a control in itself; it is what
+	// lets the UI insist rather than hope.
+	MustChangePassword bool `json:"must_change_password"`
+
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// LocalIssuer marks an account that exists only in CertPilot.
+//
+// Stored in the column an identity provider's issuer goes in, so that a local
+// account and a federated one cannot collide even if a provider ever issued
+// the same subject.
+const LocalIssuer = "certpilot-local"
+
+// RBAC roles, in ascending order of privilege.
+//
+// Declared here as well as in core/server/middleware because middleware
+// imports this package and the dependency cannot run the other way. The three
+// definitions that must agree are these constants, middleware.Role*, and the
+// CHECK constraint on users.role in migration 028 — a Go constant a CHECK
+// refuses is the oldest defect class in this store, and it fails at runtime on
+// the write, not at compile time.
+const (
+	RoleViewer   = "viewer"
+	RoleAuditor  = "auditor"
+	RoleOperator = "operator"
+	RoleAdmin    = "admin"
+)
+
+// ValidRole reports whether a role is one the store will accept, so a handler
+// can refuse a bad value with a message instead of surfacing a CHECK violation.
+func ValidRole(role string) bool {
+	switch role {
+	case RoleViewer, RoleAuditor, RoleOperator, RoleAdmin:
+		return true
+	}
+	return false
+}
+
+// User status values. Suspension is not deletion: removing the row would
+// orphan every audit entry attributed to that subject.
+const (
+	UserStatusActive    = "ACTIVE"
+	UserStatusSuspended = "SUSPENDED"
+)
+
+// How a user came to hold the role they hold.
+const (
+	RoleSourceDefault   = "DEFAULT"
+	RoleSourceBootstrap = "BOOTSTRAP"
+	RoleSourceAssigned  = "ASSIGNED"
+)
+
+// IsActive reports whether this user may act at all.
+func (u *User) IsActive() bool { return u.Status == UserStatusActive }
+
+// UserIdentity is what an authenticated request knows about its caller before
+// the store has been consulted.
+type UserIdentity struct {
+	Issuer      string
+	Subject     string
+	Email       string
+	DisplayName string
+}
+
+// Session is a signed-in browser.
+//
+// Rows rather than signed tokens, so that the core holds no key capable of
+// forging one and so a session can be ended the instant an account is
+// suspended. The raw token exists only in the cookie; what is stored is its
+// SHA-256 hash, compared in constant time — the same design as DisplayToken.
+type Session struct {
+	ID     string `json:"id"`
+	UserID string `json:"user_id"`
+	// TokenHash is hex-encoded SHA-256. The raw token is returned once, at
+	// creation, and never again.
+	TokenHash string `json:"-"`
+
+	ExpiresAt time.Time  `json:"expires_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+	LastSeenIP string     `json:"last_seen_ip,omitempty"`
+	UserAgent  string     `json:"user_agent,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// IsUsable reports whether this session may still authenticate a request.
+func (s *Session) IsUsable(now time.Time) bool {
+	return s.RevokedAt == nil && now.Before(s.ExpiresAt)
+}
+
+// LoginOutcome is why a password sign-in did not succeed.
+//
+// The distinctions exist for the audit log and for the operator reading it. The
+// caller is told only that sign-in failed: telling somebody that an address
+// exists but the password was wrong is how an attacker enumerates accounts, and
+// telling them an account is locked tells them their guessing is working.
+type LoginOutcome int
+
+const (
+	LoginOK LoginOutcome = iota
+	LoginNoSuchAccount
+	LoginWrongPassword
+	LoginLockedOut
+	LoginSuspended
+	LoginNoPasswordSet
+)
+
+// LoginLockout is the throttle applied to password sign-in.
+//
+// Held in the database rather than in process memory because the core runs as
+// several replicas behind a load balancer, and an attacker spreading attempts
+// across them would reset an in-memory counter with every request. CertPilot
+// has no rate limiting, so this is the only thing standing between a password
+// endpoint and an unlimited guessing oracle.
+const (
+	MaxFailedLogins = 8
+	LockoutWindow   = 15 * time.Minute
+)
+
+// RevocationReasons are the RFC 5280 CRLReason codes CertPilot accepts.
+//
+// The set is ACME's, which is the narrowest of the three gateways and therefore
+// the one that works everywhere. certificateHold (6) is deliberately excluded:
+// it is reversible, nothing here can lift a hold, and offering it would let
+// somebody believe they had suspended a certificate this system can never
+// un-suspend.
+var RevocationReasons = map[int]string{
+	0: "unspecified",
+	1: "keyCompromise",
+	3: "affiliationChanged",
+	4: "superseded",
+	5: "cessationOfOperation",
+	9: "privilegeWithdrawn",
+}
+
+// ValidRevocationReason reports whether a reason code may be used.
+func ValidRevocationReason(reason int) bool {
+	_, ok := RevocationReasons[reason]
+	return ok
 }

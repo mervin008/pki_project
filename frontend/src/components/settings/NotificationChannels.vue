@@ -182,32 +182,32 @@ async function remove(channel: NotificationChannel) {
 </script>
 
 <template>
-  <section class="card bg-base-100 border border-base-300">
-    <div class="card-body p-5 gap-4">
+  <section class="panel border">
+    <div class="panel-body p-5 gap-4">
       <div class="flex items-start justify-between gap-3">
         <div>
-          <h2 class="card-title text-sm font-bold flex items-center gap-2">
-            <Bell class="w-4 h-4 text-primary" />
+          <h2 class="label-rail flex items-center gap-2">
+            <Bell class="w-4 h-4 text-[color:var(--signal)]" />
             Alert delivery
           </h2>
-          <p class="text-xs opacity-60 mt-1">
+          <p class="text-xs text-[color:var(--text-muted)] mt-1">
             Where CA expiry and renewal failures are sent. A channel that has never been tested is
             a promise, not a capability.
           </p>
         </div>
-        <button class="btn btn-primary btn-sm gap-1.5" @click="showForm = !showForm">
+        <button class="btn-console btn-signal gap-1.5" @click="showForm = !showForm">
           <Plus class="w-4 h-4" /> Add
         </button>
       </div>
 
-      <div v-if="error" role="alert" class="alert alert-error py-2">
+      <div v-if="error" role="alert" class="notice py-2" data-tone="critical">
         <CircleX class="w-4 h-4 shrink-0" />
         <span class="text-xs break-words">{{ error }}</span>
       </div>
 
       <!-- Create -->
-      <form v-if="showForm" class="border border-base-300 rounded-lg p-4 space-y-3" @submit.prevent="create">
-        <div v-if="formError" role="alert" class="alert alert-error py-2">
+      <form v-if="showForm" class="border p-4 space-y-3" @submit.prevent="create">
+        <div v-if="formError" role="alert" class="notice py-2" data-tone="critical">
           <CircleX class="w-4 h-4 shrink-0" />
           <span class="text-xs break-words">{{ formError }}</span>
         </div>
@@ -215,9 +215,9 @@ async function remove(channel: NotificationChannel) {
         <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <input
             v-model="form.name" required placeholder="Name, e.g. pki-oncall"
-            class="input input-bordered input-sm sm:col-span-2"
+            class="input-console sm:col-span-2"
           />
-          <select v-model="form.channel_type" class="select select-bordered select-sm">
+          <select v-model="form.channel_type" class="select-console">
             <option v-for="t in supportedTypes" :key="t" :value="t">{{ t }}</option>
           </select>
         </div>
@@ -227,20 +227,20 @@ async function remove(channel: NotificationChannel) {
           v-if="form.channel_type === 'slack'"
           v-model="form.slack.webhook_url" type="url" required
           placeholder="https://hooks.slack.com/services/…"
-          class="input input-bordered input-sm w-full font-mono text-xs"
+          class="input-console w-full font-mono text-xs"
         />
 
         <!-- Webhook -->
         <template v-else-if="form.channel_type === 'webhook'">
           <input
             v-model="form.webhook.url" type="url" required placeholder="https://receiver.example.com/hook"
-            class="input input-bordered input-sm w-full font-mono text-xs"
+            class="input-console w-full font-mono text-xs"
           />
           <input
             v-model="form.webhook.signing_secret" placeholder="Signing secret (optional, 16+ characters)"
-            class="input input-bordered input-sm w-full font-mono text-xs"
+            class="input-console w-full font-mono text-xs"
           />
-          <p class="text-[11px] opacity-60">
+          <p class="text-[11px] text-[color:var(--text-muted)]">
             With a secret, each delivery carries an HMAC-SHA256 over
             <code>timestamp.body</code> in <code>X-CertPilot-Signature</code>.
           </p>
@@ -249,45 +249,45 @@ async function remove(channel: NotificationChannel) {
         <!-- Email -->
         <template v-else-if="form.channel_type === 'email'">
           <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <input v-model="form.email.host" required placeholder="SMTP host" class="input input-bordered input-sm sm:col-span-2" />
-            <input v-model.number="form.email.port" type="number" placeholder="587" class="input input-bordered input-sm" />
-            <input v-model="form.email.username" placeholder="Username (optional)" class="input input-bordered input-sm" />
-            <input v-model="form.email.password" type="password" placeholder="Password (optional)" class="input input-bordered input-sm" />
-            <input v-model="form.email.from" required placeholder="From address" class="input input-bordered input-sm" />
-            <input v-model="form.email.to" required placeholder="To, comma separated" class="input input-bordered input-sm sm:col-span-3" />
+            <input v-model="form.email.host" required placeholder="SMTP host" class="input-console sm:col-span-2" />
+            <input v-model.number="form.email.port" type="number" placeholder="587" class="input-console" />
+            <input v-model="form.email.username" placeholder="Username (optional)" class="input-console" />
+            <input v-model="form.email.password" type="password" placeholder="Password (optional)" class="input-console" />
+            <input v-model="form.email.from" required placeholder="From address" class="input-console" />
+            <input v-model="form.email.to" required placeholder="To, comma separated" class="input-console sm:col-span-3" />
           </div>
         </template>
 
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <label class="form-control">
-            <span class="label-text text-xs">Minimum severity</span>
-            <select v-model="form.severity_threshold" class="select select-bordered select-sm">
+          <label class="field">
+            <span class="label-micro">Minimum severity</span>
+            <select v-model="form.severity_threshold" class="select-console">
               <option value="INFO">INFO — everything</option>
               <option value="WARNING">WARNING and above</option>
               <option value="CRITICAL">CRITICAL only</option>
             </select>
           </label>
-          <label class="form-control">
-            <span class="label-text text-xs">Topics — none selected means all</span>
-            <select v-model="form.topics" multiple class="select select-bordered select-sm h-24">
+          <label class="field">
+            <span class="label-micro">Topics — none selected means all</span>
+            <select v-model="form.topics" multiple class="select-console h-24">
               <option v-for="t in topics" :key="t" :value="t">{{ t }}</option>
             </select>
           </label>
         </div>
 
         <div class="flex justify-end gap-2">
-          <button type="button" class="btn btn-ghost btn-sm" @click="showForm = false">Cancel</button>
-          <button type="submit" class="btn btn-primary btn-sm" :disabled="saving">
-            <span v-if="saving" class="loading loading-spinner loading-xs"></span>
+          <button type="button" class="btn-console" @click="showForm = false">Cancel</button>
+          <button type="submit" class="btn-console btn-signal" :disabled="saving">
+            <span v-if="saving" class="spinner-console"></span>
             Save
           </button>
         </div>
       </form>
 
       <!-- List -->
-      <div v-if="loading && !channels.length" class="text-xs opacity-60">Loading…</div>
+      <div v-if="loading && !channels.length" class="text-xs text-[color:var(--text-muted)]">Loading…</div>
 
-      <div v-else-if="!channels.length" class="text-xs opacity-60 py-4 text-center">
+      <div v-else-if="!channels.length" class="text-xs text-[color:var(--text-muted)] py-4 text-center">
         No channels configured. CA expiry alerts are recorded in the audit log and shown on the
         dashboard, but nobody is being told.
       </div>
@@ -296,21 +296,21 @@ async function remove(channel: NotificationChannel) {
         <div
           v-for="channel in channels"
           :key="channel.id"
-          class="border border-base-300 rounded-lg p-3"
+          class="border p-3"
         >
           <div class="flex items-center justify-between gap-3 flex-wrap">
             <div class="min-w-0">
               <div class="flex items-center gap-2">
                 <span class="font-bold text-sm">{{ channel.name }}</span>
-                <span class="badge badge-ghost badge-xs">{{ channel.channel_type }}</span>
+                <span class="tag">{{ channel.channel_type }}</span>
                 <span
-                  class="badge badge-xs"
-                  :class="channel.is_enabled ? 'badge-success' : 'badge-ghost'"
+                  class="tag"
+                  :class="channel.is_enabled ? 'sev-ok' : 'sev-unknown'"
                 >
                   {{ channel.is_enabled ? 'enabled' : 'disabled' }}
                 </span>
               </div>
-              <div class="text-[11px] opacity-60 mt-0.5">
+              <div class="text-[11px] text-[color:var(--text-muted)] mt-0.5">
                 {{ channel.severity_threshold }} and above ·
                 {{ channel.topics.length ? channel.topics.join(', ') : 'all topics' }} ·
                 <template v-if="channel.last_sent_at">
@@ -322,17 +322,17 @@ async function remove(channel: NotificationChannel) {
 
             <div class="flex items-center gap-1.5 shrink-0">
               <button
-                class="btn btn-outline btn-xs gap-1.5"
+                class="btn-console gap-1.5"
                 :disabled="testing === channel.id"
                 @click="sendTest(channel)"
               >
                 <Send class="w-3 h-3" />
                 {{ testing === channel.id ? 'Sending…' : 'Send test' }}
               </button>
-              <button class="btn btn-ghost btn-xs" :disabled="busy === channel.id" @click="toggle(channel)">
+              <button class="btn-console" :disabled="busy === channel.id" @click="toggle(channel)">
                 {{ channel.is_enabled ? 'Disable' : 'Enable' }}
               </button>
-              <button class="btn btn-ghost btn-xs text-error" :disabled="busy === channel.id" @click="remove(channel)">
+              <button class="btn-console sev-critical" :disabled="busy === channel.id" @click="remove(channel)">
                 <Trash2 class="w-3 h-3" />
               </button>
             </div>

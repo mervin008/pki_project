@@ -274,6 +274,14 @@ func (h *DiscoveryHandler) ListResults(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
 
+	// See the note on the same check in the cloud handler: scan_id lands in a
+	// uuid column, and an unvalidated one turned a typo into a 500 with the
+	// driver's error in the body.
+	if raw := c.Query("scan_id"); raw != "" && !isUUID(raw) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "scan_id must be a uuid"})
+		return
+	}
+
 	filter := store.DiscoveryResultFilter{
 		ScanID:          c.Query("scan_id"),
 		ManagementState: strings.ToUpper(c.Query("management_state")),

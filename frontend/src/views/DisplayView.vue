@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { AlertTriangle, Maximize, ShieldCheck, WifiOff } from 'lucide-vue-next'
 import { useCasStore } from '@/stores/cas'
 import { useEventStream } from '@/composables/useEventStream'
-import { caSeverity, compareSeverity, severityBorder, severityText, statusLabel, type Severity } from '@/lib/severity'
+import { caSeverity, compareSeverity, sevClass, statusLabel, type Severity } from '@/lib/severity'
 import { hasDisplayToken } from '@/lib/displayToken'
 import { formatDate } from '@/lib/format'
 
@@ -119,7 +119,7 @@ const tiles = computed(() => [
   { label: 'Warning', value: cas.summary.warning_cas, tone: 'text-warning' },
   { label: 'Critical', value: cas.summary.critical_cas, tone: 'text-error' },
   { label: 'Expired', value: cas.summary.expired_cas, tone: 'text-error' },
-  { label: 'Unassessed', value: cas.summary.unknown_cas, tone: 'text-base-content/70' },
+  { label: 'Unassessed', value: cas.summary.unknown_cas, tone: 'text-[color:var(--text-secondary)]' },
 ])
 
 const staleSince = computed(() => {
@@ -143,7 +143,7 @@ function remaining(days: number): string {
 </script>
 
 <template>
-  <div class="h-screen w-screen flex flex-col bg-base-200 overflow-hidden select-none">
+  <div class="h-screen w-screen flex flex-col overflow-hidden select-none">
     <!-- Alarm band. Occupies the top of the screen so a dead feed is the first
          thing seen, ahead of any figure it would otherwise be trusted for.
          Suppressed when the reason is a rejected credential: the panel below
@@ -152,7 +152,7 @@ function remaining(days: number): string {
     <div
       v-if="stale && !unauthorised"
       role="alert"
-      class="wall-alarm bg-error text-error-content px-8 py-4 flex items-center gap-5 shrink-0"
+      class="wall-alarm px-8 py-4 flex items-center gap-5 shrink-0 bg-[color:var(--sev-critical)] text-[color:var(--ink-page)]"
     >
       <WifiOff class="w-10 h-10 shrink-0" />
       <div class="min-w-0">
@@ -171,7 +171,7 @@ function remaining(days: number): string {
     <header class="px-8 pt-6 pb-4 flex items-end justify-between gap-6 shrink-0">
       <div class="flex items-center gap-4 min-w-0">
         <div
-          class="w-12 h-12 rounded-xl bg-primary flex items-center justify-center text-primary-content font-bold font-mono shrink-0"
+          class="w-12 h-12 flex items-center justify-center font-bold font-mono shrink-0 bg-[color:var(--signal)] text-[color:var(--ink-page)]"
         >
           CP
         </div>
@@ -179,7 +179,7 @@ function remaining(days: number): string {
           <div class="text-2xl font-black tracking-tight leading-tight">
             Certificate Authority Health
           </div>
-          <div class="text-sm text-base-content/60 font-mono">
+          <div class="text-sm text-[color:var(--text-muted)] font-mono">
             CertPilot ·
             <span :class="stale ? 'text-error font-bold' : 'text-success'">
               {{ stale ? 'FEED DOWN' : statusLabel(stream.status.value) }}
@@ -190,11 +190,11 @@ function remaining(days: number): string {
 
       <div class="text-right shrink-0">
         <div class="text-5xl font-black tabular-nums leading-none">{{ timeText }}</div>
-        <div class="text-sm text-base-content/60 mt-1">{{ dateText }}</div>
+        <div class="text-sm text-[color:var(--text-muted)] mt-1">{{ dateText }}</div>
       </div>
 
       <button
-        class="btn btn-ghost btn-sm opacity-20 hover:opacity-100 shrink-0"
+        class="btn-console opacity-20 hover:opacity-100 shrink-0"
         title="Fullscreen"
         @click="goFullscreen"
       >
@@ -215,12 +215,12 @@ function remaining(days: number): string {
       <!-- Not authorised -->
       <div v-if="unauthorised" class="flex-1 flex items-center justify-center">
         <div class="text-center max-w-2xl">
-          <AlertTriangle class="w-20 h-20 mx-auto text-error" />
+          <AlertTriangle class="w-20 h-20 mx-auto sev-critical" />
           <h2 class="text-4xl font-black mt-6">This display is not authorised</h2>
-          <p class="text-lg text-base-content/70 mt-3">
+          <p class="text-lg text-[color:var(--text-secondary)] mt-3">
             {{ stream.lastError.value ?? cas.error }}
           </p>
-          <p class="text-base text-base-content/60 mt-6">
+          <p class="text-base text-[color:var(--text-muted)] mt-6">
             <template v-if="hasDisplayToken()">
               The display token this screen is using has been revoked or has expired. An
               administrator can issue a replacement and relaunch this screen at its new URL.
@@ -236,8 +236,8 @@ function remaining(days: number): string {
       <!-- First load -->
       <div v-else-if="connecting" class="flex-1 flex items-center justify-center">
         <div class="text-center">
-          <span class="loading loading-spinner loading-lg opacity-40"></span>
-          <p class="text-xl text-base-content/60 mt-4">Connecting to CertPilot…</p>
+          <span class="spinner-console loading-lg opacity-40"></span>
+          <p class="text-xl text-[color:var(--text-muted)] mt-4">Connecting to CertPilot…</p>
         </div>
       </div>
 
@@ -247,12 +247,12 @@ function remaining(days: number): string {
           <div
             v-for="tile in tiles"
             :key="tile.label"
-            class="bg-base-100 rounded-xl border border-base-300 px-4 py-3"
+            class="border px-4 py-3"
           >
             <div class="text-4xl font-black tabular-nums leading-none" :class="tile.tone">
               {{ tile.value }}
             </div>
-            <div class="text-xs uppercase tracking-widest text-base-content/50 mt-1.5">
+            <div class="text-xs uppercase tracking-widest text-[color:var(--text-muted)] mt-1.5">
               {{ tile.label }}
             </div>
           </div>
@@ -263,14 +263,15 @@ function remaining(days: number): string {
           <div
             v-for="ca in shown"
             :key="ca.id"
-            class="bg-base-100 rounded-xl border border-base-300 border-l-8 flex items-center gap-6 px-6 py-3"
-            :class="severityBorder(caSeverity(ca.status))"
+            class="border border-l-8 border-[color:var(--line)] flex items-center gap-6 px-6 py-3"
+            :class="sevClass(caSeverity(ca.status))"
+            :style="{ borderLeftColor: `var(--sev-${caSeverity(ca.status)})` }"
           >
             <div class="w-28 text-center shrink-0">
               <div
                 class="font-black tabular-nums leading-none"
                 :class="[
-                  severityText(caSeverity(ca.status)),
+                  sevClass(caSeverity(ca.status)),
                   ca.days_remaining < 0 ? 'text-2xl' : 'text-5xl',
                 ]"
               >
@@ -286,17 +287,17 @@ function remaining(days: number): string {
 
             <div class="min-w-0 flex-1">
               <div class="text-2xl font-bold truncate leading-tight">{{ ca.name }}</div>
-              <div class="text-sm text-base-content/60 font-mono">
+              <div class="text-sm text-[color:var(--text-muted)] font-mono">
                 {{ statusLabel(ca.ca_type) }} · expires {{ formatDate(ca.not_after) }}
                 <template v-if="ca.crl_distribution_url && !ca.is_crl_fresh">
-                  · <span class="text-warning">CRL stale</span>
+                  · <span class="sev-warning">CRL stale</span>
                 </template>
               </div>
             </div>
 
             <div
               class="text-xl font-bold uppercase tracking-wide shrink-0"
-              :class="severityText(caSeverity(ca.status))"
+              :class="sevClass(caSeverity(ca.status))"
             >
               {{ statusLabel(ca.status) }}
             </div>
@@ -308,7 +309,7 @@ function remaining(days: number): string {
           <div class="text-center">
             <ShieldCheck class="w-20 h-20 mx-auto opacity-20" />
             <h2 class="text-3xl font-bold mt-5">No certificate authorities are being monitored</h2>
-            <p class="text-lg text-base-content/60 mt-2">
+            <p class="text-lg text-[color:var(--text-muted)] mt-2">
               This screen is empty because nothing has been imported, not because everything is
               healthy.
             </p>
@@ -320,7 +321,7 @@ function remaining(days: number): string {
         <div
           v-if="hidden.length"
           class="text-center text-base shrink-0"
-          :class="hiddenNeedingAttention > 0 ? 'text-warning font-bold' : 'text-base-content/50'"
+          :class="hiddenNeedingAttention > 0 ? 'sev-warning font-bold' : 'text-[color:var(--text-muted)]'"
         >
           <template v-if="hiddenNeedingAttention > 0">
             {{ hiddenNeedingAttention }} further
@@ -335,7 +336,7 @@ function remaining(days: number): string {
 
         <div
           v-else-if="worst === 'ok' && cas.authorities.length"
-          class="text-center text-base text-base-content/50 shrink-0"
+          class="text-center text-base text-[color:var(--text-muted)] shrink-0"
         >
           All {{ cas.authorities.length }} authorities healthy · {{ needingAttention }} needing
           attention

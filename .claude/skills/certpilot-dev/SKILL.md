@@ -16,6 +16,24 @@ and someone verified every claim in it against the code.
 
 ---
 
+## Screenshotting an authenticated page
+
+`--screenshot` cannot sign in and inherits the system appearance, which is why
+the light theme went unverified for so long. Drive Chrome over CDP instead —
+Node 22+ has a global `WebSocket`, so nothing needs installing:
+
+```
+chrome --headless --remote-debugging-port=9222 --remote-allow-origins='*' \
+       --user-data-dir=/tmp/prof about:blank &
+```
+
+Then `POST /api/v1/auth/login` with `fetch`, take the `certpilot_session` cookie
+out of `Set-Cookie`, and plant it with `Network.setCookie` — it is httpOnly, so
+the page cannot be made to set it. `Emulation.setEmulatedMedia` with
+`prefers-color-scheme` forces either theme regardless of the system.
+
+A working copy is in the session scratchpad as `theme-shot.mjs`.
+
 ## Running and verifying
 
 ### The loop that catches real defects

@@ -1,5 +1,16 @@
 # REST API reference
 
+> **There is also a documentation site**, at
+> <https://mervin008.github.io/certpilot-docs/>, built from
+> [`certpilot-docs`](https://github.com/mervin008/certpilot-docs). Its endpoint
+> tables are generated from `core/api/router.go` via
+> [`scripts/extract-routes.py`](../scripts/extract-routes.py), so they cannot
+> drift from the router.
+>
+> This file remains the deeper guide: it explains what each resource *means* —
+> discovery verdicts, ARI, the deployment queue's retry curve — which the
+> generated site does not yet cover. Keep both in mind when editing.
+
 All endpoints are under `/api/v1` and speak JSON. `GET /healthz` is the only
 unauthenticated route.
 
@@ -1571,11 +1582,20 @@ path is inside them, so a heartbeat's signature cannot be lifted onto a route
 that does something. An empty body is hashed rather than skipped, so "no body"
 and "an empty body" are not interchangeable.
 
-**What this does not prevent:** an identical request replayed inside the
-five-minute tolerance. There is no nonce, deliberately — a nonce would have to
-be checked against something every replica shares, and one checked in a single
-replica's memory implies a property that does not hold across a deployment of
-two. Decoration in a security mechanism is worse than its absence.
+**Replay is prevented on the endpoints where it changes something.** The core
+records the signatures it has accepted — in the database, not in a replica's
+memory, because a check one replica performs alone implies a property that does
+not hold across a deployment of two — and refuses a repeat on
+`POST /agent/certificates` and `POST /agent/deployments/claim`.
+
+Heartbeats, inventory, installation reports and deployment results are exempt.
+A signature covers a one-second timestamp, so an agent retrying after a network
+timeout re-sends bytes it already signed; on a report those are indistinguishable
+from a replay and refusing the retry turns a recovered blip into a failure.
+
+A refused replay answers `401` with `"code": "agent_replay"`. An agent's own
+retries sign afresh with a new timestamp and never collide, so seeing this means
+something else is re-sending its traffic.
 
 The reference implementation is [`pkg/agentauth`](../pkg/agentauth), and
 `SigningString` is written out as its own exported function precisely so an

@@ -8,6 +8,7 @@ import { useAlertsStore } from '@/stores/alerts'
 import { useEventStream } from '@/composables/useEventStream'
 import CommandRail from '@/components/layout/CommandRail.vue'
 import StreamStatusBanner from '@/components/common/StreamStatusBanner.vue'
+import PasswordChangePrompt from '@/components/common/PasswordChangePrompt.vue'
 
 const authStore = useAuthStore()
 const themeStore = useThemeStore()
@@ -53,6 +54,10 @@ const showChrome = computed(() => route.meta.chrome !== false)
   <router-view v-if="!showChrome" />
 
   <div v-else class="flex flex-col h-screen">
+    <!-- Over everything, including the rail. A generated password is one two
+         people know, and a prompt that can be worked around is not a prompt. -->
+    <PasswordChangePrompt v-if="authStore.mustChangePassword" />
+
     <CommandRail />
     <StreamStatusBanner />
     <main

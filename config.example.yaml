@@ -42,7 +42,14 @@ auth:
 
   # Skip authentication entirely and treat every request as admin.
   # Refused unless mode is development and host is a loopback address.
-  allow_anonymous: true
+  # Who becomes the first administrator. Matched only when no account can yet
+  # sign in, so it grants a first role and never maintains one — removing an
+  # address here does not demote anybody.
+  #
+  # On first start CertPilot creates this account, generates a password, and
+  # prints it once. There is no anonymous mode and no default password.
+  bootstrap_admins:
+    - "you@example.com"
 
 # Gateway plugins. Each CA provider runs as its own process.
 plugins:

@@ -35,6 +35,18 @@ export interface CaAuthority {
   crl_last_checked?: string
   is_ocsp_responsive: boolean
   ocsp_last_checked?: string
+  /**
+   * What the responder said about this CA certificate itself.
+   *
+   * The OCSP URL in a certificate names the responder run by the authority
+   * above it, so this is the answer to "has my parent revoked me" — the
+   * highest-consequence fact about an intermediate. Absent means never asked,
+   * which is not the same as UNKNOWN.
+   */
+  ocsp_status?: 'GOOD' | 'REVOKED' | 'UNKNOWN'
+  ocsp_revoked_at?: string
+  /** Why the last check produced no verified answer. */
+  ocsp_last_error?: string
   certificates_issued_count: number
   alert_thresholds?: string
   last_alert_sent_at?: string

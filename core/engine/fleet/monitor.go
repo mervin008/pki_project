@@ -129,6 +129,21 @@ func (m *Monitor) run() {
 // unique index, and for the same reason: no leader, no failover gap.
 func (m *Monitor) RunSweep(ctx context.Context) {
 	now := m.now()
+
+	// Replay-guard rows first, and unconditionally: this runs whether or not
+	// any agent has gone quiet, because the table grows with every certificate
+	// request the fleet makes and nothing else deletes from it. A row is
+	// useless once its timestamp window has closed — the signature is refused
+	// on its own age by then.
+	if removed, err := m.store.SweepAgentRequestSignatures(ctx, now); err != nil {
+		// Not a reason to skip the stale-agent sweep below. The consequence of
+		// this failing is a table that grows; the consequence of returning here
+		// is nobody being told a host has stopped reporting.
+		slog.Warn("could not sweep expired agent request signatures", "error", err)
+	} else if removed > 0 {
+		slog.Debug("swept expired agent request signatures", "removed", removed)
+	}
+
 	agents, err := m.store.GetStaleAgents(ctx, now, batch)
 	if err != nil {
 		slog.Error("could not read the agent fleet; hosts that have gone quiet are not being reported", "error", err)

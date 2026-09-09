@@ -45,7 +45,7 @@ const staleAge = computed(() => {
 <template>
   <div v-if="visible" class="space-y-2">
     <!-- Stale: the numbers below are last-known-good and may be wrong. -->
-    <div v-if="stale" role="alert" class="alert alert-error rounded-none border-x-0 border-t-0">
+    <div v-if="stale" role="alert" class="notice rounded-none border-x-0 border-t-0" data-tone="critical">
       <AlertTriangle class="w-5 h-5 shrink-0" />
       <div class="flex-1 min-w-0">
         <h2 class="font-bold text-sm">This dashboard is not receiving updates</h2>
@@ -60,7 +60,7 @@ const staleAge = computed(() => {
           <template v-if="stream.lastError.value"> ({{ stream.lastError.value }})</template>
         </p>
       </div>
-      <button class="btn btn-sm" @click="stream.reconnectNow()">
+      <button class="btn-console" @click="stream.reconnectNow()">
         <RotateCw class="w-3.5 h-3.5" />
         Reconnect
       </button>
@@ -70,7 +70,7 @@ const staleAge = computed(() => {
     <div
       v-else-if="reconnecting"
       role="status"
-      class="alert alert-warning rounded-none border-x-0 border-t-0 py-2"
+      class="notice rounded-none border-x-0 border-t-0 py-2" data-tone="warning"
     >
       <RotateCw class="w-4 h-4 shrink-0 animate-spin" />
       <span class="text-xs">
@@ -87,7 +87,7 @@ const staleAge = computed(() => {
     <div
       v-if="alerts.incomplete"
       role="status"
-      class="alert alert-warning rounded-none border-x-0 border-t-0 py-2"
+      class="notice rounded-none border-x-0 border-t-0 py-2" data-tone="warning"
     >
       <AlertTriangle class="w-4 h-4 shrink-0" />
       <span class="text-xs">
@@ -95,7 +95,7 @@ const staleAge = computed(() => {
         {{ alerts.droppedCount > 0 ? `${alerts.droppedCount} events were` : 'some events were' }}
         dropped. The alert list is incomplete; the figures have been resynchronised.
       </span>
-      <button class="btn btn-ghost btn-xs" @click="alerts.clear()">Dismiss</button>
+      <button class="btn-console" @click="alerts.clear()">Dismiss</button>
     </div>
   </div>
 </template>

@@ -144,11 +144,11 @@ async function importResult(result: DiscoveryResult) {
 function verdictClass(state: DiscoveryResult['management_state']) {
   switch (state) {
     case 'UNMANAGED':
-      return 'badge-warning'
+      return 'sev-warning'
     case 'UNREACHABLE':
-      return 'badge-ghost'
+      return 'sev-unknown'
     default:
-      return 'badge-success'
+      return 'sev-ok'
   }
 }
 
@@ -159,7 +159,7 @@ function severityClass(severity: string) {
     case 'WARNING':
       return 'text-warning'
     default:
-      return 'text-base-content/60'
+      return 'sev-unknown'
   }
 }
 
@@ -242,34 +242,32 @@ async function deleteSchedule(schedule: DiscoverySchedule) {
 
 <template>
   <div class="space-y-6">
-    <p class="text-sm text-base-content/60">
+    <p class="text-sm text-[color:var(--text-muted)]">
       Scan endpoints and find the certificates nobody told CertPilot about.
     </p>
 
-    <div class="card bg-base-100 border border-base-300">
-      <div class="card-body p-5">
-        <h2 class="card-title text-sm font-bold mb-3">
-          <Radar class="w-4 h-4 text-primary" /> Scan endpoints
+    <div class="panel border">
+      <div class="panel-body p-5">
+        <h2 class="label-rail mb-3">
+          <Radar class="w-4 h-4 text-[color:var(--signal)]" /> Scan endpoints
         </h2>
         <form @submit.prevent="runScan" class="flex items-end gap-3">
-          <div class="form-control flex-1">
-            <label class="label">
-              <span class="label-text text-xs">Hosts — one or many, separated by spaces or commas</span>
-            </label>
+          <div class="field flex-1">
+            <label class="label-micro">Hosts — one or many, separated by spaces or commas</label>
             <input
               v-model="targetInput"
               type="text"
               placeholder="example.com, 10.0.0.0/24, 10.0.0.4-40:8443"
-              class="input input-bordered input-sm"
+              class="input-console"
               required
             />
           </div>
-          <div class="form-control w-24">
-            <label class="label"><span class="label-text text-xs">Default port</span></label>
-            <input v-model="port" type="number" class="input input-bordered input-sm" />
+          <div class="field w-24">
+            <label class="label-micro">Default port</label>
+            <input v-model="port" type="number" class="input-console" />
           </div>
-          <button type="submit" class="btn btn-primary btn-sm gap-2" :disabled="scanning">
-            <span v-if="scanning" class="loading loading-spinner loading-xs"></span>
+          <button type="submit" class="btn-console btn-signal gap-2" :disabled="scanning">
+            <span v-if="scanning" class="spinner-console"></span>
             <Search v-else class="w-3.5 h-3.5" />
             Scan {{ targets.length || '' }}
           </button>
@@ -279,88 +277,88 @@ async function deleteSchedule(schedule: DiscoverySchedule) {
 
     <!-- Schedules. A scan run once is a snapshot; this is the version that
          catches an endpoint somebody stood up last Tuesday. -->
-    <div class="card bg-base-100 border border-base-300">
-      <div class="card-body p-5">
-        <h2 class="card-title text-sm font-bold mb-3">
-          <CalendarClock class="w-4 h-4 text-primary" /> Scheduled scans
+    <div class="panel border">
+      <div class="panel-body p-5">
+        <h2 class="label-rail mb-3">
+          <CalendarClock class="w-4 h-4 text-[color:var(--signal)]" /> Scheduled scans
         </h2>
 
         <div v-if="schedules.length" class="space-y-2 mb-4">
           <div
             v-for="schedule in schedules"
             :key="schedule.id"
-            class="flex items-center justify-between gap-3 text-xs border border-base-200 rounded-lg p-3"
+            class="flex items-center justify-between gap-3 text-xs border p-3"
           >
             <div class="min-w-0">
               <div class="flex items-center gap-2">
                 <span class="font-medium">{{ schedule.name }}</span>
-                <span v-if="!schedule.is_enabled" class="badge badge-ghost badge-xs">disabled</span>
+                <span v-if="!schedule.is_enabled" class="tag">disabled</span>
               </div>
-              <div class="font-mono text-base-content/60 truncate">
+              <div class="font-mono text-[color:var(--text-muted)] truncate">
                 {{ schedule.targets.join(', ') }} · every
                 {{ schedule.interval_minutes }} min
               </div>
-              <div class="text-base-content/60">
+              <div class="text-[color:var(--text-muted)]">
                 last run {{ formatWhen(schedule.last_run_at) }} · next
                 {{ formatWhen(schedule.next_run_at) }}
               </div>
               <!-- A schedule that fails every night and is never read is worse
                    than none: it is the appearance of coverage. -->
-              <div v-if="schedule.last_error" class="text-error mt-1">
+              <div v-if="schedule.last_error" class="sev-critical mt-1">
                 last run did not happen: {{ schedule.last_error }}
               </div>
             </div>
             <div class="flex items-center gap-2 shrink-0">
-              <button class="btn btn-xs btn-outline" @click="runSchedule(schedule)">Run now</button>
-              <button class="btn btn-xs btn-ghost text-error" @click="deleteSchedule(schedule)">
+              <button class="btn-console" @click="runSchedule(schedule)">Run now</button>
+              <button class="btn-console btn-danger" @click="deleteSchedule(schedule)">
                 <Trash2 class="w-3 h-3" />
               </button>
             </div>
           </div>
         </div>
-        <p v-else class="text-xs text-base-content/60 mb-4">
+        <p v-else class="text-xs text-[color:var(--text-muted)] mb-4">
           Nothing is being scanned on a schedule, so anything that appears between manual scans
           goes unnoticed.
         </p>
 
         <form @submit.prevent="createSchedule" class="flex items-end gap-3">
-          <div class="form-control w-40">
-            <label class="label"><span class="label-text text-xs">Name</span></label>
-            <input v-model="newSchedule.name" class="input input-bordered input-sm" required />
+          <div class="field w-40">
+            <label class="label-micro">Name</label>
+            <input v-model="newSchedule.name" class="input-console" required />
           </div>
-          <div class="form-control flex-1">
-            <label class="label"><span class="label-text text-xs">Targets</span></label>
+          <div class="field flex-1">
+            <label class="label-micro">Targets</label>
             <input
               v-model="newSchedule.targets"
-              class="input input-bordered input-sm"
+              class="input-console"
               placeholder="10.0.0.0/24"
               required
             />
           </div>
-          <div class="form-control w-28">
-            <label class="label"><span class="label-text text-xs">Every (min)</span></label>
+          <div class="field w-28">
+            <label class="label-micro">Every (min)</label>
             <input
               v-model="newSchedule.interval_minutes"
               type="number"
-              class="input input-bordered input-sm"
+              class="input-console"
             />
           </div>
-          <button type="submit" class="btn btn-sm" :disabled="savingSchedule">Add</button>
+          <button type="submit" class="btn-console" :disabled="savingSchedule">Add</button>
         </form>
 
-        <div v-if="scheduleError" role="alert" class="alert alert-error mt-3">
+        <div v-if="scheduleError" role="alert" class="notice mt-3" data-tone="critical">
           <AlertTriangle class="w-4 h-4" />
           <span class="text-sm">{{ scheduleError }}</span>
         </div>
       </div>
     </div>
 
-    <div v-if="scanError" role="alert" class="alert alert-error">
+    <div v-if="scanError" role="alert" class="notice" data-tone="critical">
       <AlertTriangle class="w-4 h-4" />
       <span class="text-sm">{{ scanError }}</span>
     </div>
 
-    <div v-if="importMessage" role="status" class="alert alert-info">
+    <div v-if="importMessage" role="status" class="notice" data-tone="signal">
       <CheckCircle class="w-4 h-4" />
       <span class="text-sm">{{ importMessage }}</span>
     </div>
@@ -368,12 +366,12 @@ async function deleteSchedule(schedule: DiscoverySchedule) {
     <div v-if="response" class="space-y-4">
       <!-- The summary, not the counts, because zero unmanaged and zero
            reachable look identical as numbers and mean opposite things. -->
-      <div class="card bg-base-100 border border-base-300">
-        <div class="card-body p-5 gap-2">
+      <div class="panel border">
+        <div class="panel-body p-5 gap-2">
           <div class="flex items-start justify-between gap-3">
             <div>
               <p class="text-sm font-medium">{{ response.summary }}</p>
-              <p class="text-xs text-base-content/60 font-mono mt-1">
+              <p class="text-xs text-[color:var(--text-muted)] font-mono mt-1">
                 {{ response.scan.results_count }}<span v-if="response.target_count">
                   of {{ response.target_count }}</span> scanned ·
                 {{ response.scan.unmanaged_count }} unmanaged ·
@@ -383,17 +381,17 @@ async function deleteSchedule(schedule: DiscoverySchedule) {
             </div>
             <button
               v-if="running"
-              class="btn btn-xs btn-outline btn-error"
+              class="btn-console btn-danger"
               :disabled="cancelling"
               @click="cancelScan"
             >
-              <span v-if="cancelling" class="loading loading-spinner loading-xs"></span>
+              <span v-if="cancelling" class="spinner-console"></span>
               Stop scan
             </button>
           </div>
           <progress
             v-if="running && response.target_count"
-            class="progress progress-primary w-full"
+            class="meter w-full"
             :value="response.scan.results_count"
             :max="response.target_count"
           ></progress>
@@ -403,63 +401,63 @@ async function deleteSchedule(schedule: DiscoverySchedule) {
       <div
         v-for="result in results"
         :key="result.id"
-        class="card bg-base-100 border border-base-300"
+        class="panel border"
       >
-        <div class="card-body p-5 gap-3">
+        <div class="panel-body p-5 gap-3">
           <div class="flex items-center justify-between gap-3">
             <div class="flex items-center gap-3">
-              <span class="badge badge-sm" :class="verdictClass(result.management_state)">
+              <span class="tag" :class="verdictClass(result.management_state)">
                 {{ result.management_state }}
               </span>
               <span class="font-mono text-sm">{{ result.host }}:{{ result.port }}</span>
-              <span class="text-xs text-base-content/60">{{ result.common_name || '—' }}</span>
+              <span class="text-xs text-[color:var(--text-muted)]">{{ result.common_name || '—' }}</span>
             </div>
             <button
               v-if="result.management_state === 'UNMANAGED' && result.reachable"
-              class="btn btn-xs btn-outline"
+              class="btn-console"
               :disabled="importing === result.id"
               @click="importResult(result)"
             >
-              <span v-if="importing === result.id" class="loading loading-spinner loading-xs"></span>
+              <span v-if="importing === result.id" class="spinner-console"></span>
               Import
             </button>
           </div>
 
-          <p v-if="!result.reachable" class="text-xs font-mono text-base-content/60">
+          <p v-if="!result.reachable" class="text-xs font-mono text-[color:var(--text-muted)]">
             {{ result.error }}
           </p>
 
           <div v-else class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
             <div>
-              <div class="text-base-content/60">Trust</div>
+              <div class="text-[color:var(--text-muted)]">Trust</div>
               <div class="font-mono">{{ result.trust_state }}</div>
             </div>
             <div>
-              <div class="text-base-content/60">Expires</div>
+              <div class="text-[color:var(--text-muted)]">Expires</div>
               <div class="font-mono">{{ formatDate(result.not_after) }}</div>
             </div>
             <div>
-              <div class="text-base-content/60">Issuer</div>
+              <div class="text-[color:var(--text-muted)]">Issuer</div>
               <div class="font-mono truncate">{{ result.issuer_dn || '—' }}</div>
             </div>
             <div>
-              <div class="text-base-content/60">Key</div>
+              <div class="text-[color:var(--text-muted)]">Key</div>
               <div class="font-mono">{{ result.key_type }}-{{ result.key_size }}</div>
             </div>
             <div>
-              <div class="text-base-content/60">TLS</div>
+              <div class="text-[color:var(--text-muted)]">TLS</div>
               <div class="font-mono">{{ result.tls_version || '—' }}</div>
             </div>
             <div>
-              <div class="text-base-content/60">Cipher</div>
+              <div class="text-[color:var(--text-muted)]">Cipher</div>
               <div class="font-mono truncate">{{ result.cipher_suite || '—' }}</div>
             </div>
             <div>
-              <div class="text-base-content/60">Key exchange</div>
+              <div class="text-[color:var(--text-muted)]">Key exchange</div>
               <div class="font-mono truncate">{{ result.key_exchange || '—' }}</div>
             </div>
             <div>
-              <div class="text-base-content/60">Chain sent</div>
+              <div class="text-[color:var(--text-muted)]">Chain sent</div>
               <div class="font-mono">{{ result.chain_length }}</div>
             </div>
           </div>
@@ -469,7 +467,7 @@ async function deleteSchedule(schedule: DiscoverySchedule) {
               <span class="font-mono shrink-0" :class="severityClass(finding.severity)">
                 {{ finding.code }}
               </span>
-              <span class="text-base-content/70">{{ finding.detail }}</span>
+              <span class="text-[color:var(--text-secondary)]">{{ finding.detail }}</span>
             </li>
           </ul>
         </div>

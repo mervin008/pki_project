@@ -1,5 +1,5 @@
-import { supabase } from '@/lib/supabase'
 import { displayTokenHeaders } from '@/lib/displayToken'
+import { onUnauthorized } from '@/lib/session'
 
 export function useApi() {
   async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
@@ -8,27 +8,30 @@ export function useApi() {
       ...(options.headers as Record<string, string>),
     }
 
-    // Attach the access token when signed in. With no Supabase project
-    // configured, requests go out unauthenticated — which the core accepts only
-    // in development mode on a loopback address, and rejects otherwise.
-    if (supabase) {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession()
-      if (session?.access_token) {
-        headers['Authorization'] = `Bearer ${session.access_token}`
-      }
-    }
-
     // A wall display has no session. It authenticates with a kiosk token, which
     // must reach every REST call and not only the event stream — a screen whose
     // feed connects while each panel returns 401 is the worst of both.
-    Object.assign(headers, displayTokenHeaders(headers['Authorization'] !== undefined))
+    Object.assign(headers, displayTokenHeaders(false))
 
     const response = await fetch(endpoint, {
       ...options,
+      // The credential is the session cookie, which is httpOnly and therefore
+      // invisible to this code. Stated explicitly rather than left to the
+      // same-origin default: this line is the whole authentication story for a
+      // person using the console, and it should be visible as such. A federated
+      // sign-in gets the same cookie — the browser stopped handling bearer
+      // tokens when the core took over redeeming the authorization code.
+      credentials: 'same-origin',
       headers,
     })
+
+    // A 401 once the token has already been refreshed means the session is
+    // genuinely over — revoked, or the refresh token spent. Handled centrally
+    // so that every panel does not have to recognise it, and so the operator is
+    // told rather than left reading a screen of failed requests as an outage.
+    if (response.status === 401) {
+      onUnauthorized()
+    }
 
     if (!response.ok) {
       // The API returns {"error": "..."}; prefer that message, since it is

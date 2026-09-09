@@ -25,14 +25,23 @@ import (
 // a data race out of an ordinary dashboard refresh.
 type MemoryStore struct {
 	mu             sync.RWMutex
-	certificates   map[string]*Certificate
-	caAuthorities  map[string]*CAAuthority
-	caAccounts     map[string]*CAAccount
-	targets        map[string]*DeploymentTarget
-	policies       map[string]*Policy
-	displayTokens  map[string]*DisplayToken
-	metadataFields map[string]*MetadataField
-	notifChannels  map[string]*NotificationChannel
+	auditChain     *AuditChainer
+	auditChainHead int64
+	// agentSignatures is the replay guard, mirroring the table PostgreSQL uses.
+	// Present here so the conformance suite can hold both to the same rule.
+	agentSignatures map[agentSignatureKey]time.Time
+	certificates    map[string]*Certificate
+	caAuthorities   map[string]*CAAuthority
+	caAccounts      map[string]*CAAccount
+	targets         map[string]*DeploymentTarget
+	policies        map[string]*Policy
+	displayTokens   map[string]*DisplayToken
+	metadataFields  map[string]*MetadataField
+	users           map[string]*User
+	sessions        map[string]*Session
+	passwordHashes  map[string]string
+	loginFailures   map[string]*loginState
+	notifChannels   map[string]*NotificationChannel
 	// acks is append-only, newest last. Who acknowledged what and when is the
 	// record an incident review reads, so an acknowledgement is never
 	// overwritten by the next one.
@@ -225,6 +234,10 @@ func NewMemoryStore() *MemoryStore {
 		targets:        make(map[string]*DeploymentTarget),
 		policies:       map[string]*Policy{polID: policy1},
 		metadataFields: map[string]*MetadataField{},
+		users:          map[string]*User{},
+		sessions:       map[string]*Session{},
+		passwordHashes: map[string]string{},
+		loginFailures:  map[string]*loginState{},
 		// Deliberately empty. Every other map here carries sample data so a
 		// first run has something to render, but a seeded credential is a
 		// credential someone forgets to remove.
@@ -862,15 +875,88 @@ func (m *MemoryStore) TouchDisplayToken(ctx context.Context, id string, seenAt t
 	return nil
 }
 
+func (m *MemoryStore) UseAuditChain(chainer *AuditChainer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditChain = chainer
+}
+
 func (m *MemoryStore) CreateAuditLog(ctx context.Context, log *AuditLog) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if log.ID == "" {
 		log.ID = uuid.New().String()
 	}
-	log.CreatedAt = time.Now()
+	// Truncated to microseconds even though nothing here needs it to be, so
+	// that an entry written to this store and one written to PostgreSQL cover
+	// the same bytes. A chain that only verifies in memory is exactly the class
+	// of defect this project keeps finding.
+	log.CreatedAt = time.Now().UTC().Truncate(time.Microsecond)
+
+	if m.auditChain != nil {
+		// The mutex is doing what the advisory lock does in PostgreSQL: the head
+		// read and the append are one atomic step, so concurrent writers cannot
+		// chain from the same predecessor.
+		// Counted, not derived from the slice length: this store seeds a
+		// sample entry, and any entry written before the chainer arrived is
+		// unchained. Numbering from the slice length would leave a permanent
+		// off-by-one that reads as a deleted record.
+		log.Seq = m.auditChainHead + 1
+		prev := append([]byte(nil), AuditChainZeroPrev...)
+		if len(m.auditLogs) > 0 {
+			// auditLogs is newest-first.
+			if head := m.auditLogs[0]; len(head.EntryHash) > 0 {
+				prev = append([]byte(nil), head.EntryHash...)
+			}
+		}
+		keyID, tag, err := m.auditChain.Link(log, prev)
+		if err != nil {
+			return err
+		}
+		log.PrevHash = prev
+		log.EntryHash = tag
+		log.ChainKeyID = keyID
+		m.auditChainHead = log.Seq
+	}
+
 	m.auditLogs = append([]*AuditLog{clone(log)}, m.auditLogs...)
 	return nil
+}
+
+func (m *MemoryStore) VerifyAuditChain(ctx context.Context, from int64, limit int) (*AuditChainReport, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if from < 1 {
+		from = 1
+	}
+
+	var unchained int64
+	// auditLogs is newest-first; the chain walks the other way.
+	ascending := make([]*AuditLog, 0, len(m.auditLogs))
+	for i := len(m.auditLogs) - 1; i >= 0; i-- {
+		l := m.auditLogs[i]
+		if l.Seq == 0 {
+			unchained++
+			continue
+		}
+		if l.Seq < from {
+			continue
+		}
+		// clone is a shallow struct copy, so the tags would otherwise be the
+		// store's own backing arrays handed to a caller that outlives the lock.
+		c := clone(l)
+		c.PrevHash = append([]byte(nil), l.PrevHash...)
+		c.EntryHash = append([]byte(nil), l.EntryHash...)
+		ascending = append(ascending, c)
+	}
+
+	truncated := false
+	if limit > 0 && len(ascending) > limit {
+		ascending = ascending[:limit]
+		truncated = true
+	}
+	return verifyAuditChainOver(ascending, m.auditChain, from, unchained, truncated), nil
 }
 
 func (m *MemoryStore) ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error) {
@@ -2549,7 +2635,7 @@ func (m *MemoryStore) ClaimDeploymentJob(ctx context.Context, worker string, lea
 		if target, ok := m.targets[job.TargetID]; ok && target.AgentID != nil {
 			continue
 		}
-		if m.heldBackByAFailure(job) {
+		if m.heldBackByAFailure(job) || m.heldBackByAnEarlierWave(job) {
 			continue
 		}
 		if best == nil || moreUrgentDeployment(job, best) {
@@ -2574,9 +2660,14 @@ func (m *MemoryStore) ClaimDeploymentJob(ctx context.Context, worker string, lea
 	return clone(best), nil
 }
 
-// moreUrgentDeployment ranks by the expiry being raced, matching the queue's
-// ORDER BY, so the screen agrees with what is actually happening next.
+// moreUrgentDeployment ranks by wave and then by the expiry being raced,
+// matching the queue's ORDER BY, so the screen agrees with what is actually
+// happening next.
 func moreUrgentDeployment(a, b *DeploymentJob) bool {
+	// Wave first. The order an operator declared outranks the arithmetic.
+	if a.DeployOrder != b.DeployOrder {
+		return a.DeployOrder < b.DeployOrder
+	}
 	switch {
 	case a.NotAfter == nil && b.NotAfter == nil:
 		return a.RunAfter.Before(b.RunAfter)
@@ -2946,6 +3037,39 @@ func (m *MemoryStore) ConsumeAgentEnrolToken(ctx context.Context, id string, now
 	t.Uses++
 	t.UpdatedAt = time.Now()
 	return true, nil
+}
+
+// agentSignature is one seen request, keyed the way the database keys it.
+type agentSignatureKey struct {
+	agentID string
+	hash    string
+}
+
+func (m *MemoryStore) ClaimAgentRequestSignature(ctx context.Context, agentID string, signatureHash []byte, expiresAt time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.agentSignatures == nil {
+		m.agentSignatures = make(map[agentSignatureKey]time.Time)
+	}
+	key := agentSignatureKey{agentID: agentID, hash: string(signatureHash)}
+	if _, seen := m.agentSignatures[key]; seen {
+		return false, nil
+	}
+	m.agentSignatures[key] = expiresAt
+	return true, nil
+}
+
+func (m *MemoryStore) SweepAgentRequestSignatures(ctx context.Context, now time.Time) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var removed int64
+	for key, expires := range m.agentSignatures {
+		if !expires.After(now) {
+			delete(m.agentSignatures, key)
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 func (m *MemoryStore) RevokeAgentEnrolToken(ctx context.Context, id string, revokedBy *string) error {
@@ -3344,7 +3468,7 @@ func (m *MemoryStore) ClaimAgentDeploymentJobs(ctx context.Context, agentID, wor
 	for _, job := range m.deploymentJobs {
 		ready := (job.Status == DeployPending && !job.RunAfter.After(now)) ||
 			(job.Status == DeployRunning && job.LockedUntil != nil && job.LockedUntil.Before(now))
-		if ready && mine[job.TargetID] && !m.heldBackByAFailure(job) {
+		if ready && mine[job.TargetID] && !m.heldBackByAFailure(job) && !m.heldBackByAnEarlierWave(job) {
 			claimable = append(claimable, job)
 		}
 	}
@@ -3428,6 +3552,47 @@ func (m *MemoryStore) heldBackByAFailure(job *DeploymentJob) bool {
 			continue
 		}
 		if other.Outstanding() && other.LastError != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// isLatestJobForBinding reports whether nothing newer has been queued for the
+// same place, which is what turns "has ever failed" into "is currently broken".
+func (m *MemoryStore) isLatestJobForBinding(job *DeploymentJob) bool {
+	for _, other := range m.deploymentJobs {
+		if other.DeploymentID == job.DeploymentID && other.CreatedAt.After(job.CreatedAt) {
+			return false
+		}
+	}
+	return true
+}
+
+// heldBackByAnEarlierWave mirrors the two wave predicates in the SQL claims.
+//
+// Written once and used by both the core and agent claim paths here, because
+// the SQL has the same rule in two statements and an in-memory store that
+// enforced it in one would agree with itself while a real deployment let an
+// agent target overtake its wave.
+func (m *MemoryStore) heldBackByAnEarlierWave(job *DeploymentJob) bool {
+	for _, other := range m.deploymentJobs {
+		if other.CertificateID != job.CertificateID || other.DeployOrder >= job.DeployOrder {
+			continue
+		}
+		// Still working: wait for it.
+		if other.Outstanding() {
+			return true
+		}
+		// Gave up: stop. Stricter than the same-wave rule on purpose — the
+		// point of declaring "staging, then production" is that a certificate
+		// staging would not accept must not reach production.
+		//
+		// Only if it is still the latest job for that place. Any failure ever
+		// recorded would block production for ever, including after staging had
+		// been fixed and deployed successfully since — and a terminally failed
+		// job cannot be cancelled, so there was no way out.
+		if other.Status == DeployFailed && m.isLatestJobForBinding(other) {
 			return true
 		}
 	}

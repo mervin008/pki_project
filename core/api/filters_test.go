@@ -412,3 +412,40 @@ func TestAnUnknownEnvironmentIsRefusedBeforeIssuance(t *testing.T) {
 		}
 	}
 }
+
+// A uuid filter arriving from a query string used to reach PostgreSQL
+// unvalidated, which refused the whole query and returned a 500 carrying the
+// driver's error — telling the caller the column type and the SQLSTATE for what
+// is a plain typo. Found by running the store tests against a real database for
+// the first time.
+func TestUUIDFiltersAreValidatedNotPassedThrough(t *testing.T) {
+	r, _ := realRouter(t)
+
+	for _, endpoint := range []string{
+		"/api/v1/cloud/certificates?connection_id=nope",
+		"/api/v1/discovery/results?scan_id=nope",
+	} {
+		w := do(r, http.MethodGet, endpoint, nil, nil)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("GET %s = %d, want 400: %s", endpoint, w.Code, w.Body.String())
+		}
+		if contains(w.Body.String(), "SQLSTATE") {
+			t.Errorf("GET %s leaked the driver error to the caller: %s", endpoint, w.Body.String())
+		}
+	}
+}
+
+// A well-formed id that matches nothing is an empty list, not an error.
+func TestAUUIDFilterThatMatchesNothingIsAnEmptyList(t *testing.T) {
+	r, _ := realRouter(t)
+
+	for _, endpoint := range []string{
+		"/api/v1/cloud/certificates?connection_id=00000000-0000-4000-8000-000000000000",
+		"/api/v1/discovery/results?scan_id=00000000-0000-4000-8000-000000000000",
+	} {
+		w := do(r, http.MethodGet, endpoint, nil, nil)
+		if w.Code != http.StatusOK {
+			t.Errorf("GET %s = %d, want 200: %s", endpoint, w.Code, w.Body.String())
+		}
+	}
+}

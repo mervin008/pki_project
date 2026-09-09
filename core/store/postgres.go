@@ -9,8 +9,10 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,6 +21,12 @@ import (
 // PostgresStore implements Store using pgxpool for PostgreSQL.
 type PostgresStore struct {
 	pool *pgxpool.Pool
+
+	// auditChain is read on every audit write and set once at startup, but a
+	// mutex rather than a bare field because the engines are already running by
+	// the time the server wires it in.
+	auditMu    sync.RWMutex
+	auditChain *AuditChainer
 }
 
 // NewPostgresStore connects to PostgreSQL using the provided connection string.
@@ -97,7 +105,8 @@ const certificateColumns = `id, fingerprint_sha256, common_name,
 		coalesce(signature_algorithm, ''), coalesce(public_key_algorithm, ''),
 		coalesce(posture_verdict, ''), coalesce(posture_summary, ''),
 		coalesce(posture_requirements, '[]'::jsonb),
-		quantum_readiness_score, quantum_assessed_at`
+		quantum_readiness_score, quantum_assessed_at,
+	revoked_at, revocation_reason, coalesce(revoked_by, '')`
 
 // scanCertificate reads one row of certificateColumns.
 func scanCertificate(row pgx.Row) (*Certificate, error) {
@@ -118,6 +127,7 @@ func scanCertificate(row pgx.Row) (*Certificate, error) {
 		&cert.SignatureAlgorithm, &cert.PublicKeyAlgorithm,
 		&cert.PostureVerdict, &cert.PostureSummary, &postureJSON,
 		&cert.QuantumReadinessScore, &cert.QuantumAssessedAt,
+		&cert.RevokedAt, &cert.RevocationReason, &cert.RevokedBy,
 	)
 	if err != nil {
 		return nil, err
@@ -263,12 +273,24 @@ func (s *PostgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 			auto_renew, renewal_lead_days, ca_account_id, ca_authority_id,
 			deployment_target_id, private_key_encrypted, certificate_pem, chain_pem,
 			discovered_via, environment, team, tags, created_by,
-			key_custody, key_holder_agent_id, metadata
+			key_custody, key_holder_agent_id, metadata,
+			revoked_at, revocation_reason, revoked_by
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-			$25, $26, $27
+			$25, $26, $27, $28, $29, $30
 		) RETURNING id, created_at, updated_at
 	`
+	// The revocation columns are written here even though revocation itself
+	// goes through MarkCertificateRevoked.
+	//
+	// Migration 030 requires status = 'REVOKED' and revoked_at to agree, and
+	// this statement did not name the columns at all — so a discovery or CT
+	// import of a certificate that is already revoked set the status, dropped
+	// the timestamp, and had the whole insert refused by the CHECK. Store
+	// defect class B, a model field a writer silently drops, with class A's
+	// symptom on top of it: the value is one the Go code produces and the
+	// schema rejects. The in-memory store has no constraint, so it accepted the
+	// inconsistent pair and the suite agreed with itself.
 	return s.pool.QueryRow(ctx, query,
 		cert.FingerprintSHA256, cert.CommonName, sansJSON, cert.SerialNumber, cert.IssuerDN,
 		cert.NotBefore, cert.NotAfter, cert.DaysRemaining, cert.KeyType, cert.KeySize, cert.Status,
@@ -276,7 +298,35 @@ func (s *PostgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 		cert.DeploymentTargetID, cert.PrivateKeyEncrypted, cert.CertificatePEM, cert.ChainPEM,
 		cert.DiscoveredVia, nullIfEmpty(cert.Environment), cert.Team, tagsJSON, cert.CreatedBy,
 		custodyOrDefault(cert), cert.KeyHolderAgentID, metadataJSON(cert.Metadata),
+		cert.RevokedAt, cert.RevocationReason, cert.RevokedBy,
 	).Scan(&cert.ID, &cert.CreatedAt, &cert.UpdatedAt)
+}
+
+// managedOrDefault fills in a management state the caller left blank.
+//
+// The column carries `default 'UNMANAGED'` and a CHECK that refuses anything
+// else, and passing an explicit empty string overrides the default rather than
+// falling back to it — so the CHECK rejects the row and the whole write fails.
+// The same shape as agents.heartbeat_interval_seconds, where an explicit zero
+// overrode `DEFAULT 300` and violated a positive check; see docs/database.md.
+//
+// UNMANAGED is the honest fill-in on all three tables that use it. A discovered,
+// logged or cloud-held certificate that nothing has matched to one CertPilot
+// manages is, precisely, unmanaged.
+func managedOrDefault(state string) string {
+	if strings.TrimSpace(state) == "" {
+		return DiscoveryUnmanaged
+	}
+	return state
+}
+
+// trustedOrDefault does the same for discovery's trust_state, which carries
+// `default 'UNKNOWN'` under the same trap.
+func trustedOrDefault(state string) string {
+	if strings.TrimSpace(state) == "" {
+		return TrustUnknown
+	}
+	return state
 }
 
 // metadataJSON encodes a metadata map for a jsonb column that is NOT NULL.
@@ -478,7 +528,8 @@ func caColumns(includePEM bool) string {
 		fingerprint_sha256, ` + pem + `, parent_ca_id, coalesce(crl_distribution_url, ''),
 		coalesce(ocsp_responder_url, ''), coalesce(is_crl_fresh, false), crl_last_checked,
 		coalesce(is_ocsp_responsive, false),
-		ocsp_last_checked, coalesce(certificates_issued_count, 0),
+		ocsp_last_checked, coalesce(ocsp_status, ''), ocsp_revoked_at,
+		coalesce(ocsp_last_error, ''), coalesce(certificates_issued_count, 0),
 		coalesce(alert_thresholds, '[]'::jsonb),
 		last_alert_sent_at, last_alert_threshold, status, ca_account_id,
 		owner_team, owner_email,
@@ -494,7 +545,8 @@ func scanCAAuthority(row pgx.Row) (*CAAuthority, error) {
 		&ca.NotBefore, &ca.NotAfter, &ca.DaysRemaining, &ca.KeyType, &ca.KeySize,
 		&ca.FingerprintSHA256, &ca.CertificatePEM, &ca.ParentCAID, &ca.CRLDistributionURL,
 		&ca.OCSPResponderURL, &ca.IsCRLFresh, &ca.CRLLastChecked, &ca.IsOCSPResponsive,
-		&ca.OCSPLastChecked, &ca.CertificatesIssuedCount, &alertsJSON,
+		&ca.OCSPLastChecked, &ca.OCSPStatus, &ca.OCSPRevokedAt, &ca.OCSPLastError,
+		&ca.CertificatesIssuedCount, &alertsJSON,
 		&ca.LastAlertSentAt, &ca.LastAlertThreshold, &ca.Status, &ca.CAAccountID,
 		&ca.OwnerTeam, &ca.OwnerEmail,
 		&tagsJSON, &ca.Notes, &ca.Source, &ca.LastSeenAt, &ca.CreatedAt, &ca.UpdatedAt,
@@ -655,7 +707,9 @@ func (s *PostgresStore) UpdateCAAuthority(ctx context.Context, ca *CAAuthority) 
 			last_alert_sent_at = $22, last_alert_threshold = $23,
 			status = $24, ca_account_id = $25, tags = $26, notes = $27,
 			owner_team = $28, owner_email = $29,
-			source = $30, last_seen_at = $31, updated_at = now()
+			source = $30, last_seen_at = $31,
+			ocsp_status = $32, ocsp_revoked_at = $33, ocsp_last_error = $34,
+			updated_at = now()
 		WHERE id = $1
 	`
 	if strings.TrimSpace(ca.Source) == "" {
@@ -671,6 +725,11 @@ func (s *PostgresStore) UpdateCAAuthority(ctx context.Context, ca *CAAuthority) 
 		ca.LastAlertSentAt, ca.LastAlertThreshold,
 		ca.Status, ca.CAAccountID, jsonbOrNil(ca.Tags), ca.Notes,
 		ca.OwnerTeam, ca.OwnerEmail, ca.Source, ca.LastSeenAt,
+		// nullIfEmpty because ocsp_status carries a CHECK that refuses the
+		// empty string. "Never asked" is NULL, and it is a different fact from
+		// UNKNOWN — which is the responder disclaiming knowledge of a
+		// certificate it ought to know about.
+		nullIfEmpty(ca.OCSPStatus), ca.OCSPRevokedAt, nullIfEmpty(ca.OCSPLastError),
 	)
 	return err
 }
@@ -835,14 +894,15 @@ func (s *PostgresStore) DeleteCAAccount(ctx context.Context, id string) error {
 // the table cannot be picked up by the list query and missed by the detail one.
 const deploymentTargetColumns = `id, name, coalesce(description, ''), target_type,
 		coalesce(config_encrypted, ''), coalesce(is_enabled, true), coalesce(deploys_private_key, false),
-		cloud_connection_id, agent_id,
+		coalesce(deploy_order, 0), cloud_connection_id, agent_id,
 		last_deployment_at, last_deployment_status, coalesce(last_deployment_error, ''), last_success_at,
 		created_by, created_at, updated_at`
 
 func scanDeploymentTarget(row pgx.Row) (*DeploymentTarget, error) {
 	t := &DeploymentTarget{}
 	err := row.Scan(&t.ID, &t.Name, &t.Description, &t.TargetType,
-		&t.ConfigEncrypted, &t.IsEnabled, &t.DeploysPrivateKey, &t.CloudConnectionID, &t.AgentID,
+		&t.ConfigEncrypted, &t.IsEnabled, &t.DeploysPrivateKey, &t.DeployOrder,
+		&t.CloudConnectionID, &t.AgentID,
 		&t.LastDeploymentAt, &t.LastDeploymentStatus, &t.LastDeploymentError, &t.LastSuccessAt,
 		&t.CreatedBy, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
@@ -883,12 +943,12 @@ func (s *PostgresStore) CreateDeploymentTarget(ctx context.Context, target *Depl
 	return s.pool.QueryRow(ctx, `
 		INSERT INTO public.deployment_targets
 			(name, description, target_type, config_encrypted, is_enabled, deploys_private_key,
-			 cloud_connection_id, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 deploy_order, cloud_connection_id, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id, created_at, updated_at`,
 		target.Name, nullIfEmpty(target.Description), target.TargetType,
 		nullIfEmpty(target.ConfigEncrypted), target.IsEnabled, target.DeploysPrivateKey,
-		target.CloudConnectionID, target.CreatedBy,
+		target.DeployOrder, target.CloudConnectionID, target.CreatedBy,
 	).Scan(&target.ID, &target.CreatedAt, &target.UpdatedAt)
 }
 
@@ -896,11 +956,12 @@ func (s *PostgresStore) UpdateDeploymentTarget(ctx context.Context, target *Depl
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE public.deployment_targets
 		SET name = $2, description = $3, target_type = $4, config_encrypted = $5,
-		    is_enabled = $6, deploys_private_key = $7, cloud_connection_id = $8, updated_at = now()
+		    is_enabled = $6, deploys_private_key = $7, cloud_connection_id = $8,
+		    deploy_order = $9, updated_at = now()
 		WHERE id = $1`,
 		target.ID, target.Name, nullIfEmpty(target.Description), target.TargetType,
 		nullIfEmpty(target.ConfigEncrypted), target.IsEnabled, target.DeploysPrivateKey,
-		target.CloudConnectionID)
+		target.CloudConnectionID, target.DeployOrder)
 	if err != nil {
 		return err
 	}
@@ -1213,19 +1274,171 @@ func (s *PostgresStore) TouchDisplayToken(ctx context.Context, id string, seenAt
 
 // ── Audit Logs ──────────────────────────────────────────
 
+// auditChainLockKey serialises audit writes across every replica.
+//
+// An arbitrary constant, but a fixed one: PostgreSQL advisory locks share a
+// single namespace, so it is written here rather than derived from a string in
+// case anything else in this codebase ever needs one and has to avoid it.
+const auditChainLockKey int64 = 0x43503A61756469 // "CP:audi"
+
+func (s *PostgresStore) UseAuditChain(chainer *AuditChainer) {
+	s.auditMu.Lock()
+	defer s.auditMu.Unlock()
+	s.auditChain = chainer
+}
+
+func (s *PostgresStore) chainer() *AuditChainer {
+	s.auditMu.RLock()
+	defer s.auditMu.RUnlock()
+	return s.auditChain
+}
+
 func (s *PostgresStore) CreateAuditLog(ctx context.Context, log *AuditLog) error {
-	query := `
-		INSERT INTO public.audit_logs (action, entity_type, entity_id, actor_id, actor_email, details, ip_address)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING id, created_at
+	const insert = `
+		INSERT INTO public.audit_logs
+			(id, action, entity_type, entity_id, actor_id, actor_email, details, ip_address,
+			 created_at, seq, prev_hash, entry_hash, chain_key_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`
-	var detailsJSON []byte
-	if log.Details != "" {
-		detailsJSON = []byte(log.Details)
+
+	if log.ID == "" {
+		log.ID = uuid.NewString()
 	}
-	return s.pool.QueryRow(ctx, query,
-		log.Action, log.EntityType, log.EntityID, log.ActorID, log.ActorEmail, detailsJSON, log.IPAddress,
-	).Scan(&log.ID, &log.CreatedAt)
+	if log.CreatedAt.IsZero() {
+		log.CreatedAt = time.Now()
+	}
+	// Truncated before the tag is computed, because timestamptz holds
+	// microseconds and would otherwise hand back a different instant than the
+	// one that was signed — making every entry read as tampered on the first
+	// verification.
+	log.CreatedAt = log.CreatedAt.UTC().Truncate(time.Microsecond)
+
+	var details *string
+	if log.Details != "" {
+		details = &log.Details
+	}
+
+	chainer := s.chainer()
+	if chainer == nil {
+		// Written unchained rather than refused. Losing the record of what
+		// happened is worse than losing the proof that the record is intact,
+		// and VerifyAuditChain counts these and says so rather than letting
+		// them pass as verified.
+		_, err := s.pool.Exec(ctx, insert,
+			log.ID, log.Action, log.EntityType, log.EntityID, log.ActorID, log.ActorEmail,
+			details, log.IPAddress, log.CreatedAt, nil, nil, nil, nil)
+		return err
+	}
+
+	// The head read and the insert have to be one atomic step. Without the
+	// lock, two replicas writing at the same moment both read sequence N as the
+	// head and both chain from it: the unique index then rejects one of them and
+	// an audit entry is lost, or — worse, before that index existed — the chain
+	// silently forks and verification fails forever at that point. The lock is
+	// transaction-scoped, so it is released by commit or rollback and cannot be
+	// stranded by a replica dying mid-write.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", auditChainLockKey); err != nil {
+		return fmt.Errorf("could not take the audit chain lock: %w", err)
+	}
+
+	var headSeq int64
+	prev := append([]byte(nil), AuditChainZeroPrev...)
+	err = tx.QueryRow(ctx,
+		`SELECT seq, entry_hash FROM public.audit_logs WHERE seq IS NOT NULL ORDER BY seq DESC LIMIT 1`,
+	).Scan(&headSeq, &prev)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("could not read the audit chain head: %w", err)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		headSeq = 0
+		prev = append([]byte(nil), AuditChainZeroPrev...)
+	}
+
+	log.Seq = headSeq + 1
+	log.PrevHash = prev
+	keyID, tag, err := chainer.Link(log, prev)
+	if err != nil {
+		return fmt.Errorf("could not compute the audit chain tag: %w", err)
+	}
+	log.ChainKeyID = keyID
+	log.EntryHash = tag
+
+	if _, err := tx.Exec(ctx, insert,
+		log.ID, log.Action, log.EntityType, log.EntityID, log.ActorID, log.ActorEmail,
+		details, log.IPAddress, log.CreatedAt, log.Seq, log.PrevHash, log.EntryHash, log.ChainKeyID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *PostgresStore) VerifyAuditChain(ctx context.Context, from int64, limit int) (*AuditChainReport, error) {
+	var unchained int64
+	if err := s.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM public.audit_logs WHERE seq IS NULL").Scan(&unchained); err != nil {
+		return nil, err
+	}
+
+	if from < 1 {
+		from = 1
+	}
+	// One more than asked for, so the report can say whether it stopped at the
+	// end of the chain or at its own limit. "Intact" over a truncated walk is a
+	// much weaker claim and must not read like the full one.
+	fetch := limit
+	if fetch > 0 {
+		fetch++
+	}
+
+	query := `
+		SELECT id, action, entity_type, entity_id, actor_id, actor_email, details,
+		       host(ip_address), created_at, seq, prev_hash, entry_hash, chain_key_id
+		FROM public.audit_logs
+		WHERE seq IS NOT NULL AND seq >= $1
+		ORDER BY seq ASC`
+	args := []any{from}
+	if fetch > 0 {
+		query += " LIMIT $2"
+		args = append(args, fetch)
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := make([]*AuditLog, 0, 256)
+	for rows.Next() {
+		l := &AuditLog{}
+		var details *string
+		if err := rows.Scan(&l.ID, &l.Action, &l.EntityType, &l.EntityID, &l.ActorID,
+			&l.ActorEmail, &details, &l.IPAddress, &l.CreatedAt, &l.Seq,
+			&l.PrevHash, &l.EntryHash, &l.ChainKeyID); err != nil {
+			return nil, err
+		}
+		if details != nil {
+			l.Details = *details
+		}
+		l.CreatedAt = l.CreatedAt.UTC()
+		entries = append(entries, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	truncated := false
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+		truncated = true
+	}
+	return verifyAuditChainOver(entries, s.chainer(), from, unchained, truncated), nil
 }
 
 func (s *PostgresStore) ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int64, error) {
@@ -1504,7 +1717,15 @@ func (s *PostgresStore) GetActiveAcknowledgement(ctx context.Context, entityType
 		// treat a real failure as "not acknowledged" and alert anyway.
 		return nil, nil
 	}
-	return a, err
+	if err != nil {
+		// nil, not the half-scanned struct. scanAcknowledgement returns a
+		// non-nil pointer alongside its error, so returning it here handed a
+		// caller an object *and* a failure — and a caller that checked only the
+		// pointer would read a database error as somebody having acknowledged
+		// the alert, which is the one direction this must never fail in.
+		return nil, err
+	}
+	return a, nil
 }
 
 func (s *PostgresStore) ListAcknowledgements(ctx context.Context, entityType, entityID string) ([]*AlertAcknowledgement, error) {
@@ -1772,7 +1993,8 @@ func (s *PostgresStore) CreateDiscoveryResults(ctx context.Context, results []*D
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
 			        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 			RETURNING id, created_at`,
-			r.ScanID, r.Host, r.Port, r.Reachable, nullIfEmpty(r.Error), r.ManagementState, r.TrustState,
+			r.ScanID, r.Host, r.Port, r.Reachable, nullIfEmpty(r.Error),
+			managedOrDefault(r.ManagementState), trustedOrDefault(r.TrustState),
 			r.MatchedCertificateID, nullIfEmpty(r.CommonName), nullIfEmpty(r.SubjectDN), sansJSON,
 			nullIfEmpty(r.IssuerDN), nullIfEmpty(r.SerialNumber), r.NotBefore, r.NotAfter,
 			nullIfEmpty(r.KeyType), r.KeySize, r.IsCA, nullIfEmpty(r.FingerprintSHA256),
@@ -2284,7 +2506,7 @@ func (s *PostgresStore) RecordCTCertificates(ctx context.Context, certs []*CTCer
 			ON CONFLICT (monitor_id, entry_id) DO NOTHING
 			RETURNING id, created_at, first_seen_at`,
 			c.MonitorID, c.EntryID, c.LoggedAt, nullIfEmpty(c.SerialNumber), nullIfEmpty(c.IssuerDN),
-			nullIfEmpty(c.CommonName), sansJSON, c.NotBefore, c.NotAfter, c.ManagementState,
+			nullIfEmpty(c.CommonName), sansJSON, c.NotBefore, c.NotAfter, managedOrDefault(c.ManagementState),
 			c.MatchedCertificateID, c.IsPrecertificate)
 
 		err = row.Scan(&c.ID, &c.CreatedAt, &c.FirstSeenAt)
@@ -2619,8 +2841,25 @@ func (s *PostgresStore) UpsertCloudCertificates(ctx context.Context, certs []*Cl
 				key_type = excluded.key_type, key_size = excluded.key_size,
 				fingerprint_sha256 = excluded.fingerprint_sha256,
 				certificate_pem = excluded.certificate_pem,
-				management_state = excluded.management_state,
-				matched_certificate_id = excluded.matched_certificate_id,
+				-- An import survives the next sync.
+				--
+				-- The provider goes on reporting the certificate as unmanaged,
+				-- because the provider has no idea it was adopted — so writing
+				-- excluded.management_state straight through reverted every
+				-- adopted certificate to UNMANAGED on the following sweep, six
+				-- hours later, and it reappeared as an unmanaged finding for
+				-- ever. The in-memory store had always preserved this, which is
+				-- exactly why nothing noticed: cloud_test.go called
+				-- NewMemoryStore directly and had never run against a database.
+				management_state = CASE
+					WHEN public.cloud_certificates.is_imported THEN 'MANAGED'
+					ELSE excluded.management_state END,
+				-- Likewise the link to what it was adopted as. coalesce and not
+				-- excluded-wins: the provider never supplies this, so letting it
+				-- win means letting NULL win.
+				matched_certificate_id = coalesce(
+					public.cloud_certificates.matched_certificate_id,
+					excluded.matched_certificate_id),
 				renewal_mode = excluded.renewal_mode, will_renew = excluded.will_renew,
 				attached = excluded.attached, attached_to = excluded.attached_to,
 				findings = excluded.findings, last_seen_at = excluded.last_seen_at,
@@ -2630,7 +2869,7 @@ func (s *PostgresStore) UpsertCloudCertificates(ctx context.Context, certs []*Cl
 			nullIfEmpty(c.CommonName), nullIfEmpty(c.SubjectDN), nullIfEmpty(c.IssuerDN),
 			nullIfEmpty(c.SerialNumber), sansJSON, c.NotBefore, c.NotAfter,
 			nullIfEmpty(c.KeyType), c.KeySize, nullIfEmpty(c.FingerprintSHA256),
-			nullIfEmpty(c.CertificatePEM), c.ManagementState, c.MatchedCertificateID,
+			nullIfEmpty(c.CertificatePEM), managedOrDefault(c.ManagementState), c.MatchedCertificateID,
 			nullIfEmpty(c.RenewalMode), c.WillRenew, c.Attached, attachedToJSON, findingsJSON,
 			c.LastSeenAt)
 
@@ -3245,7 +3484,7 @@ func (s *PostgresStore) GetEndpointsServingCertificate(ctx context.Context, cert
 const deploymentJobColumns = `id, deployment_id, certificate_id, target_id, reason, status,
 		run_after, coalesce(attempts, 0), locked_by, locked_until,
 		coalesce(last_error, ''), coalesce(attempt_log, '[]'::jsonb),
-		coalesce(fingerprint, ''), not_after, escalated_at,
+		coalesce(deploy_order, 0), coalesce(fingerprint, ''), not_after, escalated_at,
 		triggered_by, actor_email, started_at, completed_at, created_at, updated_at`
 
 func scanDeploymentJob(row pgx.Row) (*DeploymentJob, error) {
@@ -3255,7 +3494,7 @@ func scanDeploymentJob(row pgx.Row) (*DeploymentJob, error) {
 		&j.ID, &j.DeploymentID, &j.CertificateID, &j.TargetID, &j.Reason, &j.Status,
 		&j.RunAfter, &j.Attempts, &j.LockedBy, &j.LockedUntil,
 		&j.LastError, &logJSON,
-		&j.Fingerprint, &j.NotAfter, &j.EscalatedAt,
+		&j.DeployOrder, &j.Fingerprint, &j.NotAfter, &j.EscalatedAt,
 		&j.TriggeredBy, &j.ActorEmail, &j.StartedAt, &j.CompletedAt, &j.CreatedAt, &j.UpdatedAt,
 	)
 	if err != nil {
@@ -3280,12 +3519,12 @@ func (s *PostgresStore) EnqueueDeployment(ctx context.Context, job *DeploymentJo
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO public.deployment_jobs
 			(deployment_id, certificate_id, target_id, reason, status, run_after,
-			 fingerprint, not_after, triggered_by, actor_email)
-		VALUES ($1, $2, $3, $4, 'PENDING', $5, $6, $7, $8, $9)
+			 deploy_order, fingerprint, not_after, triggered_by, actor_email)
+		VALUES ($1, $2, $3, $4, 'PENDING', $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (deployment_id) WHERE status IN ('PENDING', 'RUNNING') DO NOTHING
 		RETURNING `+deploymentJobColumns,
 		job.DeploymentID, job.CertificateID, job.TargetID, job.Reason, job.RunAfter,
-		nullIfEmpty(job.Fingerprint), job.NotAfter, job.TriggeredBy, job.ActorEmail)
+		job.DeployOrder, nullIfEmpty(job.Fingerprint), job.NotAfter, job.TriggeredBy, job.ActorEmail)
 
 	created, err := scanDeploymentJob(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -3361,7 +3600,50 @@ func (s *PostgresStore) ClaimDeploymentJob(ctx context.Context, worker string, l
 			        AND f.id <> c.id
 			        AND f.status IN ('PENDING', 'RUNNING')
 			        AND coalesce(f.last_error, '') <> ''))
-			ORDER BY c.not_after ASC NULLS LAST, c.run_after ASC
+			  -- Waves. A job waits while anything for the same certificate in
+			  -- an earlier wave is still outstanding.
+			  --
+			  -- Race-free in the safe direction: a worker that reads an earlier
+			  -- job before the transaction claiming it has committed still sees
+			  -- it as PENDING, and waits. The failure mode is a delay, never an
+			  -- overtake.
+			  AND NOT EXISTS (
+			      SELECT 1 FROM public.deployment_jobs w
+			      WHERE w.certificate_id = c.certificate_id
+			        AND w.deploy_order < c.deploy_order
+			        AND w.status IN ('PENDING', 'RUNNING'))
+			  -- An earlier wave that gave up stops the ones behind it, and this
+			  -- is deliberately stricter than the same-wave rule above.
+			  --
+			  -- Within a wave a terminally failed job stops blocking, so one
+			  -- dead target does not hold up its peers. Across waves the
+			  -- opposite is right: the entire point of declaring "staging, then
+			  -- production" is that a certificate staging would not accept must
+			  -- not reach production.
+			  --
+			  -- Only the *latest* job for that binding counts, and the inner
+			  -- NOT EXISTS is what says so. Without it the clause matched any
+			  -- failure ever recorded, so one bad afternoon in staging blocked
+			  -- production for ever — including after staging had been fixed
+			  -- and had deployed successfully twice since. A terminally failed
+			  -- job cannot be cancelled either, so there was no way out at all.
+			  -- Found by running it.
+			  --
+			  -- Scoped this way the question is "is that place currently
+			  -- broken", which is what an operator means, and the way out is
+			  -- the obvious one: fix staging and deploy again.
+			  AND NOT EXISTS (
+			      SELECT 1 FROM public.deployment_jobs w
+			      WHERE w.certificate_id = c.certificate_id
+			        AND w.deploy_order < c.deploy_order
+			        AND w.status = 'FAILED'
+			        AND NOT EXISTS (
+			            SELECT 1 FROM public.deployment_jobs newer
+			            WHERE newer.deployment_id = w.deployment_id
+			              AND newer.created_at > w.created_at))
+			-- Wave first, so the order the operator declared is the order the
+			-- queue works in. Expiry breaks ties within a wave, as before.
+			ORDER BY c.deploy_order ASC, c.not_after ASC NULLS LAST, c.run_after ASC
 			FOR UPDATE OF c SKIP LOCKED
 			LIMIT 1
 		)
@@ -3819,6 +4101,30 @@ func (s *PostgresStore) ConsumeAgentEnrolToken(ctx context.Context, id string, n
 		return false, err
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+func (s *PostgresStore) ClaimAgentRequestSignature(ctx context.Context, agentID string, signatureHash []byte, expiresAt time.Time) (bool, error) {
+	// ON CONFLICT DO NOTHING rather than a SELECT then an INSERT. Two copies of
+	// one captured request can reach two replicas in the same millisecond, and
+	// with a read-then-write both would find nothing and both would proceed.
+	// Here the primary key decides, and exactly one insert reports a row.
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO public.agent_request_signatures (agent_id, signature_hash, expires_at)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (agent_id, signature_hash) DO NOTHING`, agentID, signatureHash, expiresAt)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (s *PostgresStore) SweepAgentRequestSignatures(ctx context.Context, now time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		"DELETE FROM public.agent_request_signatures WHERE expires_at <= $1", now)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (s *PostgresStore) RevokeAgentEnrolToken(ctx context.Context, id string, revokedBy *string) error {
@@ -4524,7 +4830,27 @@ func (s *PostgresStore) ClaimAgentDeploymentJobs(ctx context.Context, agentID, w
 			        AND f.id <> c.id
 			        AND f.status IN ('PENDING', 'RUNNING')
 			        AND coalesce(f.last_error, '') <> ''))
-			ORDER BY c.not_after ASC NULLS LAST, c.run_after ASC
+			-- Waves, on the same terms as the core worker's claim. An agent
+			-- target is still a target: without this an agent in wave 2 would
+			-- poll and install while wave 1 was still being attempted from the
+			-- core, and the declared order would hold for half the estate.
+			AND NOT EXISTS (
+			      SELECT 1 FROM public.deployment_jobs w
+			      WHERE w.certificate_id = c.certificate_id
+			        AND w.deploy_order < c.deploy_order
+			        AND w.status IN ('PENDING', 'RUNNING'))
+			  -- Latest-job-only, for the same reason as the core claim: a
+			  -- historical failure must not block a place for ever.
+			  AND NOT EXISTS (
+			      SELECT 1 FROM public.deployment_jobs w
+			      WHERE w.certificate_id = c.certificate_id
+			        AND w.deploy_order < c.deploy_order
+			        AND w.status = 'FAILED'
+			        AND NOT EXISTS (
+			            SELECT 1 FROM public.deployment_jobs newer
+			            WHERE newer.deployment_id = w.deployment_id
+			              AND newer.created_at > w.created_at))
+			ORDER BY c.deploy_order ASC, c.not_after ASC NULLS LAST, c.run_after ASC
 			-- OF c, not bare FOR UPDATE. A bare one in a joined subquery locks
 			-- the deployment_targets row as well, so every agent polling for
 			-- work would take a row lock on its own target and an operator

@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/certpilot/certpilot/core/api"
@@ -49,6 +52,7 @@ type Server struct {
 	deployQueue  *deploy.Queue
 	assessor     *posture.Assessor
 	fleetMonitor *fleet.Monitor
+	rateLimiter  *middleware.RateLimiter
 	cfg          *config.CoreConfig
 }
 
@@ -81,11 +85,17 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 
 	// 2. Keyring. Certificate private keys and CA credentials are sealed before
 	// they reach the store, so a keyring is required whenever the store is.
-	keyring, err := loadKeyring(usingMemoryStore)
+	keyring, err := loadKeyring(ctx, cfg.Secrets, usingMemoryStore)
 	if err != nil {
 		st.Close()
 		return nil, err
 	}
+
+	// The audit log is chained with a subkey of the same KEK. Wired here rather
+	// than at store construction because the store is built first — and wired
+	// unconditionally, because an audit log that is only sometimes
+	// tamper-evident is one nobody can reason about.
+	st.UseAuditChain(store.NewAuditChainer(keyring))
 
 	// 3. Plugin manager.
 	gwTLS := grpckit.TLSConfig{
@@ -183,6 +193,33 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		st.Close()
 		return nil, err
 	}
+	// The identity provider says who somebody is; CertPilot says what they may
+	// do. Without this the role falls back to whatever claim the token carries,
+	// which puts every promotion and demotion in the hands of an administrator
+	// of the provider rather than of the team that owns the CA hierarchy.
+	authenticator = authenticator.WithUserDirectory(st)
+
+	// A negative rate is an explicit opt-out, for a deployment with something
+	// in front of it already shaping traffic. Zero means the defaults, so an
+	// operator who has never thought about it still gets a limit.
+	var limiter *middleware.RateLimiter
+	if cfg.Auth.RateLimitPerSecond >= 0 {
+		rlCfg := middleware.DefaultAPIRateLimit
+		if cfg.Auth.RateLimitPerSecond > 0 {
+			rlCfg.Rate = cfg.Auth.RateLimitPerSecond
+		}
+		if cfg.Auth.RateLimitBurst > 0 {
+			rlCfg.Burst = cfg.Auth.RateLimitBurst
+		}
+		limiter = middleware.NewRateLimiter(rlCfg)
+	}
+
+	// Before the router is built, so that an instance nobody can sign in to is
+	// reported at start-up rather than discovered at the login screen.
+	if err := bootstrapFirstAdmin(ctx, st, cfg.Auth); err != nil {
+		st.Close()
+		return nil, fmt.Errorf("bootstrap: %w", err)
+	}
 
 	// 6. HTTP router.
 	engine := gin.New()
@@ -210,6 +247,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		Broker:        broker,
 		Dispatcher:    dispatcher,
 		Auth:          authenticator,
+		RateLimiter:   limiter,
 		Config:        cfg,
 	})
 
@@ -242,6 +280,7 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 		deployQueue:  deployQueue,
 		assessor:     assessor,
 		fleetMonitor: fleetMonitor,
+		rateLimiter:  limiter,
 		cfg:          cfg,
 	}, nil
 }
@@ -251,10 +290,20 @@ func NewServer(ctx context.Context, cfg *config.CoreConfig, dbConnStr string) (*
 // An ephemeral key is acceptable only alongside the in-memory store, where
 // nothing outlives the process anyway. Against a real database it would render
 // every stored secret unreadable on restart, so it is refused.
-func loadKeyring(usingMemoryStore bool) (*secrets.Keyring, error) {
-	keyring, err := secrets.LoadKeyring()
+func loadKeyring(ctx context.Context, cfg config.SecretsConfig, usingMemoryStore bool) (*secrets.Keyring, error) {
+	provider, err := kekProvider(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	keyring, err := secrets.LoadKeyringFrom(ctx, provider)
 	if err == nil {
-		slog.Info("loaded secret encryption keyring", "key_id", keyring.PrimaryKeyID())
+		// The provider is named in the log. On a machine where somebody has
+		// just moved the key out of the environment, "which one did it
+		// actually use" is the first question, and the answer must not require
+		// reading the configuration back.
+		slog.Info("loaded secret encryption keyring",
+			"key_id", keyring.PrimaryKeyID(), "provider", provider.Name())
 		return keyring, nil
 	}
 
@@ -262,10 +311,21 @@ func loadKeyring(usingMemoryStore bool) (*secrets.Keyring, error) {
 		return nil, err
 	}
 
+	// Only the environment provider falls through to an ephemeral key. A
+	// configured file or Vault provider that produced nothing is a
+	// misconfiguration somebody needs to fix, and quietly inventing a key would
+	// hide it behind a working start-up.
+	if _, isEnv := provider.(secrets.EnvProvider); !isEnv {
+		return nil, fmt.Errorf(
+			"no key encryption key was returned by %s. CertPilot stores certificate private keys "+
+				"and CA credentials encrypted at rest and will not start without one", provider.Name())
+	}
+
 	if !usingMemoryStore {
 		return nil, fmt.Errorf(
 			"CERTPILOT_KEK is not set. CertPilot stores certificate private keys and CA credentials " +
-				"encrypted at rest and will not start without a key. Generate one with: make generate-kek")
+				"encrypted at rest and will not start without a key. Generate one with: make generate-kek, " +
+				"or set secrets.kek_provider to read it from a file or from Vault")
 	}
 
 	keyring, err = secrets.NewEphemeralKeyring()
@@ -275,6 +335,66 @@ func loadKeyring(usingMemoryStore bool) (*secrets.Keyring, error) {
 	slog.Warn("CERTPILOT_KEK is not set; using an ephemeral key alongside the in-memory store. " +
 		"Set CERTPILOT_KEK before configuring a database")
 	return keyring, nil
+}
+
+// kekProvider turns configuration into the thing that fetches the key.
+//
+// The configuration has already been validated, so a bad provider name cannot
+// reach here — but the default is spelled out rather than left to a fallthrough,
+// because "unrecognised, so use the environment" is exactly how a typo in
+// kek_provider would leave the key in an env var somebody believed they had
+// stopped using.
+func kekProvider(cfg config.SecretsConfig) (secrets.Provider, error) {
+	switch cfg.KEKProvider {
+	case "", "env":
+		return secrets.EnvProvider{}, nil
+
+	case "file":
+		return secrets.FileProvider{
+			Path:         cfg.KEKFile,
+			RetiredPaths: cfg.KEKRetiredFiles,
+		}, nil
+
+	case "vault":
+		client, err := vaultClient(cfg.Vault)
+		if err != nil {
+			return nil, err
+		}
+		return secrets.VaultProvider{
+			Address:      cfg.Vault.Address,
+			Path:         cfg.Vault.Path,
+			Field:        cfg.Vault.Field,
+			RetiredField: cfg.Vault.RetiredField,
+			Token:        cfg.Vault.Token,
+			TokenFile:    cfg.Vault.TokenFile,
+			Namespace:    cfg.Vault.Namespace,
+			Client:       client,
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("secrets.kek_provider %q is not one of env, file, vault", cfg.KEKProvider)
+	}
+}
+
+// vaultClient builds the HTTP client, pinning Vault's CA when one is given.
+func vaultClient(cfg config.VaultSecretsConfig) (*http.Client, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	if cfg.CACert == "" {
+		return client, nil
+	}
+
+	pem, err := os.ReadFile(cfg.CACert)
+	if err != nil {
+		return nil, fmt.Errorf("could not read secrets.vault.ca_cert: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("secrets.vault.ca_cert (%s) contains no certificates", cfg.CACert)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	client.Transport = transport
+	return client, nil
 }
 
 // Start begins the HTTP server and background schedulers.
@@ -342,6 +462,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.deployQueue.Stop()
 	s.assessor.Stop()
 	s.fleetMonitor.Stop()
+	if s.rateLimiter != nil {
+		s.rateLimiter.Stop()
+	}
 	// A range scan can run for minutes. Left alone it would hold the grace
 	// period open and then be killed mid-write anyway; cancelled, it records
 	// what it found and stops.

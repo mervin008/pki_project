@@ -48,6 +48,7 @@ type RouterDeps struct {
 	Broker       *events.Broker
 	Dispatcher   *notifications.Dispatcher
 	Auth         *middleware.Authenticator
+	RateLimiter  *middleware.RateLimiter
 	Config       *config.CoreConfig
 }
 
@@ -55,9 +56,20 @@ type RouterDeps struct {
 func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	engine.Use(gin.Recovery())
 	engine.Use(middleware.SecurityHeaders())
+
+	// Ahead of authentication, so an unauthenticated flood costs a map lookup
+	// rather than a JWKS fetch or an Argon2id derivation. The key falls back to
+	// the client address until an identity is established, and prefers the
+	// identity once one is — a credential should not escape its limit by
+	// arriving from more addresses.
+	if limiter := deps.RateLimiter; limiter != nil {
+		engine.Use(limiter.Middleware())
+	}
+
 	engine.Use(middleware.CORS(deps.Config.Server.AllowedOrigins))
 
-	// Health endpoint (public, and deliberately says nothing about internals).
+	// ── Health ──
+	// Public, and deliberately says nothing about internals.
 	engine.GET("/healthz", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok", "service": "certpilot-core"})
 	})
@@ -68,6 +80,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	caHandler := NewCAHandler(deps.Store, deps.CAMonitor, deps.CAImporter, deps.ChainResolver)
 	caAccHandler := NewCAAccountHandler(deps.Store, deps.PluginMgr, deps.Keyring, deps.CAImporter)
 	dashHandler := NewDashboardHandler(deps.Store)
+	auditHandler := NewAuditHandler(deps.Store)
 	discHandler := NewDiscoveryHandler(deps.Store, deps.Scanner)
 	policyHandler := NewPolicyHandler(deps.Store)
 	eventsHandler := NewEventsHandler(deps.Store, deps.Broker)
@@ -79,6 +92,29 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	cloudHandler := NewCloudHandler(deps.Store, deps.CloudEngine, deps.Keyring)
 	deployHandler := NewDeploymentHandler(deps.Store, deps.Keyring)
 	postureHandler := NewPostureHandler(deps.Store, posture.ToolVersion)
+	sessionHandler := NewSessionHandler(deps.Store, deps.Config.Auth, deps.Auth)
+	userHandler := NewUserHandler(deps.Store)
+
+	// ── Sign-in discovery ──
+	// Public, and necessarily so: this is what a browser reads before it holds
+	// any credential. It carries the issuer and client id, which are public by
+	// construction in authorization code with PKCE — the user's own browser
+	// sends both to the provider in a URL they can read.
+	engine.GET("/api/v1/auth/config", sessionHandler.Config)
+
+	// Sign-in itself cannot require being signed in. It is rate-limited by the
+	// per-account lockout in the store rather than by middleware, because the
+	// core runs as several replicas and an in-process counter would reset with
+	// every request that landed on a different one.
+	engine.POST("/api/v1/auth/login", sessionHandler.Login)
+
+	// The core redeems the authorization code, the browser does not.
+	//
+	// A single-page application that redeems it itself receives a refresh token
+	// and has nowhere safe to keep it — every storage a page can reach is
+	// readable by script on that origin. Doing the exchange here means the
+	// browser gets a session cookie and never handles a token at all.
+	engine.POST("/api/v1/auth/callback", sessionHandler.Callback)
 
 	// ── The agent API ──
 	//
@@ -123,7 +159,12 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 	// that is not a GET and refuses the sensitive read paths outright, so the
 	// read-only property does not depend on every route below getting its role
 	// gate right.
+	// Order matters, and it is the same rule in both cases: an explicit
+	// credential beats an ambient one. A cookie sitting in a browser must never
+	// override a request that presented a token, or the audit log records the
+	// wrong person.
 	v1.Use(middleware.DisplayTokenAuth(deps.Store))
+	v1.Use(middleware.SessionAuth(deps.Store))
 	v1.Use(deps.Auth.Middleware())
 	{
 		// ── Live event stream ──
@@ -131,10 +172,28 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// certificate state, never secrets or actor identity.
 		v1.GET("/events", eventsHandler.Stream)
 
+		// ── The caller's own identity ──
+		// The role reported here is the one from CertPilot's users table, not
+		// the one in the token. A frontend that decoded the JWT itself would
+		// keep showing controls for a role the API had stopped honouring.
+		v1.GET("/me", sessionHandler.Me)
+		v1.POST("/auth/logout", sessionHandler.Logout)
+		// Changing a password requires the current one even though the caller
+		// is already authenticated: a session left open on an unattended
+		// machine should not be enough to lock its owner out of their account.
+		v1.POST("/auth/password", sessionHandler.ChangePassword)
+
 		// ── Dashboard ──
 		v1.GET("/dashboard/stats", dashHandler.Stats)
 		v1.GET("/dashboard/expiring", dashHandler.Expiring)
 		v1.GET("/dashboard/activity", dashHandler.Activity)
+
+		// ── Audit record integrity ──
+		// Whether the audit log has been altered, as distinct from what it
+		// says. Admin only: the people who could tamper with it are the ones
+		// this answer would implicate, and telling them whether the check
+		// passes is telling them whether a rewrite worked.
+		v1.GET("/audit/verify", middleware.RequireRole(middleware.RoleAdmin), auditHandler.Verify)
 
 		// ── Certificates ──
 		v1.GET("/certificates", certHandler.List)
@@ -146,6 +205,11 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/certificates/:id/renew", middleware.RequireRole(middleware.RoleOperator), certHandler.Renew)
 		// Exporting a private key is admin-only and audited: it is the one
 		// operation that removes a secret from the system's custody.
+		// Revocation is admin, and it is the operation DELETE was being used
+		// for. It tells the CA first and records only what the CA accepted, so
+		// a certificate can never read REVOKED here while still answering
+		// handshakes in production.
+		v1.POST("/certificates/:id/revoke", middleware.RequireRole(middleware.RoleAdmin), certHandler.Revoke)
 		v1.GET("/certificates/:id/private-key", middleware.RequireRole(middleware.RoleAdmin), certHandler.PrivateKey)
 		v1.DELETE("/certificates/:id", middleware.RequireRole(middleware.RoleAdmin), certHandler.Delete)
 
@@ -290,9 +354,6 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/agents/:id/revoke", middleware.RequireRole(middleware.RoleAdmin), agentHandler.RevokeAgent)
 		v1.DELETE("/agents/:id", middleware.RequireRole(middleware.RoleAdmin), agentHandler.DeleteAgent)
 
-		// Enrolment tokens are admin throughout, including the list. The hash
-		// is useless on its own, but a list of live tokens is a map of which
-		// doors are currently open.
 		// The fourth place certificates hide: a file on a disk, behind two
 		// firewalls, that no scan, no transparency log, and no cloud API will
 		// ever mention. Reading is open to any authenticated user — it carries
@@ -312,9 +373,24 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.POST("/agent-grants", middleware.RequireRole(middleware.RoleOperator), agentHandler.CreateGrant)
 		v1.DELETE("/agent-grants/:id", middleware.RequireRole(middleware.RoleOperator), agentHandler.RevokeGrant)
 
+		// Enrolment tokens are admin throughout, including the list. The hash
+		// is useless on its own, but a list of live tokens is a map of which
+		// doors are currently open.
 		v1.GET("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.ListEnrolTokens)
 		v1.POST("/agent-enrol-tokens", middleware.RequireRole(middleware.RoleAdmin), agentHandler.CreateEnrolToken)
 		v1.DELETE("/agent-enrol-tokens/:id", middleware.RequireRole(middleware.RoleAdmin), agentHandler.RevokeEnrolToken)
+
+		// ── Accounts ──
+		//
+		// Admin throughout, including the list. A list of accounts is a map of
+		// who can do what to the CA hierarchy, and it is exactly what somebody
+		// who has taken over one account wants next.
+		v1.GET("/users", middleware.RequireRole(middleware.RoleAdmin), userHandler.List)
+		v1.POST("/users", middleware.RequireRole(middleware.RoleAdmin), userHandler.Create)
+		v1.PATCH("/users/:id", middleware.RequireRole(middleware.RoleAdmin), userHandler.Update)
+		// Resetting somebody else's password does not require the old one —
+		// that is the point, it is the path back from a locked-out colleague.
+		v1.POST("/users/:id/password", middleware.RequireRole(middleware.RoleAdmin), userHandler.ResetPassword)
 
 		// ── Display Tokens ──
 		// Admin-only throughout: minting a credential that authenticates to
@@ -337,7 +413,6 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		// which is why it is a POST and gated at operator.
 		v1.POST("/notification-channels/:id/test", middleware.RequireRole(middleware.RoleOperator), notifHandler.Test)
 
-		// ── Policies ──
 		// ── Custom metadata fields ──
 		//
 		// Readable by anyone, because a viewer needs the labels to make sense of
@@ -348,6 +423,7 @@ func SetupRouter(engine *gin.Engine, deps RouterDeps) {
 		v1.PUT("/metadata-fields/:id", middleware.RequireRole(middleware.RoleAdmin), metadataHandler.Update)
 		v1.DELETE("/metadata-fields/:id", middleware.RequireRole(middleware.RoleAdmin), metadataHandler.Archive)
 
+		// ── Policies ──
 		v1.GET("/policies", policyHandler.List)
 		v1.GET("/policies/:id", policyHandler.Get)
 		v1.POST("/policies", middleware.RequireRole(middleware.RoleOperator), policyHandler.Create)

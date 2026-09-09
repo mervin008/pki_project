@@ -88,7 +88,7 @@ func issueToken(t *testing.T, f *fakeDisplayStore, name string, mutate func(*sto
 // tested is about paths a screen might actually reach, and a synthetic "/test"
 // route would prove nothing about "/certificates/:id/private-key".
 func displayRouter(f *fakeDisplayStore, cfg config.AuthConfig) *gin.Engine {
-	if cfg.JWTSecret == "" && !cfg.AllowAnonymous {
+	if cfg.JWTSecret == "" {
 		cfg.JWTSecret = testSecret
 	}
 	cfg.RoleClaim = "certpilot_role"
@@ -310,25 +310,30 @@ func TestRejectionReasonIsNotDisclosed(t *testing.T) {
 	}
 }
 
-// The sharpest failure available: with anonymous access enabled for local
-// evaluation, an invalid display token must not fall through to the anonymous
-// path, which grants admin.
-func TestInvalidDisplayTokenNeverFallsThroughToAnonymousAdmin(t *testing.T) {
+// A rejected display token must abort, not fall through.
+//
+// This was the sharpest failure available while anonymous access existed: a
+// token that failed would have landed on the anonymous path and been granted
+// admin. Anonymous access is gone, so the consequence is now a 401 rather than
+// a privilege escalation — but the property being tested is the same one, and
+// it is the property that would matter again if any fallback were ever added.
+func TestInvalidDisplayTokenNeverFallsThrough(t *testing.T) {
 	f := newFakeDisplayStore()
-	r := displayRouter(f, config.AuthConfig{AllowAnonymous: true})
+	r := displayRouter(f, config.AuthConfig{JWTSecret: testSecret})
 
 	w := callWithDisplayToken(r, http.MethodGet, "/api/v1/pki/authorities", "cpd_"+strings.Repeat("C", 43))
 	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 — a rejected display token reached the anonymous admin path (body: %s)",
+		t.Fatalf("status = %d, want 401 — a rejected display token fell through instead of aborting (body: %s)",
 			w.Code, w.Body.String())
 	}
 }
 
-// A valid display token must not be promoted by anonymous access either.
-func TestValidDisplayTokenStaysViewerUnderAnonymousAccess(t *testing.T) {
+// A valid display token is viewer and stays viewer, whatever else is
+// configured.
+func TestValidDisplayTokenIsAlwaysViewer(t *testing.T) {
 	f := newFakeDisplayStore()
 	raw := issueToken(t, f, "screen", nil)
-	r := displayRouter(f, config.AuthConfig{AllowAnonymous: true})
+	r := displayRouter(f, config.AuthConfig{JWTSecret: testSecret})
 
 	w := callWithDisplayToken(r, http.MethodGet, "/api/v1/pki/authorities", raw)
 	if w.Code != http.StatusOK {

@@ -1,0 +1,37 @@
+name: Route inventory
+
+# docs/routes.json is what the documentation site is built from. If it is
+# allowed to drift from the router, the published reference is wrong and
+# nothing says so — which is the failure mode generating it was meant to remove
+# in the first place.
+on:
+  pull_request:
+    paths:
+      - 'core/api/router.go'
+      - 'core/server/middleware/auth.go'
+      - 'core/server/middleware/display_token.go'
+      - 'scripts/extract-routes.py'
+      - 'docs/routes.json'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Regenerate the route inventory
+        run: python3 scripts/extract-routes.py docs/routes.json
+
+      - name: Fail if it changed
+        run: |
+          if ! git diff --quiet -- docs/routes.json; then
+            echo "::error::docs/routes.json is out of date. Run:"
+            echo "::error::  python3 scripts/extract-routes.py docs/routes.json"
+            git --no-pager diff -- docs/routes.json
+            exit 1
+          fi
+          echo "Route inventory is current."

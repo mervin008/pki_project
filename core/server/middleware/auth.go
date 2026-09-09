@@ -4,14 +4,17 @@ package middleware
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/certpilot/certpilot/pkg/config"
 	"github.com/gin-gonic/gin"
+	"log/slog"
+
+	"github.com/certpilot/certpilot/core/store"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/lestrrat-go/httprc/v3"
 	"github.com/lestrrat-go/jwx/v3/jwk"
@@ -36,20 +39,62 @@ const (
 	// attributed to a corridor screen means something different from one
 	// attributed to a person.
 	ContextAuthMethod = "auth_method"
+	// ContextUserDBID is the primary key of the row in CertPilot's users
+	// table, as distinct from ContextUserID which is the provider's subject.
+	// Actor columns keep storing the subject: it is what the audit log has
+	// always held, and it survives the users table being rebuilt.
+	ContextUserDBID = "user_db_id"
+	// ContextSessionID identifies the browser session, so signing out can end
+	// this one specifically rather than every session the account holds.
+	ContextSessionID = "session_id"
 )
+
+// identityIssuer prefers the issuer the token asserts.
+//
+// A legacy HS256 token need not carry one, and there is no JWKS to infer it
+// from, so the configured issuer stands in. The constant last resort keeps a
+// subject from being stored against an empty issuer, where it would collide
+// with every other provider's subjects.
+func identityIssuer(claims *UserClaims, configured string) string {
+	if iss, err := claims.GetIssuer(); err == nil && iss != "" {
+		return iss
+	}
+	if configured != "" {
+		return configured
+	}
+	return "legacy-shared-secret"
+}
 
 // Authentication methods recorded in ContextAuthMethod.
 const (
 	AuthMethodBearer       = "bearer"
 	AuthMethodAnonymous    = "anonymous"
 	AuthMethodDisplayToken = "display_token"
+	AuthMethodSession      = "session"
 )
 
 // UserClaims represents the claims inside an identity provider's JWT.
 type UserClaims struct {
-	Email       string         `json:"email"`
-	AppMetadata map[string]any `json:"app_metadata"`
+	Email string `json:"email"`
+	// Name and PreferredUsername are the OIDC profile claims that let a users
+	// list show a person rather than an opaque subject. Both are optional, and
+	// a provider configured without the profile scope sends neither.
+	Name              string         `json:"name"`
+	PreferredUsername string         `json:"preferred_username"`
+	AppMetadata       map[string]any `json:"app_metadata"`
+	// Nonce binds an ID token to the one authorization request that asked for
+	// it. Present only on ID tokens, and checked only there: without it, a
+	// token captured from one sign-in can be replayed into another.
+	Nonce string `json:"nonce"`
 	jwt.RegisteredClaims
+}
+
+// DisplayName is the friendliest label the token offers, or empty.
+func (c *UserClaims) DisplayName() string {
+	if c.Name != "" {
+		return c.Name
+	}
+	return c.PreferredUsername
 }
 
 // Role returns the RBAC role from app_metadata, defaulting to viewer.
@@ -72,14 +117,27 @@ func (c *UserClaims) Role(claimName string) string {
 	return RoleViewer
 }
 
+// UserDirectory is the slice of the store the authenticator needs.
+//
+// Narrow on purpose: this middleware runs on every request and should be able
+// to look a user up and record that they were seen, and nothing else. Handing
+// it the whole Store would let a future edit here change a role during a
+// sign-in, which is exactly what must never happen.
+type UserDirectory interface {
+	ResolveUser(ctx context.Context, identity store.UserIdentity, bootstrapAdmins []string) (*store.User, error)
+	TouchUser(ctx context.Context, id string, seenAt time.Time) error
+}
+
 // Authenticator verifies bearer tokens.
 type Authenticator struct {
 	cfg   config.AuthConfig
 	cache *jwk.Cache
 
-	// anonymousWarn ensures the anonymous-access warning is logged once per
-	// process rather than once per request.
-	anonymousWarn sync.Once
+	// users resolves a verified token's subject to the role CertPilot holds
+	// for that person. When nil the role falls back to the token's own claim,
+	// which is how the middleware tests and any deployment without a store
+	// continue to work.
+	users UserDirectory
 }
 
 // NewAuthenticator builds an Authenticator. When a JWKS URL is configured, its
@@ -98,11 +156,22 @@ func NewAuthenticator(ctx context.Context, cfg config.AuthConfig) (*Authenticato
 		a.cache = cache
 	}
 
-	if a.cache == nil && cfg.JWTSecret == "" && !cfg.AllowAnonymous {
-		return nil, fmt.Errorf("auth: no verification method configured; set auth.jwks_url, auth.jwt_secret, or auth.allow_anonymous")
-	}
+	// A build with neither is still valid: local accounts sign in with a
+	// password and a session cookie, which needs no token verification at all.
+	// What must not happen is a *token* arriving with nothing to check it
+	// against, and Verify refuses that case on its own.
 
 	return a, nil
+}
+
+// WithUserDirectory makes CertPilot's own users table the authority on role.
+//
+// Separate from the constructor because the authenticator is built before the
+// store is opened, and because the middleware package's own tests exercise
+// token verification with no database at all.
+func (a *Authenticator) WithUserDirectory(dir UserDirectory) *Authenticator {
+	a.users = dir
+	return a
 }
 
 // Middleware returns the Gin handler that authenticates each request.
@@ -120,24 +189,15 @@ func (a *Authenticator) Middleware() gin.HandlerFunc {
 		authHeader := c.GetHeader("Authorization")
 
 		if authHeader == "" {
-			// Anonymous access is a first-run convenience, gated at config
-			// load to development mode on a loopback address. Crucially it
-			// applies only when no token was presented at all — an invalid
-			// token is always a rejection, never a fallback to admin.
-			if a.cfg.AllowAnonymous {
-				a.anonymousWarn.Do(func() {
-					gin.DefaultWriter.Write([]byte(
-						"WARNING: anonymous API access is enabled; every request is treated as admin\n"))
-				})
-				c.Set(ContextUserID, "00000000-0000-0000-0000-000000000001")
-				c.Set(ContextUserEmail, "anonymous@certpilot.local")
-				c.Set(ContextUserRole, RoleAdmin)
-				c.Set(ContextAuthMethod, AuthMethodAnonymous)
-				c.Next()
-				return
-			}
+			// No anonymous fallback. There used to be one, gated to
+			// development mode on a loopback address, and the gate worked —
+			// but running every local session as an unnamed superuser made the
+			// authorisation paths the least exercised code in the system, and
+			// wrote an audit log attributing everything to a subject nobody
+			// could be asked about. Sign in locally instead; it costs one
+			// password and buys a system that is exercised the way it ships.
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "Authorization header required",
+				"error": "this request carried no credential: sign in, or present a bearer token or display token",
 			})
 			return
 		}
@@ -162,8 +222,58 @@ func (a *Authenticator) Middleware() gin.HandlerFunc {
 
 		c.Set(ContextUserID, claims.Subject)
 		c.Set(ContextUserEmail, claims.Email)
-		c.Set(ContextUserRole, claims.Role(a.cfg.RoleClaim))
 		c.Set(ContextAuthMethod, AuthMethodBearer)
+
+		if a.users == nil {
+			// No directory configured: the token's own claim is the only
+			// available answer.
+			c.Set(ContextUserRole, claims.Role(a.cfg.RoleClaim))
+			c.Next()
+			return
+		}
+
+		user, err := a.users.ResolveUser(c.Request.Context(), store.UserIdentity{
+			// The issuer from the token, not from configuration. A subject is
+			// unique only within the issuer that minted it, and taking the
+			// issuer from config would merge two providers' users if an
+			// operator ever pointed the core at a second one.
+			Issuer:      identityIssuer(claims, a.cfg.Issuer),
+			Subject:     claims.Subject,
+			Email:       claims.Email,
+			DisplayName: claims.DisplayName(),
+		}, a.cfg.BootstrapAdmins)
+		if err != nil {
+			// Fail closed. A role that cannot be established is not a role,
+			// and defaulting to viewer here would silently strip an operator
+			// mid-incident rather than telling them the lookup broke.
+			slog.Error("could not resolve the signed-in user", "error", err, "subject", claims.Subject)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+				"error": "your identity could not be resolved against CertPilot's user directory, " +
+					"so no role could be established for this request",
+			})
+			return
+		}
+
+		if !user.IsActive() {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error": "this account is suspended in CertPilot; the identity provider still " +
+					"accepts it, so sign-in succeeds and every request is refused here",
+			})
+			return
+		}
+
+		c.Set(ContextUserRole, user.Role)
+		c.Set(ContextUserDBID, user.ID)
+		if user.Email != "" {
+			c.Set(ContextUserEmail, user.Email)
+		}
+
+		// Best effort: being unable to record a timestamp is not a reason to
+		// refuse a request that is otherwise fully authorised.
+		if err := a.users.TouchUser(c.Request.Context(), user.ID, time.Now()); err != nil {
+			slog.Warn("could not record last-seen", "error", err, "user_id", user.ID)
+		}
+
 		c.Next()
 	}
 }
@@ -204,6 +314,73 @@ func (a *Authenticator) Verify(ctx context.Context, tokenString string) (*UserCl
 	}
 
 	return claims, nil
+}
+
+// VerifyIDToken validates an ID token returned by an authorization code
+// exchange.
+//
+// Separate from Verify because an ID token is a different document with
+// different rules, and conflating them is how audience checks get skipped. Its
+// audience is the *client id* — not the API audience an access token carries —
+// so verifying one with the other's expectations either rejects every valid
+// token or, worse, accepts a token minted for a different application.
+//
+// The nonce is required and compared here. It is the only thing tying the token
+// to the browser that started this particular sign-in; a provider will happily
+// re-issue an ID token that is valid in every other respect.
+func (a *Authenticator) VerifyIDToken(ctx context.Context, tokenString, clientID, nonce string) (*UserClaims, error) {
+	if clientID == "" {
+		return nil, fmt.Errorf("auth: no client id is configured, so an ID token cannot be verified")
+	}
+	if nonce == "" {
+		return nil, fmt.Errorf("auth: this sign-in carried no nonce, so its ID token cannot be tied to it")
+	}
+
+	claims := &UserClaims{}
+	opts := []jwt.ParserOption{
+		jwt.WithExpirationRequired(),
+		jwt.WithLeeway(30 * time.Second),
+		jwt.WithAudience(clientID),
+		// Pinned for the same reason as in Verify: an unpinned parser accepts
+		// "none", and accepts HS256 signed with the public half of an RS256
+		// keypair.
+		jwt.WithValidMethods([]string{"RS256", "RS512", "ES256", "ES384", "ES512", "EdDSA"}),
+	}
+	if a.cfg.Issuer != "" {
+		opts = append(opts, jwt.WithIssuer(a.cfg.Issuer))
+	}
+
+	token, err := jwt.ParseWithClaims(tokenString, claims, a.keyFunc(ctx), opts...)
+	if err != nil {
+		return nil, err
+	}
+	if !token.Valid {
+		return nil, fmt.Errorf("auth: ID token is not valid")
+	}
+	if subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(nonce)) != 1 {
+		return nil, fmt.Errorf("auth: the ID token's nonce does not match the sign-in that requested it")
+	}
+	if claims.Subject == "" {
+		return nil, fmt.Errorf("auth: the ID token carries no subject, so there is nobody to sign in")
+	}
+	return claims, nil
+}
+
+// ResolveIdentity turns verified claims into a CertPilot user.
+//
+// Shared with the middleware so that a federated sign-in and a federated
+// request establish identity by exactly the same rules — including taking the
+// issuer from the token rather than from configuration.
+func (a *Authenticator) ResolveIdentity(ctx context.Context, claims *UserClaims) (*store.User, error) {
+	if a.users == nil {
+		return nil, fmt.Errorf("auth: no user directory is configured")
+	}
+	return a.users.ResolveUser(ctx, store.UserIdentity{
+		Issuer:      identityIssuer(claims, a.cfg.Issuer),
+		Subject:     claims.Subject,
+		Email:       claims.Email,
+		DisplayName: claims.DisplayName(),
+	}, a.cfg.BootstrapAdmins)
 }
 
 func (a *Authenticator) keyFunc(ctx context.Context) jwt.Keyfunc {

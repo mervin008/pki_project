@@ -47,15 +47,22 @@ Six Go modules in a workspace (`go.work`, Go 1.26.6) plus a Vue frontend.
 | `gateways/{selfsigned,acme,vault}/` | CA adapters, each its own module and process, speaking one gRPC contract |
 | `agent/` | Host agent: generates keys locally, sends CSRs, installs and reloads |
 | `frontend/` | Vue 3 + Vite + Tailwind 4 + Pinia |
-| `migrations/` | 27 numbered `.sql` files, applied by `certpilot-core --migrate` |
+| `migrations/` | 35 numbered `.sql` files, applied by `certpilot-core --migrate` |
 | `docs/` | Written, current, and worth reading |
+
+**The API reference is published as a separate site** from
+[`mervin008/certpilot-docs`](https://github.com/mervin008/certpilot-docs)
+(VitePress, GitHub Pages). Its endpoint tables are *generated* from
+`core/api/router.go` by `scripts/extract-routes.py` into `docs/routes.json`,
+which CI checks for staleness — so **run `make routes` after adding a route**.
+`docs/api-reference.md` stays here as the deeper per-resource guide.
 
 `core/engine/` holds the ten background engines: `pki` (CA health and issuer
 import), `renewal`, `discovery`, `ctlog`, `cloudsync`, `deploy`, `fleet`,
 `notifications`, `policy`, `posture`. They are started by `core/server` and
 publish to an in-process broker (`core/events`) that feeds the SSE endpoint.
 
-`core/api/` is 21 handler files behind ~101 routes in `router.go`.
+`core/api/` is 26 handler files behind 121 routes in `router.go`.
 
 ---
 
@@ -67,6 +74,7 @@ make seed     # fill a running instance with a realistic estate; idempotent
 make test     # all six modules
 make lint     # gofmt + go vet + staticcheck
 make migrate  # apply outstanding migrations (never run automatically)
+make routes   # regenerate docs/routes.json after changing the router
 make help     # the rest
 ```
 
@@ -98,10 +106,93 @@ policy. Never move it, and never run it against a database you did not create.
 **The server never migrates itself.** A schema change is something an operator
 runs, not a side effect of a replica restarting mid-deploy.
 
+**Where the KEK comes from is configurable** — `secrets.kek_provider` is `env`
+(default), `file`, or `vault`, in `pkg/secrets/provider.go`. Moving between them
+is a configuration change, not a migration: the same key value from a different
+source opens existing ciphertext. A key file writable by group or other is
+refused; world-readable is only warned about, because Kubernetes mounts secret
+volumes 0644. Only `env` falls back to an ephemeral key — a configured `file` or
+`vault` provider that returns nothing is fatal, or a misconfiguration would hide
+behind a successful start.
+
 **Private keys and CA credentials are sealed with `CERTPILOT_KEK`** before they
 reach the database (`pkg/secrets`, envelope encryption, `CPS1` magic). Losing the
 KEK makes every stored secret unrecoverable. The core refuses to start against a
 database without one.
+
+**There is no anonymous mode, including locally.** `auth.allow_anonymous` is
+refused by configuration validation, not ignored. On first start the core
+creates the account in `auth.bootstrap_admins`, generates a password and prints
+it once; `make dev` also writes it to `.certpilot/dev-admin`. The bootstrap
+re-runs whenever **no active account has a password**, which is both the upgrade
+path and the recovery path.
+
+**The core redeems the OIDC authorization code, not the browser.** `POST
+/auth/callback` takes the code, the PKCE verifier and the nonce; the core
+exchanges them, verifies the ID token against the client id and that nonce, and
+returns the same session cookie a password sign-in gets. The browser therefore
+holds no access token, no refresh token and no ID token — `lib/oidc.ts` builds
+an authorization URL and checks `state`, and that is all it does. The provider's
+refresh token is discarded rather than stored: CertPilot's session is the
+durable credential, so a federated session outlives revocation at the provider
+until it expires, and suspending the account is what ends it immediately.
+
+**Browser sessions are rows, not tokens.** An opaque value in an `HttpOnly`,
+`SameSite=Strict` cookie, stored as a SHA-256 hash — so the core holds no key
+that can forge one, and suspending somebody ends their session immediately.
+Sign-in is throttled in the database (8 failures, 15 minutes) because there are
+several replicas and no rate limiting.
+
+**The identity provider says who you are; CertPilot says what you may do.**
+Roles live in the `users` table keyed on `(issuer, subject)`, not in a token
+claim — `app_metadata.certpilot_role` is ignored when a directory is wired in.
+A sign-in never writes a role, so `auth.bootstrap_admins` grants a first one and
+never maintains it. A subject is opaque text, **not a uuid**: Okta, Google and
+Auth0 all issue non-uuid subjects, which is what migration 028 widened every
+actor column for. `GET /me` is the only honest source of a role for the UI.
+
+**Accounts are managed in Settings → Accounts** (admin only, including the
+list). The last active admin cannot be demoted or suspended — the only way back
+from that is SQL, which is what the screen exists to remove. Suspending revokes
+every session immediately. A generated password sets `must_change_password`,
+which raises a modal that cannot be dismissed.
+
+**The audit log is chained with a key the database does not hold.** Each entry
+carries a gapless `seq`, the previous entry's tag, and an HMAC-SHA256 tag over
+both, keyed from a subkey of `CERTPILOT_KEK`. So a database-only attacker can
+alter a row and cannot forge a tag that agrees with it. `details` is `text`, not
+`jsonb`, precisely because jsonb rewrites the bytes it is given and the tag
+would stop matching. Entries predating migration 031 are deliberately left
+unchained, and `GET /audit/verify` counts them rather than pretending they are
+covered. Writing takes a transaction-scoped advisory lock: without it two
+replicas chain from the same predecessor and one entry is lost.
+
+**Revocation tells the CA first and records only what the CA accepted.**
+`POST /certificates/:id/revoke` (admin). A row can never read `REVOKED` while
+the certificate still answers handshakes — the schema enforces that `status =
+'REVOKED'` and `revoked_at is not null` agree. `DELETE` now refuses a live
+certificate and points at revoke; `?forget=true` is the deliberate override for
+a certificate you want to stop tracking while it stays live.
+
+**The CA health sweep asks whether each CA has been revoked, and verifies the
+signature.** The OCSP URL in a certificate's AIA is the *parent's* responder, so
+for an intermediate the question is "has my parent revoked me" —
+`pkg/revocation` builds a real request and `ocsp.ParseResponseForCert` checks the
+signature, the delegation, and that the answer is about the right certificate.
+A revoked CA is forced to `CRITICAL` on every sweep from the *recorded* status,
+not from the check's own result: `CheckCA` recomputes status from expiry each
+time, so keying off the result let a known-revoked CA return to `HEALTHY` the
+moment its responder blipped. A failed check never clears a recorded revocation.
+
+**A replayed agent request is refused, and the signature is the nonce.** Ed25519
+is deterministic, so an identical request carries an identical signature; the
+core stores the ones it has accepted (`agent_request_signatures`) and refuses a
+repeat. No protocol change, so deployed agents are unaffected. Guarded by
+default with an *exemption* list in `middleware/agent.go` — heartbeat, inventory,
+installations, deployments/result — because a one-second timestamp means an
+agent's own retry is byte-identical to a replay, and refusing that on a report
+turns a recovered blip into a failure. Checked after the revocation check, so a
+withdrawn credential is always told so.
 
 **`key_custody` on a certificate says who holds the private key** — `CERTPILOT`,
 `AGENT`, or `EXTERNAL`. Provenance (`discovered_via`) cannot answer that
@@ -119,6 +210,23 @@ API's `days_remaining` over recomputing from `not_after`. The exception, and it
 is deliberate: a certificate's *urgency* combines its status with its own
 `renewal_lead_days`, because the core leaves a certificate `ISSUED` until a
 renewal sweep moves it while `/dashboard/stats` already counts it as expiring.
+
+**Deployment order is declared on the target, carried by the job.**
+`deployment_targets.deploy_order` — lower first, zero by default, which is one
+wave and the behaviour that existed before. A job copies the wave at enqueue
+rather than joining it at claim time, so reordering a target cannot change a
+rollout already under way. A canary is a target on its own in the lowest wave:
+exactly one attempt, declared rather than inferred.
+
+Two gates, in `ClaimDeploymentJob` **and** `ClaimAgentDeploymentJobs` — an agent
+target is still a target, and gating one path only would let the declared order
+hold for half the estate. Within a wave a terminally failed job stops blocking
+its peers; across waves it does not, because the point of "staging, then
+production" is that a certificate staging refused must not reach production.
+That cross-wave gate counts only the *latest* job per binding: keyed on
+`status = 'FAILED'` alone it blocked production for ever after one bad
+afternoon, and a terminally failed job cannot be cancelled, so there was no way
+out. The way out is to fix the target and deploy again.
 
 **Durable queues** (renewal, deployment) use a partial unique index plus
 `ON CONFLICT DO NOTHING` and `FOR UPDATE SKIP LOCKED`. No leader election; any
@@ -163,6 +271,13 @@ and screenshotting has caught real defects that reading the code did not
 (uncoloured severity cells losing a CSS specificity fight, a red chip labelled
 "ISSUED", sentences rendered in an uppercase tracked label style).
 
+**Every store test runs against both implementations**, enforced by
+`TestStoreTestsRunAgainstBothImplementations` in `preflight_test.go`. Building a
+`MemoryStore` directly in a store test is a failure with a short allow-list —
+`discovery_test.go` and `cloud_test.go` did it for a year and hid four defects,
+including an adopted cloud certificate silently reverting to unmanaged on every
+sync while a test called `TestImportSurvivesTheNextSync` passed.
+
 **The four store defect classes**, all found the hard way, all worth checking
 when touching the store: a Go constant a CHECK constraint refuses; a model field
 a writer silently drops; empty string versus NULL; a parameter PostgreSQL types
@@ -172,7 +287,11 @@ differently than expected. See [`docs/database.md`](docs/database.md).
 
 ## Frontend
 
-Vue 3, Pinia, Tailwind 4, daisyUI (being removed), chart.js, lucide icons.
+Vue 3, Pinia, Tailwind 4, chart.js, lucide icons. **daisyUI is gone** — the
+conversion finished, the plugin and both retheme blocks were removed from
+`main.css`, and the dependency was dropped. The stylesheet halved as a result
+(143 kB to 65 kB). If you find a `btn`, `card`, `badge`, `modal` or `alert`
+class anywhere, it is dead markup, not a component.
 
 **The design is an operations console, not an admin template.** Three rules, all
 enforced in `src/assets/styles/main.css`:
@@ -196,12 +315,26 @@ Severity utility classes are tripled (`.sev-critical.sev-critical.sev-critical`)
 to win specificity fights against `.tbl tbody td` and scoped component styles.
 That is deliberate; do not "simplify" it.
 
-**Converted to the console idiom:** `DashboardView`, `CaHealthView`,
-`CertificatesView`, plus the shell (`CommandRail`), `DataState`, and the `ui/`
-and `metadata/` components.
-**Still daisyUI:** `PkiOverviewView`, `GatewaysView`, `DiscoveryView`,
-`PoliciesView`, `SettingsView`, `DisplayView`. They follow the palette because
-daisyUI's theme tokens were overridden, but they are proportional-font and airy.
+Sign-in is OpenID Connect, authorization code with PKCE, in `lib/oidc.ts`. The
+frontend reads the issuer and client id from `/auth/config` rather than from
+build-time environment variables, so one instance is described by one file.
+
+**Every view is on the console idiom.** The six that were still daisyUI —
+`PkiOverviewView`, `GatewaysView`, `DiscoveryView`, `PoliciesView`,
+`SettingsView`, `DisplayView` — were converted, along with the settings
+components and `ConnectionIndicator`.
+
+The primitives that conversion needed live in `main.css` under CONSOLE
+PRIMITIVES: `.select-console`, `.textarea-console`, `.check-console`,
+`.toggle-console`, `.field`, `.notice` (replaces `alert`), `.tag`, `.toolbar`,
+`.dialog-*` (replaces `modal`), `.tabs-console`, `.empty-console`, `.skel`,
+`.spinner-console`, `.meter` and `.kv`. Three token groups back them:
+`--dur-*`/`--ease-out` for motion and `--sp-*` for spacing rhythm.
+
+**`.tag` is not `.chip`.** `.chip` carries severity and is bordered in the
+severity colour; `.tag` is inert metadata — a key type, a gateway kind. They
+were being used interchangeably, which is how a red-bordered chip reading
+"ISSUED" reached the screen once already.
 
 `DisplayView` is the unattended wall screen: no chrome, authenticates with a
 kiosk display token, and must degrade loudly when the feed dies.
@@ -236,20 +369,17 @@ adding a required field makes the whole estate unsaveable.
 
 Documented, not secretly broken. Do not "discover" these as findings.
 
-- **No certificate revocation endpoint.** Both gateways implement it; the core
-  exposes no route. `DELETE /certificates/:id` deletes the record and leaves the
-  certificate live at the CA. This is the largest hole in the product.
-- Audit log is not hash-chained.
-- No agent nonce store (replay window bounded by timestamp only).
-- OCSP checking is a bare GET, not a signed-response validation.
+**Blocked on this machine, not on the code:** the Key Vault and F5 deployers
+need a real Azure tenant and a real F5 to test against, and the Docker assets
+need a container runtime.
+
+- The audit chain has no external anchor — an attacker holding both the
+  database and the KEK can rewrite it wholesale, or truncate the newest entries.
 - Key Vault and F5 deployers are unit-tested only.
-- The KEK lives in an environment variable.
-- No API rate limiting.
-- Deployment ordering is not expressible.
-- Discovery, CT and cloud-sync tables are thinly covered by the conformance suite.
+- The KEK is held in the core's memory. It can be loaded from a file or from
+  Vault, but delegated unwrapping (transit/KMS) needs a `CPS2` envelope.
+- Deployment waves are per certificate; two rollouts do not coordinate.
 - Docker assets were fixed but never built — no container runtime on this machine.
-- The light theme ships but has never been verified in a rendered screenshot;
-  this machine is in system dark mode and headless Chrome inherits it.
 
 ---
 

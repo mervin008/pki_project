@@ -36,9 +36,45 @@ effect of a deploy restarting a replica.
 
 | Variable | Required | |
 |:---|:---|:---|
-| `CERTPILOT_KEK` | **yes, with a database** | Base64 32-byte key encrypting private keys and CA credentials at rest |
+| `CERTPILOT_KEK` | **yes, with a database**, unless `secrets.kek_provider` says otherwise | Base64 32-byte key encrypting private keys and CA credentials at rest |
 | `CERTPILOT_KEK_RETIRED` | no | Comma-separated previous KEKs, still able to decrypt. See [KEK rotation](operations.md#rotating-the-kek) |
 | `CERTPILOT_DB_URL` | no | Connection string. `DATABASE_URL` is a fallback |
+| `VAULT_TOKEN` | no | Read only by `secrets.kek_provider: vault` and only when no `token_file` is set. For development; a token file can be rotated under a running process |
+
+### Where the KEK comes from
+
+`CERTPILOT_KEK` is the default and not the only option. An environment variable
+is readable through `/proc/<pid>/environ` by anything running as the same user,
+inherited by every child process, present in core dumps and `docker inspect`,
+and tends to end up committed in an orchestrator manifest.
+
+```yaml
+secrets:
+  # "env" (default), "file", or "vault"
+  kek_provider: "file"
+  kek_file: "/run/secrets/certpilot_kek"
+  kek_retired_files:
+    - "/run/secrets/certpilot_kek.previous"
+```
+
+```yaml
+secrets:
+  kek_provider: "vault"
+  vault:
+    address: "https://vault.internal:8200"
+    path: "secret/data/certpilot/kek"   # KV v1 paths work too
+    field: "kek"                        # default
+    retired_field: "retired"            # default
+    token_file: "/var/run/secrets/vault-token"
+    ca_cert: "/etc/ssl/vault-ca.pem"    # optional; system roots otherwise
+```
+
+Moving between providers is a configuration change, not a migration: the same
+key from a different source opens existing ciphertext unchanged. A key file
+writable by group or other is refused — anybody who can write it can replace the
+key. A configured `file` or `vault` provider that returns nothing is fatal
+rather than falling back, so a misconfiguration cannot hide behind a successful
+start-up.
 
 With no connection string the core uses the in-memory store, seeded with sample
 data, discarded on restart.

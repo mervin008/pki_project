@@ -104,7 +104,15 @@ func main() {
 				Mode:           "development",
 				AllowedOrigins: []string{"http://localhost:5173"},
 			},
-			Auth:    config.AuthConfig{AllowAnonymous: true, RoleClaim: "certpilot_role"},
+			// A local administrator is created on first start and its
+			// password printed once. There is no anonymous fallback: running
+			// development as an unnamed superuser is what left the
+			// authorisation paths untested and the audit log unattributable.
+			Auth: config.AuthConfig{
+				RoleClaim:       "certpilot_role",
+				BootstrapAdmins: []string{"admin@certpilot.local"},
+				Scopes:          []string{"openid", "profile", "email"},
+			},
 			Renewal: config.RenewalConfig{ScanInterval: 60, DefaultLeadDays: 30},
 			Plugins: config.PluginsConfig{
 				TLS: config.GatewayTLSConfig{Insecure: true},

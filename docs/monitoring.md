@@ -28,7 +28,8 @@ The CA monitor sweeps every registered CA every six hours by default
 reports real state rather than what was last persisted.
 
 Per CA it re-parses the certificate, recomputes days remaining, fetches the CRL
-and checks its freshness, probes the OCSP responder, and evaluates expiry
+and checks its freshness, asks the OCSP responder whether the CA itself has
+been revoked, and evaluates expiry
 thresholds.
 
 ```bash

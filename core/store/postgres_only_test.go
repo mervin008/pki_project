@@ -3,8 +3,12 @@ package store
 import (
 	"context"
 	"os"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/certpilot/certpilot/pkg/secrets"
 )
 
 // The defects the in-memory store is structurally incapable of having.
@@ -159,5 +163,205 @@ func TestTheMigrationsApplyTwice(t *testing.T) {
 			t.Errorf("%s is not idempotent; applying it to a migrated database failed: %v",
 				migration.Name, err)
 		}
+	}
+}
+
+// ── The audit chain against real PostgreSQL ─────────────
+
+func chainedPostgres(t *testing.T) *PostgresStore {
+	t.Helper()
+	s := postgresOnly(t)
+	kr, err := secrets.NewEphemeralKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.UseAuditChain(NewAuditChainer(kr))
+	return s
+}
+
+// The whole chain rests on the row reading back exactly as it was signed.
+//
+// This is class D and E territory and the in-memory store cannot fail it:
+// timestamptz truncates to microseconds, `details` is written through a
+// *string, and `ip_address` is an inet read back through host(). Any of the
+// three coming back a byte different from what the tag covered would make every
+// entry read as tampered — and it would happen only against a real database.
+func TestAuditChainSurvivesTheRoundTrip(t *testing.T) {
+	s := chainedPostgres(t)
+	ctx := context.Background()
+
+	ip := "203.0.113.7"
+	actor := "00uOKTAsubject001"
+	email := "operator@example.test"
+	for i := 0; i < 5; i++ {
+		if err := s.CreateAuditLog(ctx, &AuditLog{
+			Action:     "certificate.revoked",
+			EntityType: "certificate",
+			ActorID:    &actor,
+			ActorEmail: &email,
+			// Several keys on purpose: jsonb would have reordered them, which is
+			// why this column is text.
+			Details:   `{"reason":"keyCompromise","serial":"0a1b2c","by":"me"}`,
+			IPAddress: &ip,
+		}); err != nil {
+			t.Fatalf("CreateAuditLog: %v", err)
+		}
+	}
+
+	report, err := s.VerifyAuditChain(ctx, 1, 0)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if !report.Intact {
+		t.Fatalf("a chain written and read back by PostgreSQL must verify: %s", report.Reason)
+	}
+	if report.Verified != 5 {
+		t.Errorf("expected 5 verified entries, got %d", report.Verified)
+	}
+}
+
+// No leader election: any replica can write an audit entry, and two doing it at
+// the same instant is ordinary. Without the advisory lock they read the same
+// head and chain from it — one insert loses the unique index and the entry is
+// gone, which is a worse failure than the one the chain was added to detect.
+//
+// A single pool with concurrent goroutines is the same race: each Begin takes
+// its own connection.
+func TestAuditChainIsSafeUnderConcurrentWrites(t *testing.T) {
+	s := chainedPostgres(t)
+	ctx := context.Background()
+
+	const writers = 12
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			errs <- s.CreateAuditLog(ctx, &AuditLog{
+				Action:     "certificate.issued",
+				EntityType: "certificate",
+				Details:    `{"writer":` + strconv.Itoa(n) + `}`,
+			})
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("a concurrent audit write failed: %v", err)
+		}
+	}
+
+	report, err := s.VerifyAuditChain(ctx, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Intact {
+		t.Fatalf("concurrent writers forked the chain: %s", report.Reason)
+	}
+	if report.Verified != writers {
+		t.Errorf("expected %d entries, got %d — an entry was lost to the race",
+			writers, report.Verified)
+	}
+}
+
+// The table has claimed to be immutable since 001 and enforced nothing. The
+// trigger is not a security boundary — anyone who can drop it can drop it — but
+// it is what stops a mistyped UPDATE silently destroying the record.
+func TestAuditLogRefusesUpdatesAndDeletes(t *testing.T) {
+	s := chainedPostgres(t)
+	ctx := context.Background()
+
+	if err := s.CreateAuditLog(ctx, &AuditLog{Action: "ca.checked", EntityType: "ca_authority"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.pool.Exec(ctx, "UPDATE public.audit_logs SET action = 'rewritten'"); err == nil {
+		t.Error("an UPDATE against audit_logs must be refused")
+	}
+	if _, err := s.pool.Exec(ctx, "DELETE FROM public.audit_logs"); err == nil {
+		t.Error("a DELETE against audit_logs must be refused")
+	}
+
+	report, err := s.VerifyAuditChain(ctx, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Intact {
+		t.Errorf("the refused statements must have left the record untouched: %s", report.Reason)
+	}
+}
+
+// Retention is the one legitimate deletion. It has a documented door rather
+// than teaching operators to drop the trigger — and going through it must still
+// leave the gap visible, because a pruned chain is not an intact one.
+func TestAuditPruningIsPossibleAndStillVisible(t *testing.T) {
+	s := chainedPostgres(t)
+	ctx := context.Background()
+
+	for i := 0; i < 4; i++ {
+		if err := s.CreateAuditLog(ctx, &AuditLog{Action: "ca.checked", EntityType: "ca_authority"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := s.pool.Exec(ctx, `
+		BEGIN;
+		SET LOCAL certpilot.audit_maintenance = 'on';
+		DELETE FROM public.audit_logs WHERE seq = 2;
+		COMMIT;`); err != nil {
+		t.Fatalf("the documented retention path must work: %v", err)
+	}
+
+	report, err := s.VerifyAuditChain(ctx, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Intact {
+		t.Fatal("a pruned entry must leave the chain reading as broken, not intact")
+	}
+	if report.BrokenAt == nil || *report.BrokenAt != 2 {
+		t.Fatalf("expected the gap reported at seq 2, got %v", report.BrokenAt)
+	}
+}
+
+// The tag is keyed by a subkey of CERTPILOT_KEK, which lives in the core's
+// environment and never in the database. Somebody holding only the database can
+// rewrite a row — the trigger is theirs to drop — but cannot produce a tag that
+// agrees with it. This is the property that distinguishes the design from a
+// plain SHA-256 chain, so it is worth proving against real SQL rather than
+// asserting in a comment.
+func TestAuditChainDetectsTamperingDoneInSQL(t *testing.T) {
+	s := chainedPostgres(t)
+	ctx := context.Background()
+
+	for i := 0; i < 4; i++ {
+		if err := s.CreateAuditLog(ctx, &AuditLog{
+			Action: "certificate.revoked", EntityType: "certificate",
+			Details: `{"reason":"keyCompromise"}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Exactly what an attacker with database access would do: drop the guard,
+	// edit the row, put the guard back.
+	if _, err := s.pool.Exec(ctx, `
+		ALTER TABLE public.audit_logs DISABLE TRIGGER trg_audit_logs_append_only;
+		UPDATE public.audit_logs SET details = '{"reason":"superseded"}' WHERE seq = 3;
+		ALTER TABLE public.audit_logs ENABLE TRIGGER trg_audit_logs_append_only;`); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := s.VerifyAuditChain(ctx, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Intact {
+		t.Fatal("an entry rewritten in SQL must not verify")
+	}
+	if report.BrokenAt == nil || *report.BrokenAt != 3 {
+		t.Fatalf("expected the break at seq 3, got %v", report.BrokenAt)
 	}
 }

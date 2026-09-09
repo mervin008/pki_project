@@ -49,6 +49,20 @@ type CertInfo struct {
 
 // ParseCertificatePEM parses a PEM-encoded certificate and returns CertInfo.
 func ParseCertificatePEM(certPEM []byte) (*CertInfo, error) {
+	cert, err := ParseX509PEM(certPEM)
+	if err != nil {
+		return nil, err
+	}
+	return CertInfoFromX509(cert), nil
+}
+
+// ParseX509PEM returns the certificate itself rather than a summary of it.
+//
+// CertInfo is a flattened view for storage and display; anything doing
+// cryptography needs the real thing — checking revocation, for one, has to hash
+// the issuer's public key and verify a signature, and neither is derivable from
+// a struct of strings.
+func ParseX509PEM(certPEM []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
 		return nil, fmt.Errorf("failed to decode PEM block")
@@ -58,8 +72,7 @@ func ParseCertificatePEM(certPEM []byte) (*CertInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse certificate: %w", err)
 	}
-
-	return CertInfoFromX509(cert), nil
+	return cert, nil
 }
 
 // CertInfoFromX509 extracts CertInfo from a parsed x509.Certificate.

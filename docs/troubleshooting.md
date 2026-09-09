@@ -19,15 +19,28 @@ Symptom, cause, fix. Grouped by where the symptom shows up.
 The core will not start against a database without one. `make generate-kek`,
 then put it somewhere durable — see [operations.md](operations.md#first-run).
 
-**`config: auth.allow_anonymous cannot be enabled in production mode`**
+**`config: auth.allow_anonymous no longer exists and must be removed`**
 
-Working as intended. Anonymous means every request is admin. Configure
-`auth.jwks_url` instead.
+Working as intended, and it is refused rather than ignored on purpose: an
+instance you believe is open should not quietly become one that is not.
 
-**`config: auth.allow_anonymous requires server.host to be a loopback address`**
+Remove the setting. Sign in with a local account — the first one is created and
+its password printed at first start — or configure `auth.jwks_url` for an
+identity provider.
 
-Anonymous access on an interface anything can reach is not a development
-convenience. Bind to `127.0.0.1` or configure real authentication.
+**Nobody can sign in / the first-run password scrolled past**
+
+The password is shown once and is not recoverable. `make dev` writes it to
+`.certpilot/dev-admin`.
+
+If it is genuinely lost, the bootstrap runs again whenever **no active account
+has a password**, so clearing the one on the bootstrap address is enough:
+
+```sql
+update users set password_hash = null where email = 'you@example.com';
+```
+
+Restart the core and it will print a new one.
 
 **`gateway TLS configuration is invalid`**
 

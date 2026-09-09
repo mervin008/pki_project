@@ -38,9 +38,9 @@ function ruleLabel(type: string) {
 
 function severityBadgeClass(severity: string) {
   switch (severity) {
-    case 'BLOCK': return 'badge-error'
-    case 'WARNING': return 'badge-warning'
-    default: return 'badge-ghost'
+    case 'BLOCK': return 'sev-critical'
+    case 'WARNING': return 'sev-warning'
+    default: return 'sev-unknown'
   }
 }
 
@@ -156,26 +156,26 @@ async function removePolicy(policy: Policy) {
 <template>
   <div class="space-y-6">
     <div class="flex items-center justify-between gap-4 flex-wrap">
-      <p class="text-sm text-base-content/60">
+      <p class="text-sm text-[color:var(--text-muted)]">
         Rules evaluated when a certificate is requested
       </p>
       <div class="flex items-center gap-2">
-        <button class="btn btn-ghost btn-sm gap-1.5" :disabled="policies.loading.value" @click="policies.refresh()">
+        <button class="btn-console gap-1.5" :disabled="policies.loading.value" @click="policies.refresh()">
           <RotateCw class="w-3.5 h-3.5" :class="policies.loading.value && 'animate-spin'" />
           Refresh
         </button>
-        <button class="btn btn-primary btn-sm gap-2" @click="showCreate = true">
+        <button class="btn-console btn-signal gap-2" @click="showCreate = true">
           <Plus class="w-4 h-4" /> Create policy
         </button>
       </div>
     </div>
 
-    <div v-if="actionError" role="alert" class="alert alert-error">
+    <div v-if="actionError" role="alert" class="notice" data-tone="critical">
       <CircleX class="w-5 h-5 shrink-0" />
       <span class="text-sm break-words">{{ actionError }}</span>
     </div>
 
-    <div role="alert" class="alert alert-info">
+    <div role="alert" class="notice" data-tone="signal">
       <Sliders class="w-4 h-4 shrink-0" />
       <span class="text-xs">
         Policies are evaluated on issuance only, not on renewal. Only
@@ -193,41 +193,41 @@ async function removePolicy(policy: Policy) {
       <div v-if="policyList.length" class="grid grid-cols-1 md:grid-cols-2 gap-3">
         <div
           v-for="policy in policyList" :key="policy.id"
-          class="card bg-base-100 border border-base-300"
+          class="panel border"
           :class="!policy.is_enabled && 'opacity-60'"
         >
-          <div class="card-body p-4 gap-2">
+          <div class="panel-body p-4 gap-2">
             <div class="flex items-start justify-between gap-3">
               <div class="min-w-0">
                 <div class="font-bold text-sm truncate">{{ policy.name }}</div>
-                <div class="text-[11px] opacity-60">{{ ruleLabel(policy.rule_type) }}</div>
+                <div class="text-[11px] text-[color:var(--text-muted)]">{{ ruleLabel(policy.rule_type) }}</div>
               </div>
-              <span class="badge badge-sm shrink-0" :class="severityBadgeClass(policy.severity)">
+              <span class="tag shrink-0" :class="severityBadgeClass(policy.severity)">
                 {{ policy.severity }}
               </span>
             </div>
 
-            <p v-if="policy.description" class="text-xs opacity-70">{{ policy.description }}</p>
-            <p class="text-xs font-mono bg-base-200 rounded px-2 py-1.5 break-words">
+            <p v-if="policy.description" class="text-xs text-[color:var(--text-secondary)]">{{ policy.description }}</p>
+            <p class="text-xs font-mono px-2 py-1.5 break-words">
               {{ describeRule(policy) }}
             </p>
-            <p class="text-[11px] opacity-60">
+            <p class="text-[11px] text-[color:var(--text-muted)]">
               Applies to <span class="font-mono">{{ policy.domain_pattern || '*' }}</span>
             </p>
 
             <div class="flex items-center justify-between mt-1">
               <label class="label cursor-pointer justify-start gap-2 py-0">
                 <input
-                  type="checkbox" class="toggle toggle-sm toggle-primary"
+                  type="checkbox" class="toggle-console toggle-primary"
                   :checked="policy.is_enabled" :disabled="busyId === policy.id"
                   @change="toggleEnabled(policy)"
                 />
-                <span class="label-text text-xs">
+                <span class="label-micro">
                   {{ policy.is_enabled ? 'Enabled' : 'Disabled' }}
                 </span>
               </label>
               <button
-                class="btn btn-ghost btn-xs text-error" :disabled="busyId === policy.id"
+                class="btn-console sev-critical" :disabled="busyId === policy.id"
                 @click="removePolicy(policy)"
               >
                 <Trash2 class="w-3.5 h-3.5" />
@@ -237,14 +237,14 @@ async function removePolicy(policy: Policy) {
         </div>
       </div>
 
-      <div v-else class="card bg-base-100 border border-base-300">
-        <div class="card-body items-center text-center py-12">
+      <div v-else class="panel border">
+        <div class="panel-body items-center text-center py-12">
           <Sliders class="w-10 h-10 opacity-30" />
           <h3 class="font-bold text-sm">No policies defined</h3>
-          <p class="text-xs opacity-60 max-w-sm">
+          <p class="text-xs text-[color:var(--text-muted)] max-w-sm">
             Without policies, any key size, lifetime, and CA combination is accepted.
           </p>
-          <button class="btn btn-primary btn-sm gap-2 mt-2" @click="showCreate = true">
+          <button class="btn-console btn-signal gap-2 mt-2" @click="showCreate = true">
             <Plus class="w-4 h-4" /> Create policy
           </button>
         </div>
@@ -252,115 +252,115 @@ async function removePolicy(policy: Policy) {
     </DataState>
 
     <!-- Create modal -->
-    <dialog class="modal" :class="{ 'modal-open': showCreate }">
-      <div class="modal-box max-w-md">
-        <h3 class="text-base font-bold mb-4">Create policy</h3>
+    <div
+      v-if="showCreate"
+      class="dialog-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="create-policy-title"
+      @click.self="showCreate = false"
+      @keydown.esc="showCreate = false"
+    >
+      <div class="dialog-panel !max-w-md">
+        <header class="panel-head">
+          <span id="create-policy-title" class="label-rail">Create policy</span>
+        </header>
+        <form @submit.prevent="createPolicy">
+          <div class="dialog-body flex flex-col gap-3">
+            <div v-if="createError" role="alert" class="notice" data-tone="critical">
+              <CircleX class="w-4 h-4 notice-icon" />
+              <span class="break-words">{{ createError }}</span>
+            </div>
 
-        <div v-if="createError" role="alert" class="alert alert-error mb-3">
-          <CircleX class="w-4 h-4 shrink-0" />
-          <span class="text-xs break-words">{{ createError }}</span>
-        </div>
-
-        <form class="space-y-3" @submit.prevent="createPolicy">
-          <div class="form-control">
-            <label class="label" for="p-name"><span class="label-text text-xs">Name</span></label>
+          <div class="field">
+            <label class="label-micro" for="p-name">Name</label>
             <input
               id="p-name" v-model="form.name" type="text" required
-              placeholder="Minimum RSA 2048" class="input input-bordered input-sm"
+              placeholder="Minimum RSA 2048" class="input-console"
             />
           </div>
 
-          <div class="form-control">
-            <label class="label" for="p-desc"><span class="label-text text-xs">Description</span></label>
+          <div class="field">
+            <label class="label-micro" for="p-desc">Description</label>
             <input
               id="p-desc" v-model="form.description" type="text"
-              class="input input-bordered input-sm"
+              class="input-console"
             />
           </div>
 
-          <div class="form-control">
-            <label class="label" for="p-type"><span class="label-text text-xs">Rule</span></label>
-            <select id="p-type" v-model="form.rule_type" class="select select-bordered select-sm">
+          <div class="field">
+            <label class="label-micro" for="p-type">Rule</label>
+            <select id="p-type" v-model="form.rule_type" class="select-console">
               <option v-for="r in RULE_TYPES" :key="r.value" :value="r.value">{{ r.label }}</option>
             </select>
-            <p class="text-[11px] opacity-60 mt-1">
+            <p class="text-[11px] text-[color:var(--text-muted)] mt-1">
               {{ RULE_TYPES.find((r) => r.value === form.rule_type)?.hint }}
             </p>
           </div>
 
-          <div v-if="form.rule_type === 'key_size'" class="form-control">
-            <label class="label" for="p-keysize">
-              <span class="label-text text-xs">Minimum RSA key size (bits)</span>
-            </label>
-            <select id="p-keysize" v-model="form.min_key_size" class="select select-bordered select-sm">
+          <div v-if="form.rule_type === 'key_size'" class="field">
+            <label class="label-micro" for="p-keysize">Minimum RSA key size (bits)</label>
+            <select id="p-keysize" v-model="form.min_key_size" class="select-console">
               <option value="2048">2048</option>
               <option value="3072">3072</option>
               <option value="4096">4096</option>
             </select>
           </div>
 
-          <div v-else-if="form.rule_type === 'max_lifetime'" class="form-control">
-            <label class="label" for="p-maxdays">
-              <span class="label-text text-xs">Maximum validity (days)</span>
-            </label>
+          <div v-else-if="form.rule_type === 'max_lifetime'" class="field">
+            <label class="label-micro" for="p-maxdays">Maximum validity (days)</label>
             <input
               id="p-maxdays" v-model="form.max_days" type="number" min="1" max="398"
-              class="input input-bordered input-sm"
+              class="input-console"
             />
-            <p class="text-[11px] opacity-60 mt-1">
+            <p class="text-[11px] text-[color:var(--text-muted)] mt-1">
               Public TLS maximum is 200 days from March 2026, 100 from 2027, 47 from 2029.
             </p>
           </div>
 
-          <div v-else class="form-control">
-            <label class="label" for="p-providers">
-              <span class="label-text text-xs">Allowed providers</span>
-              <span class="label-text-alt text-[10px] opacity-60">Comma separated</span>
-            </label>
+          <div v-else class="field">
+            <label class="label-micro" for="p-providers">Allowed providers</label>
+              <span class="field-help">Comma separated</span>
             <input
               id="p-providers" v-model="form.allowed_providers" type="text"
-              placeholder="acme, vault" class="input input-bordered input-sm"
+              placeholder="acme, vault" class="input-console"
             />
           </div>
 
           <div class="grid grid-cols-2 gap-3">
-            <div class="form-control">
-              <label class="label" for="p-sev"><span class="label-text text-xs">Severity</span></label>
-              <select id="p-sev" v-model="form.severity" class="select select-bordered select-sm">
+            <div class="field">
+              <label class="label-micro" for="p-sev">Severity</label>
+              <select id="p-sev" v-model="form.severity" class="select-console">
                 <option v-for="s in SEVERITIES" :key="s.value" :value="s.value">{{ s.label }}</option>
               </select>
             </div>
-            <div class="form-control">
-              <label class="label" for="p-domain">
-                <span class="label-text text-xs">Domain pattern</span>
-              </label>
+            <div class="field">
+              <label class="label-micro" for="p-domain">Domain pattern</label>
               <input
                 id="p-domain" v-model="form.domain_pattern" type="text"
-                placeholder="*.prod.example.com" class="input input-bordered input-sm"
+                placeholder="*.prod.example.com" class="input-console"
               />
             </div>
           </div>
-          <p class="text-[11px] opacity-60 -mt-1">
+          <p class="text-[11px] text-[color:var(--text-muted)] -mt-1">
             {{ SEVERITIES.find((s) => s.value === form.severity)?.hint }}
           </p>
 
-          <label class="label cursor-pointer justify-start gap-3">
-            <input v-model="form.is_enabled" type="checkbox" class="checkbox checkbox-sm" />
-            <span class="label-text text-xs">Enabled</span>
-          </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input v-model="form.is_enabled" type="checkbox" class="check-console" />
+              <span class="label-micro">Enabled</span>
+            </label>
+          </div>
 
-          <div class="modal-action">
-            <button type="button" class="btn btn-ghost btn-sm" @click="showCreate = false">Cancel</button>
-            <button type="submit" class="btn btn-primary btn-sm" :disabled="saving">
-              <span v-if="saving" class="loading loading-spinner loading-xs"></span>
+          <div class="dialog-foot">
+            <button type="button" class="btn-console" @click="showCreate = false">Cancel</button>
+            <button type="submit" class="btn-console btn-signal" :disabled="saving">
+              <span v-if="saving" class="spinner-console"></span>
               Create
             </button>
           </div>
         </form>
       </div>
-      <form method="dialog" class="modal-backdrop" @click="showCreate = false">
-        <button>close</button>
-      </form>
-    </dialog>
+    </div>
   </div>
 </template>
