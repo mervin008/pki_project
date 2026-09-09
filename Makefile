@@ -86,10 +86,17 @@ dev:
 seed:
 	./scripts/seed-demo.sh
 
-## Regenerate docs/routes.json from the router. The documentation site is built
-## from it, so it is checked in CI — a new route with a stale inventory fails.
+## Regenerate docs/routes.json from the router and the handlers. The
+## documentation site is built from it, so it is checked in CI — a new route
+## with a stale inventory fails.
+##
+## Two passes, because they read different things. extract-routes reads the
+## router: what exists, and who may call it. schemagen reads the handlers:
+## what to send, what comes back, and which refusals are possible. Neither
+## question is answerable from the other file.
 routes:
 	python3 scripts/extract-routes.py docs/routes.json
+	$(GO) run scripts/schemagen/main.go docs/routes.json
 
 run-core:
 	$(GO) run ./core/cmd/ --config=config.dev.yaml
@@ -179,7 +186,13 @@ lint:
 		echo "==> $$m"; \
 		(cd $$m && $(GO) vet ./...) || exit 1; \
 	done
-	@gofmt -l $(MODULES) | grep . && echo "gofmt needed on the files above" && exit 1 || true
+	@## The build tools are outside every module, so the loop above never sees
+	@## them. schemagen decides what the published API reference says about
+	@## request bodies; it rotting silently is the same failure as the docs
+	@## rotting silently, which is what it exists to prevent.
+	@echo "==> scripts"
+	@$(GO) vet scripts/schemagen/main.go
+	@gofmt -l $(MODULES) scripts | grep . && echo "gofmt needed on the files above" && exit 1 || true
 	@## staticcheck when it is installed, because it catches a class go vet does
 	@## not: dead assignments, impossible conditions, and code nothing reaches.
 	@## Not a hard requirement, so a clone can be linted without installing it.
