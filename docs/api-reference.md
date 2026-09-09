@@ -24,9 +24,11 @@ Tokens are verified against `auth.jwks_url` (preferred) or `auth.jwt_secret`
 (legacy shared secret). An invalid or expired token is always rejected — there
 is no development mode in which a bad token is accepted.
 
-When `auth.allow_anonymous` is set, requests with **no** `Authorization` header
-at all are treated as admin. It is refused unless the server is in development
-mode on a loopback address. Presenting a broken token is still a 401.
+There is no anonymous mode, including locally. A request with no credential is
+a 401, in every build and every configuration. `auth.allow_anonymous` is still
+read, and setting it now refuses to start rather than being ignored: an
+operator who has it set believes their instance is open, and silently dropping
+it would leave them believing that until somebody was refused.
 
 ### Authenticating an unattended screen
 

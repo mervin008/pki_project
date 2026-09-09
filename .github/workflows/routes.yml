@@ -1,17 +1,28 @@
 name: Route inventory
 
 # docs/routes.json is what the documentation site is built from. If it is
-# allowed to drift from the router, the published reference is wrong and
-# nothing says so — which is the failure mode generating it was meant to remove
-# in the first place.
+# allowed to drift from the code, the published reference is wrong and nothing
+# says so — which is the failure mode generating it was meant to remove in the
+# first place.
+#
+# The inventory is now built from two passes over different files, so the
+# trigger list below is wider than the router. extract-routes.py reads the
+# router for what exists and who may call it; schemagen reads the handlers and
+# the store for what to send, what comes back, and which refusals are possible.
+# A request struct gaining a field is exactly the drift this job exists to
+# catch, and watching only router.go would have missed every one of them.
 on:
   pull_request:
     paths:
-      - 'core/api/router.go'
+      - 'core/api/**'
+      - 'core/store/**'
       - 'core/server/middleware/auth.go'
       - 'core/server/middleware/display_token.go'
+      - 'pkg/agentauth/agentauth.go'
       - 'scripts/extract-routes.py'
+      - 'scripts/schemagen/main.go'
       - 'docs/routes.json'
+      - 'Makefile'
   workflow_dispatch:
 
 jobs:
@@ -22,15 +33,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
 
       - name: Regenerate the route inventory
-        run: python3 scripts/extract-routes.py docs/routes.json
+        run: make routes
 
       - name: Fail if it changed
         run: |
           if ! git diff --quiet -- docs/routes.json; then
-            echo "::error::docs/routes.json is out of date. Run:"
-            echo "::error::  python3 scripts/extract-routes.py docs/routes.json"
+            echo "::error::docs/routes.json is out of date. Run: make routes"
             git --no-pager diff -- docs/routes.json
             exit 1
           fi

@@ -110,7 +110,7 @@ auth:
   issuer: "${CERTPILOT_JWT_ISSUER}"
   audience: "authenticated"
   role_claim: "certpilot_role"
-  allow_anonymous: false
+  bootstrap_admins: ["you@example.com"]
 ```
 
 | Key | Default | |
@@ -119,8 +119,9 @@ auth:
 | `issuer` | — | Validated when set |
 | `audience` | — | Validated when set |
 | `jwt_secret` | — | Legacy HS256 shared secret. See below |
-| `role_claim` | `certpilot_role` | Claim inside `app_metadata` carrying the role |
-| `allow_anonymous` | `false` | Treat every request as admin |
+| `role_claim` | `certpilot_role` | Claim inside `app_metadata` carrying the role. Read **only** when no user directory is configured |
+| `bootstrap_admins` | — | Accounts granted admin on first start, and never maintained afterwards |
+| `allow_anonymous` | — | **Removed.** Setting it refuses to start |
 
 Two verification paths exist and they are not equivalent. With `jwks_url` the
 core verifies asymmetric signatures against published public keys and holds
@@ -129,12 +130,19 @@ forge an admin token. Use `jwks_url` wherever the provider supports it; the
 shared-secret path is kept for Supabase projects that have not migrated to
 asymmetric signing keys.
 
-`allow_anonymous` is refused unless `mode` is `development` **and** the bind
-address is loopback. It exists so a first evaluation does not require standing
-up an identity provider.
+`allow_anonymous` no longer exists and is refused in every mode, not only in
+production. It used to treat an unauthenticated request as admin, gated to
+development on a loopback address. The gate held; the feature was wrong anyway,
+because it meant every local session ran as an unnamed superuser — which made
+the authorisation paths the least exercised code in the system and attributed
+every audit entry to a subject nobody could be asked about.
 
-Roles are read only from `app_metadata`. `user_metadata` is user-writable in
-Supabase, and a role read from it is a privilege escalation with extra steps.
+**The identity provider says who you are; CertPilot says what you may do.**
+Roles live in CertPilot's own `users` table, keyed on `(issuer, subject)`, and
+`role_claim` is consulted only when no directory is wired in. A claim in a
+token cannot promote anybody: a sign-in never writes a role, which is why
+`bootstrap_admins` exists to grant the first one. `GET /me` is the only honest
+source of a role.
 
 ### `plugins`
 
@@ -314,25 +322,24 @@ with a revoked credential or an unreachable core. See [agent.md](agent.md).
 
 ## Production mode
 
-Setting `server.mode: production` refuses three things that are convenient
+Setting `server.mode: production` refuses four things that are convenient
 locally and dangerous deployed:
 
 | Refused | Why |
 |:---|:---|
-| `auth.allow_anonymous: true` | Every request would be admin |
 | Neither `auth.jwks_url` nor `auth.jwt_secret` | Nothing would verify anything |
 | `plugins.tls.insecure: true` | The gateway channel carries CSRs, private keys and CA credentials |
 | `"*"` in `server.allowed_origins` | A wildcard with credentials is not a CORS configuration, it is an open door |
 | No database connection string | An in-memory store would come up healthy and lose every certificate it issued |
 
 The core **refuses to start**, rather than warning. A warning in a log nobody
-reads is the same as no check at all. The first four are checked at config
+reads is the same as no check at all. The first three are checked at config
 load ([`pkg/config/config.go`](../pkg/config/config.go) `Validate`); the last
 when the store is built.
 
-One check applies in every mode: `auth.allow_anonymous` requires
-`server.host` to be a loopback address. Anonymous access on an interface
-anything can reach is not a development convenience.
+One check applies in every mode rather than only in production:
+`auth.allow_anonymous` is refused outright. There is no configuration in which
+CertPilot serves an unauthenticated caller.
 
 Production mode also requires `CERTPILOT_KEK` whenever a database is
 configured. See [operations.md](operations.md) and [security.md](security.md).
