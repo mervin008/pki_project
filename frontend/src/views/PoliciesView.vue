@@ -237,16 +237,12 @@ async function removePolicy(policy: Policy) {
         </div>
       </div>
 
-      <div v-else class="panel border">
-        <div class="panel-body items-center text-center py-12">
-          <Sliders class="w-10 h-10 opacity-30" />
-          <h3 class="font-bold text-sm">No policies defined</h3>
-          <p class="text-xs text-[color:var(--text-muted)] max-w-sm">
-            Without policies, any key size, lifetime, and CA combination is accepted.
-          </p>
-          <button class="btn-console btn-signal gap-2 mt-2" @click="showCreate = true">
-            <Plus class="w-4 h-4" /> Create policy
-          </button>
+      <div v-else class="p-3">
+        <div class="empty-console">
+          <strong>No policies are defined.</strong>
+          Every request is accepted: any key size, any lifetime, any certificate
+          authority. Nothing is being enforced here, which is not the same as
+          nothing being wrong.
         </div>
       </div>
     </DataState>
