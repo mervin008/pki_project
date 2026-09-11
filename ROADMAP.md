@@ -1454,12 +1454,111 @@ waits for the standard library.
 
 ---
 
+---
+
+## Next
+
+Ordered by what unblocks the most people, not by what is most interesting to
+build.
+
+### Phase 9 — Containers, and proof that they run
+
+`deploy/docker-compose.yml` exists and has never been built. That is recorded
+as a known gap rather than presented as working, and it is now the single
+biggest obstacle to anybody trying this: the quick start needs Go 1.26, Node 20
+and a local PostgreSQL, which is a thirty-minute detour for somebody who wanted
+to spend ten minutes deciding whether the product is interesting.
+
+It is first for that reason and no other. Nothing in this phase makes CertPilot
+better at managing certificates. It makes the difference between a reader who
+evaluates it and a reader who closes the tab.
+
+- **Build every image and run the stack from them.** Six modules produce five
+  binaries — core, three gateways, the agent — plus the frontend. Every
+  Dockerfile in the tree is unverified, and the honest expectation is that
+  several do not build at all
+- **One `docker compose up` to a working instance**, with PostgreSQL, the
+  self-signed gateway, the core and the frontend, seeded. The migration step
+  stays explicit: the server never migrates itself, and a compose file that
+  quietly did would contradict the one rule this project is least willing to
+  bend
+- **Publish to a registry, tagged.** `ghcr.io` alongside the repository, built
+  by CI on a tag so the image and the source cannot drift
+- **A CI job that builds the images on every pull request.** Without it they rot
+  back to unbuildable within a month, which is how they got here
+- **Verify the mTLS story survives containers.** The core-to-gateway channel is
+  mutually authenticated and `make dev-certs` writes development material for
+  loopback. Names change inside a compose network, and this is exactly where a
+  certificate management product looks silly if it gets it wrong
+
+Blocked on this machine — there is no container runtime here — so this is work
+for somebody who has one, or for CI.
+
+### Phase 10 — Post-quantum, the half that is possible
+
+Phase 8 built posture scoring and deferred issuance, correctly. The deferral is
+still correct and the reasoning has not changed: `crypto/mldsa` does not exist
+in Go 1.26, `crypto/x509` cannot build or parse an ML-DSA certificate, and
+issuing one would mean hand-rolling ASN.1 plus a third-party signature
+implementation for a certificate almost nothing can verify.
+
+What has changed is the other half. `crypto/tls` in Go 1.26 carries
+`X25519MLKEM768`, `SecP256r1MLKEM768` and `SecP384r1MLKEM1024`. Post-quantum
+*key exchange* is in the standard library today, and CertPilot can both measure
+it and use it.
+
+- **Report which endpoints negotiate a post-quantum key exchange.** The
+  discovery scanner already completes a handshake to read the certificate; the
+  negotiated group is one field away. "Three of six scanned endpoints do not
+  negotiate a post-quantum group" is a finding about the estate that needs no
+  new standard, no new certificate, and nothing from a CA
+- **Offer hybrid groups on CertPilot's own channels** — the API, and the
+  core-to-gateway mTLS. A product that reports on other people's key exchange
+  and does not use one itself is making an argument it does not believe
+- **Keep issuance blocked and say why.** It moves when the standard library
+  moves. Watching `crypto/mldsa` is the whole plan, and a CBOM that reports
+  honestly about a classical estate is worth more than an ML-DSA certificate
+  nothing will accept
+
+The distinction matters more than the feature: harvest-now-decrypt-later is a
+threat to *key exchange*, which is available to fix. Signature agility is a
+threat to certificates issued today with a long life, which is a planning
+problem rather than a shipping one.
+
+### Phase 11 — The rest, in the order it hurts
+
+- **Delegated unwrapping for the key encryption key.** `secrets.kek_provider`
+  can read a key from an environment variable, a file or Vault, and all three
+  end with the key in this process's memory — which rules out every HSM, because
+  refusing to hand over the key is what an HSM is for. Needs a `CPS2` envelope
+  that stores a reference the backend unwraps, with `CPS1` still readable
+- **A gateway for a CA that does not have one.** Google Cloud CAS, AWS Private
+  CA, DigiCert, Sectigo. The best-isolated work in the project: one gRPC
+  contract, three existing implementations to read, no need to understand
+  anything else
+- **Run the Azure Key Vault and F5 deployers against real hardware.** Both are
+  written to published APIs and unit-tested against fakes, which is precisely
+  the arrangement that let `sys/health` and `GetCAChain` ship broken
+- **Finish the policy rule types.** `key_type`, `naming` and `approval_required`
+  are accepted by the schema and do nothing, which is worse than rejecting them:
+  an operator can write a policy, see it saved, and believe it is enforced
+- **An approval queue for agent enrolment.** A leaked token currently yields a
+  live agent rather than one waiting for somebody to say yes
+- **Java keystores, PKCS#12 and the Windows certificate store** in host
+  inventory. A JVM estate is invisible to the agent today
+
+---
+
 ## Known gaps
 
 Tracked honestly rather than quietly:
 
-- Audit log is an ordinary table — not hash-chained, so a database writer can
-  rewrite history
+- ~~Audit log is an ordinary table — not hash-chained~~ — **closed.** Migration
+  031 gave each entry a gapless `seq`, its predecessor's tag, and a keyed MAC
+  over both, from a subkey of `CERTPILOT_KEK`. A database-only attacker can
+  alter a row and cannot forge a tag that agrees with it. Entries written before
+  the chain existed are left unchained and counted as such rather than presented
+  as covered
 - Post-renewal verification only covers endpoints discovery has already
   observed. A certificate deployed somewhere nothing has scanned is reported as
   unverifiable rather than checked
@@ -1486,13 +1585,17 @@ Tracked honestly rather than quietly:
   references installs successfully and serves nothing. That is deliberate —
   repointing a virtual server is its owner's decision — but nothing here detects
   it, the way ACM's read-back detects an unattached ARN
-- Deployment ordering is not expressible. A failing target now halts the rest of
-  a rollout automatically, which bounds a bad one to at most `workers` targets
-  per replica — but there is no way to say "staging first, then production", and
-  no way to make the canary exactly one rather than one per worker
-- Agent request signatures are bounded against replay by a five-minute window
-  and nothing else. Stated rather than papered over: see phase 6 step 4a on why
-  there is no nonce
+- ~~Deployment ordering is not expressible~~ — **closed.** Migration 034 put
+  `deploy_order` on the target, copied onto the job at enqueue so reordering a
+  target cannot disturb a rollout already under way. A canary is one target in
+  the lowest wave: exactly one attempt, declared rather than inferred
+- ~~Agent request signatures are bounded against replay by a five-minute window
+  and nothing else~~ — **closed.** Migration 032. Ed25519 is deterministic, so an
+  identical request carries an identical signature: the core stores the ones it
+  has accepted and refuses a repeat, which is the nonce the earlier note said
+  would need a protocol change. Exempted on heartbeat, inventory, installations
+  and deployment results, because a one-second timestamp makes an agent's own
+  retry byte-identical to a replay
 - An enrolled agent is trusted from the moment it presents a valid token. There
   is no approval queue, so a leaked enrolment token yields a live agent rather
   than one waiting for somebody to say yes
@@ -1523,8 +1626,12 @@ Tracked honestly rather than quietly:
   parsing. nginx `include`, Apache variables, and generated configuration will
   be missed — deliberately erring towards reporting a file as unreferenced,
   which invites a look, rather than silently marking it in use
-- The OCSP responder check is an HTTP GET, not an RFC 6960 request, and reports
-  responders as healthy that are not
+- ~~The OCSP responder check is an HTTP GET, not an RFC 6960 request~~ —
+  **closed.** Migration 033. `pkg/revocation` builds a real request and
+  `ocsp.ParseResponseForCert` verifies the signature, the delegation, and that
+  the answer is about the right certificate. A revoked CA is forced critical
+  from the *recorded* status rather than the check's own result, so a blip at
+  the responder cannot return it to healthy
 - `migrations/001_initial_schema.sql` references `auth.users` and `auth.jwt()`
   and applies only to Supabase. The Go store layer is plain `pgx` with no
   Supabase dependency; the schema is the only coupling
