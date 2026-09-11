@@ -102,7 +102,7 @@ func main() {
 				Host:           "127.0.0.1",
 				Port:           8080,
 				Mode:           "development",
-				AllowedOrigins: []string{"http://localhost:5173"},
+				AllowedOrigins: []string{"http://localhost:3000"},
 			},
 			// A local administrator is created on first start and its
 			// password printed once. There is no anonymous fallback: running

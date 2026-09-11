@@ -22,7 +22,7 @@ server:
   # Browser origins permitted to call the API. A wildcard is not accepted
   # alongside credentials, so name the frontend explicitly.
   allowed_origins:
-    - "http://localhost:5173"
+    - "http://localhost:3000"
 
 auth:
   # Preferred: verify asymmetrically signed tokens against the provider's

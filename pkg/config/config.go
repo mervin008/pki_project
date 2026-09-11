@@ -228,7 +228,7 @@ func LoadCoreConfig(path string) (*CoreConfig, error) {
 			Host:           "0.0.0.0",
 			Port:           8080,
 			Mode:           "development",
-			AllowedOrigins: []string{"http://localhost:5173"},
+			AllowedOrigins: []string{"http://localhost:3000"},
 		},
 		Auth: AuthConfig{
 			RoleClaim: "certpilot_role",
