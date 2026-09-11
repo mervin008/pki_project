@@ -81,9 +81,12 @@ jobs:
           set -euo pipefail
           case "${{ matrix.name }}" in
             frontend)
-              # nginx has no --help worth running; check the built console is
-              # actually in the image and the config parses.
-              docker run --rm certpilot/${{ matrix.name }}:ci nginx -t
+              # nginx resolves every proxy_pass upstream when it tests the
+              # config, and `core` only exists on the compose network — so a
+              # bare `nginx -t` fails on a perfectly good image. Point the name
+              # at loopback to check the syntax without the service.
+              docker run --rm --add-host core:127.0.0.1 \
+                certpilot/${{ matrix.name }}:ci nginx -t
               docker run --rm certpilot/${{ matrix.name }}:ci \
                 test -s /usr/share/nginx/html/index.html
               ;;
