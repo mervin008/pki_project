@@ -1,8 +1,8 @@
 # REST API reference
 
 > **There is also a documentation site**, at
-> <https://mervin008.github.io/certpilot-docs/>, built from
-> [`certpilot-docs`](https://github.com/mervin008/certpilot-docs). Its endpoint
+> <https://certpilot.github.io/certpilot-docs/>, built from
+> [`certpilot-docs`](https://github.com/certpilot/certpilot-docs). Its endpoint
 > tables are generated from `core/api/router.go` via
 > [`scripts/extract-routes.py`](../scripts/extract-routes.py), so they cannot
 > drift from the router.

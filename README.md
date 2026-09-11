@@ -9,7 +9,7 @@
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" /></a>
   <img alt="Go 1.26" src="https://img.shields.io/badge/go-1.26-00ADD8.svg" />
   <img alt="Status: early development" src="https://img.shields.io/badge/status-early%20development-orange.svg" />
-  <a href="https://mervin008.github.io/certpilot-docs/"><img alt="API reference" src="https://img.shields.io/badge/docs-API%20reference-informational.svg" /></a>
+  <a href="https://certpilot.github.io/certpilot-docs/"><img alt="API reference" src="https://img.shields.io/badge/docs-API%20reference-informational.svg" /></a>
 </p>
 
 ---
@@ -52,8 +52,8 @@ is aimed at.
 Requires Go 1.26+, Node 20+, and PostgreSQL 13+. No cloud account needed.
 
 ```bash
-git clone https://github.com/mervin008/pki_project.git
-cd pki_project
+git clone https://github.com/certpilot/certpilot.git
+cd certpilot
 make dev
 ```
 
@@ -125,7 +125,7 @@ whole design follows from.
 
 ## Documentation
 
-The **[API reference](https://mervin008.github.io/certpilot-docs/)** is
+The **[API reference](https://certpilot.github.io/certpilot-docs/)** is
 published as its own site, generated from the router so it cannot fall behind
 the implementation.
 

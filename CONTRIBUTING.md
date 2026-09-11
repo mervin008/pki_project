@@ -18,8 +18,8 @@ a pull request.
 You need Go 1.26+, Node 20+, and PostgreSQL 13+. No cloud account.
 
 ```bash
-git clone https://github.com/mervin008/pki_project.git
-cd pki_project
+git clone https://github.com/certpilot/certpilot.git
+cd certpilot
 make dev
 ```
 

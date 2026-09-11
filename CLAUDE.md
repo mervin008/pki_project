@@ -51,7 +51,7 @@ Six Go modules in a workspace (`go.work`, Go 1.26.6) plus a Vue frontend.
 | `docs/` | Written, current, and worth reading |
 
 **The API reference is published as a separate site** from
-[`mervin008/certpilot-docs`](https://github.com/mervin008/certpilot-docs)
+[`certpilot/certpilot-docs`](https://github.com/certpilot/certpilot-docs)
 (VitePress, GitHub Pages). Its endpoint tables are *generated* from
 `core/api/router.go` by `scripts/extract-routes.py` into `docs/routes.json`,
 which CI checks for staleness — so **run `make routes` after adding a route**.
