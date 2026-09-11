@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="brand/logo.svg" alt="" width="76" height="76" />
+</p>
+
 <h1 align="center">CertPilot</h1>
 
 <p align="center">
