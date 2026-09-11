@@ -1,0 +1,31 @@
+# What an image build must never see.
+#
+# Two entries here are not about size. `.env` carries a KEK and `.certpilot/`
+# holds the development PKI's private keys; every Dockerfile in this tree does
+# `COPY . .` in its builder stage, and a build context is handed to the daemon
+# whole before any instruction runs. A certificate management product baking its
+# own private keys into a layer is the specific failure this file prevents.
+.env
+.env.*
+.certpilot/
+config.dev.yaml
+*.pem
+*.key
+
+# Not inputs to any binary.
+.git/
+.github/
+.claude/
+**/node_modules/
+frontend/dist/
+bin/
+docs/
+brand/
+*.md
+*.log
+.DS_Store
+
+# `deploy/` is deliberately NOT excluded: the frontend image copies
+# deploy/docker/nginx.conf out of it. Only the compose files themselves are
+# never build inputs, and they cost nothing.
+deploy/.env

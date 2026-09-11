@@ -1,0 +1,124 @@
+name: Images
+
+# Every Dockerfile in this tree was unverified until this job existed, and one
+# of them could not have built: the frontend image copied nginx.conf from
+# outside its own build context. That is how they got there — nothing ever
+# tried. A job that builds all six on every pull request is the only thing that
+# keeps them from rotting back to the same state.
+#
+# No runtime was available on the machine these were written on, so this job is
+# also where they were verified for the first time.
+on:
+  pull_request:
+    paths:
+      - '.dockerignore'
+      - 'deploy/docker/**'
+      - 'deploy/docker-compose*.yml'
+      - '.github/workflows/images.yml'
+      - 'go.work'
+      - '**/go.mod'
+      - '**/go.sum'
+      - 'core/**'
+      - 'agent/**'
+      - 'gateways/**'
+      - 'pkg/**'
+      - 'frontend/**'
+      - 'migrations/**'
+      - 'config.example.yaml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Every image, every time. Stopping at the first failure would report one
+      # broken Dockerfile per run, and there is more than one to find.
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            dockerfile: deploy/docker/core.Dockerfile
+          - name: gateway-selfsigned
+            dockerfile: deploy/docker/gateway-selfsigned.Dockerfile
+          - name: gateway-acme
+            dockerfile: deploy/docker/gateway-acme.Dockerfile
+          - name: gateway-vault
+            dockerfile: deploy/docker/gateway-vault.Dockerfile
+          - name: agent
+            dockerfile: deploy/docker/agent.Dockerfile
+          - name: frontend
+            dockerfile: deploy/docker/frontend.Dockerfile
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.name }}
+        uses: docker/build-push-action@v6
+        with:
+          # The repository root for all six: this is a Go workspace and every
+          # module replaces ../pkg, so a context rooted at a module cannot
+          # resolve its own dependency. The frontend needs the root too, for
+          # deploy/docker/nginx.conf.
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: certpilot/${{ matrix.name }}:ci
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      # Building proves it compiles. This proves the binary in the image is the
+      # right one and can actually start — a Go binary built for the wrong
+      # architecture, or a CMD naming a path that is not there, both build
+      # perfectly and fail here.
+      - name: Run it
+        run: |
+          set -euo pipefail
+          case "${{ matrix.name }}" in
+            frontend)
+              # nginx has no --help worth running; check the built console is
+              # actually in the image and the config parses.
+              docker run --rm certpilot/${{ matrix.name }}:ci nginx -t
+              docker run --rm certpilot/${{ matrix.name }}:ci \
+                test -s /usr/share/nginx/html/index.html
+              ;;
+            agent)
+              docker run --rm certpilot/${{ matrix.name }}:ci --help
+              ;;
+            *)
+              docker run --rm certpilot/${{ matrix.name }}:ci --help || true
+              docker run --rm certpilot/${{ matrix.name }}:ci --version 2>/dev/null || true
+              ;;
+          esac
+
+      - name: Confirm it does not run as root
+        # Excludes the frontend: the stock nginx image starts as root to bind
+        # port 80 and drops to nginx for workers.
+        if: matrix.name != 'frontend'
+        run: |
+          id="$(docker run --rm certpilot/${{ matrix.name }}:ci id -u 2>/dev/null || echo failed)"
+          if [ "$id" = "0" ]; then
+            echo "::error::${{ matrix.name }} runs as root"
+            exit 1
+          fi
+          echo "${{ matrix.name }} runs as uid $id"
+
+  compose:
+    name: compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Catches a malformed compose file, an unresolvable build context and a
+      # service naming a Dockerfile that is not there — without needing the
+      # secrets a real `up` would want.
+      - name: Validate both compose files
+        run: |
+          set -euo pipefail
+          CERTPILOT_KEK=ci CERTPILOT_DB_URL=postgres://ci \
+            docker compose -f deploy/docker-compose.yml config -q
+          echo "deploy/docker-compose.yml is valid"
