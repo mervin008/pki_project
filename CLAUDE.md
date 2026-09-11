@@ -17,7 +17,7 @@ re-deriving from source.
 
 **The Bash working directory persists between calls.** A `cd core` in one call
 is still in effect in the next one. Prefix commands with
-`cd /Volumes/Mervin/pki_project` when the location matters. This has bitten
+`cd /Volumes/Mervin/certpilot` when the location matters. This has bitten
 repeatedly, most memorably by making a heredoc write a file into the wrong
 directory and silently succeed.
 
