@@ -94,8 +94,10 @@ jobs:
               docker run --rm certpilot/${{ matrix.name }}:ci --help
               ;;
             *)
-              docker run --rm certpilot/${{ matrix.name }}:ci --help || true
-              docker run --rm certpilot/${{ matrix.name }}:ci --version 2>/dev/null || true
+              # Bounded: a binary that ignores an unknown flag and starts
+              # serving would otherwise hang the job rather than fail it.
+              timeout 30 docker run --rm certpilot/${{ matrix.name }}:ci --help || true
+              timeout 30 docker run --rm certpilot/${{ matrix.name }}:ci --version 2>/dev/null || true
               ;;
           esac
 
@@ -104,12 +106,21 @@ jobs:
         # port 80 and drops to nginx for workers.
         if: matrix.name != 'frontend'
         run: |
-          id="$(docker run --rm certpilot/${{ matrix.name }}:ci id -u 2>/dev/null || echo failed)"
-          if [ "$id" = "0" ]; then
+          set -euo pipefail
+          # --entrypoint is the whole point of this line. Every image here sets
+          # ENTRYPOINT to its binary, so `docker run IMAGE id -u` does not run
+          # id — it passes "id -u" to the binary as arguments. The core ignores
+          # them, falls back to its built-in development defaults, starts
+          # listening and never exits, hanging the job until the six-hour
+          # timeout. The gateways exited non-zero instead, which made this check
+          # report success without ever reading a uid.
+          uid="$(timeout 30 docker run --rm --entrypoint id \
+            certpilot/${{ matrix.name }}:ci -u)"
+          if [ "$uid" = "0" ]; then
             echo "::error::${{ matrix.name }} runs as root"
             exit 1
           fi
-          echo "${{ matrix.name }} runs as uid $id"
+          echo "${{ matrix.name }} runs as uid $uid"
 
   compose:
     name: compose config
