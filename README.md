@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg" /></a>
+  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" /></a>
   <img alt="Go 1.26" src="https://img.shields.io/badge/go-1.26-00ADD8.svg" />
   <img alt="Status: early development" src="https://img.shields.io/badge/status-early%20development-orange.svg" />
   <a href="https://certpilot.github.io/certpilot-docs/"><img alt="API reference" src="https://img.shields.io/badge/docs-API%20reference-informational.svg" /></a>
@@ -215,4 +215,4 @@ substantial; small fixes can go straight to a pull request.
 
 ## License
 
-[MIT](LICENSE).
+[Apache 2.0](LICENSE).
