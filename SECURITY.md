@@ -9,9 +9,19 @@ production.**
 
 ## Reporting a vulnerability
 
-Do not open a public issue. Email **security@certpilot.dev** with a description,
-reproduction steps, and affected versions. Expect acknowledgement within three
-working days.
+Do not open a public issue. Use GitHub's private vulnerability reporting:
+**[Report a vulnerability](https://github.com/certpilot/certpilot/security/advisories/new)**,
+or the *Report a vulnerability* button under this repository's Security tab.
+
+Include a description, reproduction steps, and the affected version. Expect
+acknowledgement within three working days.
+
+Reporting through GitHub rather than to an email address is deliberate. A
+published security contact that nobody reads is worse than none: a researcher
+who gets no reply concludes the project is unmaintained and discloses
+publicly, which is the outcome this section exists to avoid. GitHub's
+advisory flow delivers to the maintainers directly, needs no infrastructure to
+keep working, and cannot quietly stop resolving.
 
 We will not pursue legal action against good-faith research that respects user
 privacy, avoids service disruption, and gives us reasonable time to fix the
