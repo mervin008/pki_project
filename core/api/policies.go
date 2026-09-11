@@ -38,17 +38,56 @@ func (h *PolicyHandler) Get(c *gin.Context) {
 	c.JSON(http.StatusOK, p)
 }
 
+// PolicyInput is what a caller may set on a policy.
+//
+// Narrow rather than binding store.Policy, which is what both handlers used to
+// do. That accepted id, created_by, created_at and updated_at from the request
+// body — so a caller could choose a policy's identifier and assert when it was
+// written, and Create handed whatever arrived straight to the store.
+//
+// The binding tags carry the CHECK constraints that migration 001 put on this
+// table. Without them an unknown rule_type reaches PostgreSQL and comes back
+// as a raw SQLSTATE 23514, which tells an operator nothing about which of six
+// values they should have sent.
+type PolicyInput struct {
+	Name        string `json:"name" binding:"required"`
+	Description string `json:"description"`
+	// IsEnabled is a pointer so that omitting it leaves the column's default of
+	// true, rather than a Go zero value quietly creating every policy disabled.
+	IsEnabled     *bool  `json:"is_enabled"`
+	RuleType      string `json:"rule_type" binding:"required,oneof=key_size key_type ca_restriction max_lifetime naming approval_required"`
+	RuleConfig    string `json:"rule_config" binding:"required"`
+	DomainPattern string `json:"domain_pattern"`
+	Severity      string `json:"severity" binding:"omitempty,oneof=INFO WARNING BLOCK"`
+}
+
+// policy builds the record this input describes. Everything the caller does not
+// own — identity, authorship, timestamps — is left for the store to set.
+func (in PolicyInput) policy() store.Policy {
+	severity := in.Severity
+	if severity == "" {
+		severity = "WARNING"
+	}
+	return store.Policy{
+		Name:          in.Name,
+		Description:   in.Description,
+		IsEnabled:     in.IsEnabled == nil || *in.IsEnabled,
+		RuleType:      in.RuleType,
+		RuleConfig:    in.RuleConfig,
+		DomainPattern: in.DomainPattern,
+		Severity:      severity,
+	}
+}
+
 // Create handles POST /api/v1/policies.
 func (h *PolicyHandler) Create(c *gin.Context) {
-	var p store.Policy
-	if err := c.ShouldBindJSON(&p); err != nil {
+	var in PolicyInput
+	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	if p.Severity == "" {
-		p.Severity = "WARNING"
-	}
+	p := in.policy()
 
 	if err := h.store.CreatePolicy(c.Request.Context(), &p); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -61,11 +100,12 @@ func (h *PolicyHandler) Create(c *gin.Context) {
 // Update handles PUT /api/v1/policies/:id.
 func (h *PolicyHandler) Update(c *gin.Context) {
 	id := c.Param("id")
-	var p store.Policy
-	if err := c.ShouldBindJSON(&p); err != nil {
+	var in PolicyInput
+	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	p := in.policy()
 	p.ID = id
 
 	if err := h.store.UpdatePolicy(c.Request.Context(), &p); err != nil {
