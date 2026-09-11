@@ -474,13 +474,20 @@ func (s *PostgresStore) GetCertificatesDueForRenewal(ctx context.Context, defaul
 		FROM public.certificates
 		WHERE auto_renew = true
 		  AND status IN ('ISSUED', 'EXPIRING', 'RENEWAL_FAILED')
-		  -- A certificate whose key lives on a host cannot be renewed from
-		  -- here: renewing means generating a key, and the whole point is that
-		  -- this process never has one. The agent renews its own by sending a
-		  -- new request. Without this line the queue would pick them up and
-		  -- fail on every attempt forever, which is a loud way of being wrong
-		  -- about something that is working perfectly.
-		  AND coalesce(key_custody, 'EXTERNAL') <> 'AGENT'
+		  -- A certificate whose key CertPilot does not hold cannot be renewed
+		  -- from here: renewing means generating a key, and for these the whole
+		  -- point is that this process never has one. An agent renews its own
+		  -- by sending a new request; an externally held key is renewed by
+		  -- whoever holds it, submitting a new signing request.
+		  --
+		  -- Without this the queue would pick them up and fail on every attempt
+		  -- forever, which is a loud way of being wrong about something that is
+		  -- working perfectly.
+		  --
+		  -- NULL stays eligible. It means nobody recorded custody, which is true
+		  -- of rows predating the column, and excluding them would silently stop
+		  -- renewing certificates that have been renewing all along.
+		  AND coalesce(key_custody, '') NOT IN ('AGENT', 'EXTERNAL')
 		  AND CASE
 		        WHEN renewal_scheduled_at IS NOT NULL THEN
 		          renewal_scheduled_at <= now()

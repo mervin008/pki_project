@@ -416,10 +416,14 @@ func (m *MemoryStore) GetCertificatesDueForRenewal(ctx context.Context, leadDays
 		if !c.AutoRenew {
 			continue
 		}
-		// A certificate whose key lives on a host cannot be renewed from here:
-		// renewing means generating a key, and the point is that this process
-		// never has one. The agent renews its own by sending a new request.
-		if c.KeyCustody == KeyCustodyAgent {
+		// A certificate whose key CertPilot does not hold cannot be renewed from
+		// here: renewing means generating a key, and for these the point is that
+		// this process never has one. An agent renews its own by sending a new
+		// request; an externally held key is renewed by whoever holds it.
+		//
+		// An empty custody stays eligible, matching the SQL: it means nobody
+		// recorded one, not that somebody else holds the key.
+		if c.KeyCustody == KeyCustodyAgent || c.KeyCustody == KeyCustodyExternal {
 			continue
 		}
 		// The CA's advice takes precedence over the lead time when there is

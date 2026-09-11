@@ -1812,8 +1812,14 @@ apart shut itself down over a missing grant.
 ### Renewal
 
 The agent renews its own, because rotating means generating a key and only the
-host has one. The core's renewal sweep excludes `key_custody = 'AGENT'`; without
-that the queue would claim those jobs and fail forever.
+host has one. The core's renewal sweep excludes both `key_custody = 'AGENT'` and
+`key_custody = 'EXTERNAL'` — the two cases where CertPilot does not hold the key
+and so cannot rotate it. Without that the queue would claim those jobs and fail
+forever.
+
+An externally held key is renewed by whoever holds it, by submitting a new
+signing request. A certificate with no recorded custody stays eligible: that
+means nobody wrote one down, not that somebody else holds the key.
 
 *When* is the core's decision, returned as `renew_after` and derived from the
 grant's `renew_before_days`. A host that picked its own moment could decide to

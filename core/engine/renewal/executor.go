@@ -51,6 +51,27 @@ func (e *Executor) RenewCertificate(ctx context.Context, certID string) (*store.
 		return nil, fmt.Errorf("certificate %s has no assigned CA account", certID)
 	}
 
+	/*
+	 * A key CertPilot does not hold cannot be rotated by CertPilot.
+	 *
+	 * RenewCertificateRequest carries no CSR, so the gateway generates a fresh
+	 * keypair and the response is sealed into this record. For a certificate
+	 * issued from a caller-supplied CSR — whose key is in an HSM, a load
+	 * balancer, or a host that will never send it here — that is two failures
+	 * at once. The certificate stops matching the key that is actually serving
+	 * it, and key_custody goes on reading EXTERNAL while CertPilot quietly
+	 * holds a key, which is the one question that field exists to answer.
+	 *
+	 * Refusing is the honest outcome. Renewing it needs a new signing request
+	 * from whoever holds the key, and there is no way to ask for one from here.
+	 */
+	if cert.KeyCustody == store.KeyCustodyExternal {
+		return nil, fmt.Errorf(
+			"certificate %s is renewed by whoever holds its private key, not by CertPilot: "+
+				"key_custody is EXTERNAL, so renewal here would issue against a key this "+
+				"certificate does not use. Submit a new signing request instead", certID)
+	}
+
 	caAccount, err := e.store.GetCAAccount(ctx, *cert.CAAccountID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch CA account: %w", err)
