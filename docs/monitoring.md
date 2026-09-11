@@ -11,6 +11,12 @@ One principle drives the whole design:
 A frozen screen showing green is worse than no screen, because it manufactures
 false confidence.
 
+![Every certificate authority sorted by urgency, with a critical intermediate seven days from expiry at the top and its acknowledgement state alongside.](images/ca-health.png)
+
+*CA health, sorted by urgency. An acknowledged authority keeps its place in the
+order and is marked rather than hidden — filtering it out is how CAs expire in
+organisations that believed they were monitoring them.*
+
 - [CA health](#ca-health)
 - [Expiry thresholds](#expiry-thresholds)
 - [The live event stream](#the-live-event-stream)

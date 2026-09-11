@@ -14,6 +14,18 @@
 
 ---
 
+<p align="center">
+  <img src="docs/images/dashboard.png" alt="The CertPilot dashboard: a logarithmic expiry horizon with authorities above the axis and certificates below, a critical issuing CA seven days out, and the estate summarised beneath it." width="100%" />
+</p>
+
+<p align="center">
+  <em>The expiry horizon. One logarithmic axis from now to ten years, authorities
+  above and certificates below &mdash; because on a linear axis everything
+  expiring inside a quarter collapses into the first two percent of the width.</em>
+</p>
+
+---
+
 CertPilot is built for the **central PKI team** — the group that owns the CA
 hierarchy and answers for every certificate the organisation serves. One place
 to watch every CA and certificate across any authority, public or private, with
