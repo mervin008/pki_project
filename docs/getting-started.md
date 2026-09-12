@@ -102,6 +102,12 @@ urgency, and `/display` is the fullscreen wall view — locally it works without
 credential, because the core accepts anonymous requests on loopback in
 development mode. On a real deployment it needs a display token; see the README.
 
+![The dashboard: a logarithmic expiry horizon with authorities above and certificates below, six counters, the two authorities needing attention, and a live activity feed.](images/dashboard.png)
+
+*The horizon is logarithmic, so "five days" and "five years" fit on one axis
+without the near end collapsing to a point. The red marker is an intermediate CA
+five days out; everything it ever signed stops verifying when it goes.*
+
 Confirm the gateway registered over mTLS:
 
 ```bash
@@ -137,6 +143,12 @@ curl -s -X POST localhost:8080/api/v1/certificates \
     "auto_renew": true
   }' | jq
 ```
+
+![The certificate inventory: eighteen certificates sorted by urgency, with filters for cost centre, PCI scope, service tier, region and change ticket.](images/certificates.png)
+
+*The filters above the table are not built in. They are the custom metadata
+fields this instance defined, and "PCI in scope" is marked required — which is
+why issuing a certificate without it is refused rather than recorded as unknown.*
 
 The response contains the certificate but **not** the private key. Keys are
 never included in list or detail responses; exporting one is a separate

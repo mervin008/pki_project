@@ -13,6 +13,13 @@ problem you have already solved. Three engines look elsewhere:
 
 Plus a fourth, from the inside: the [agent's file inventory](agent.md#inventory).
 
+![A completed scan of three endpoints, reporting three certificates served that CertPilot does not manage, each with its trust state, TLS version, cipher and findings.](images/discovery.png)
+
+*The verdict is the point: "3 certificates are being served that CertPilot does
+not manage. Nothing renews them." Each finding says what is wrong in a sentence
+— an untrusted issuer, a chain missing its intermediate, a name that does not
+match — because "untrusted" alone tells an operator nothing they can act on.*
+
 ---
 
 ## Network scan

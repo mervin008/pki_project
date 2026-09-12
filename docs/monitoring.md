@@ -11,7 +11,7 @@ One principle drives the whole design:
 A frozen screen showing green is worse than no screen, because it manufactures
 false confidence.
 
-![Every certificate authority sorted by urgency, with a critical intermediate seven days from expiry at the top and its acknowledgement state alongside.](images/ca-health.png)
+![Every certificate authority sorted by urgency, with a critical intermediate five days from expiry at the top, a warning at seventy-four, and the acknowledgement control on each.](images/ca-health.png)
 
 *CA health, sorted by urgency. An acknowledged authority keeps its place in the
 order and is marked rather than hidden — filtering it out is how CAs expire in
@@ -67,6 +67,13 @@ Two ways, and the row records which in `source`:
 gateway for the issuers behind it and records them. See
 [gateways/vault.md](gateways/vault.md). This is how the CA that actually signs
 your estate ends up in the same list as the estate.
+
+![The authorities view: six CAs under management with their type, key algorithm, days remaining, issued count and state, above a breakdown of roots and intermediates.](images/authorities.png)
+
+*Every CA is on one clock, roots and intermediates together, most urgent first.
+The issued counts read zero because nothing in this estate was signed through
+CertPilot — which is not the same as the CA being unused, and is exactly the gap
+[discovery](discovery.md) exists to close.*
 
 An imported CA is refreshed on a 12-hour sweep, and the sweep never overwrites
 what an operator decided: the name, the alert thresholds, the owning team, the
