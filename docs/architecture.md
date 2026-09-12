@@ -33,8 +33,7 @@ flowchart TB
     SELF --> LOCAL(["nothing — it signs locally"])
 ```
 
-Three things in that picture are load-bearing, and each is a decision rather
-than an accident.
+The boxes are the easy part. What the arrows say is where the design is.
 
 **The core-to-gateway links are mutually authenticated because of what they
 carry** — CSRs, private keys and CA credentials, on every issuance. An
@@ -169,11 +168,6 @@ sequenceDiagram
     B->>DB: SELECT … FOR UPDATE SKIP LOCKED
     DB-->>B: the same job, and this time it finishes
 ```
-
-Read it as three separate guarantees rather than one: the index makes
-duplicate work impossible, `SKIP LOCKED` makes duplicate execution impossible,
-and the lease makes a dead replica a delay instead of a certificate that never
-renews.
 
 ## The processes
 
