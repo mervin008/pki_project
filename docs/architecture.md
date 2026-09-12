@@ -2,27 +2,51 @@
 
 CertPilot is three kinds of process and one database.
 
+```mermaid
+flowchart TB
+    UI["Vue 3 console"]
+    AGENT["Host agent<br/>on each of your servers"]
+
+    UI -->|"HTTPS · REST + SSE"| CORE
+    AGENT -->|"HTTPS · Ed25519-signed<br/>the agent always dials out"| CORE
+
+    subgraph plane["Control plane — the only thing holding the KEK"]
+        direction LR
+        CORE["CertPilot Core<br/>REST API · 13 engines"]
+        DB[("PostgreSQL<br/>sealed secrets, queues")]
+        CORE <--> DB
+    end
+
+    subgraph gws["Gateways — gRPC over mutual TLS, and no state of their own"]
+        direction LR
+        ACME["ACME gateway<br/>:9092"]
+        VAULT["Vault gateway<br/>:9093"]
+        SELF["Self-signed gateway<br/>:9091"]
+    end
+
+    CORE --> ACME
+    CORE --> VAULT
+    CORE --> SELF
+
+    ACME -->|"RFC 8555"| PUBCA(["Let's Encrypt · ZeroSSL<br/>BuyPass · step-ca"])
+    VAULT -->|"HTTPS · AppRole or token"| HCV(["HashiCorp Vault<br/>PKI secrets engine"])
+    SELF --> LOCAL(["nothing — it signs locally"])
 ```
-                       ┌──────────────────────────┐
-                       │      Vue 3 frontend      │
-                       └────────────┬─────────────┘
-                                    │ HTTPS · REST + SSE
-                       ┌────────────▼─────────────┐
-                       │      CertPilot Core      │
-                       │                          │
-                       │  REST API · 96 routes    │
-                       │  13 background engines   │
-                       │  event broker            │
-                       │  store interface         │
-                       └──┬──────────┬─────────┬──┘
-              mutual TLS  │          │         │  signed HTTP
-              gRPC        │          │         │  Ed25519
-        ┌────────────┬────┘          │         └────────────┐
-┌───────▼──────┐ ┌───▼──────────┐    │              ┌───────▼───────┐
-│ ACME gateway │ │Vault gateway │   ┌▼───────────┐  │ Host agents   │
-│ RFC 8555     │ │ PKI engine   │   │ PostgreSQL │  │ (many)        │
-└──────────────┘ └──────────────┘   └────────────┘  └───────────────┘
-```
+
+The boxes are the easy part. What the arrows say is where the design is.
+
+**The core-to-gateway links are mutually authenticated because of what they
+carry** — CSRs, private keys and CA credentials, on every issuance. An
+unauthenticated gateway is a machine that will sign anything for anyone.
+
+**The agent arrow points the wrong way on purpose.** The core never dials a
+host. A machine behind two firewalls can still hold a certificate, because it
+is the one opening the connection.
+
+**Nothing crosses into PostgreSQL except the core.** A gateway that could read
+the database would be a CA integration with access to every sealed secret in
+the system, and the first defect in a vendor SDK would be a breach rather than
+a restart.
 
 Everything below follows from three decisions.
 
@@ -115,6 +139,35 @@ core that dies mid-job holds a lease that expires, and another picks the job up.
 The alternative — a leader — has a failover window during which nothing renews.
 For a system whose entire purpose is that certificates do not expire, a window
 in which nothing renews is the wrong failure mode.
+
+Two replicas racing on the same certificate, and what the database does about
+it:
+
+```mermaid
+sequenceDiagram
+    participant A as Core replica A
+    participant DB as PostgreSQL
+    participant B as Core replica B
+
+    Note over A,B: Every replica runs every engine. Nobody is in charge.
+
+    A->>DB: INSERT renewal_jobs … ON CONFLICT DO NOTHING
+    B->>DB: INSERT renewal_jobs … ON CONFLICT DO NOTHING
+    DB-->>A: 1 row
+    DB-->>B: 0 rows — the partial unique index already holds one
+    Note over DB: One job, not two.
+
+    A->>DB: SELECT … FOR UPDATE SKIP LOCKED
+    B->>DB: SELECT … FOR UPDATE SKIP LOCKED
+    DB-->>A: the job, leased
+    DB-->>B: nothing — the row is locked, so B skips past it
+    Note over DB: One execution, not two.
+
+    A-xA: the process dies mid-renewal
+    Note over DB: The lease expires. The job is claimable again.
+    B->>DB: SELECT … FOR UPDATE SKIP LOCKED
+    DB-->>B: the same job, and this time it finishes
+```
 
 ## The processes
 
@@ -212,34 +265,50 @@ user can write. See [security.md](security.md).
 
 ## Data flow: a certificate from request to renewal
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Op as Operator
+    participant Core as Core
+    participant DB as PostgreSQL
+    participant GW as Gateway
+    participant CA as Certificate authority
+    participant Tgt as The thing that serves it
+
+    Op->>Core: POST /api/v1/certificates
+    Core->>Core: the policy engine evaluates the request
+    Note right of Core: A BLOCK violation refuses it here,<br/>before anything has been issued.
+    Core->>Core: decrypt the CA account config, for this one call
+    Core->>GW: IssueCertificate
+    GW->>CA: an ACME order, or a Vault issue
+    CA-->>GW: a certificate
+    GW-->>Core: the certificate, and a key if the gateway made one
+    Core->>Core: parse it before trusting it · seal the key with the KEK
+    Core->>DB: write the row
+
+    Note over Core,DB: weeks pass
+
+    Core->>DB: scheduler: inside its lead window, so enqueue a renewal job
+    Core->>DB: queue: claim it
+    Core->>GW: RenewCertificate
+    GW->>CA: renew
+    CA-->>GW: a new certificate
+    GW-->>Core: a new certificate
+    Core->>DB: store it, and increment renewal_count
+
+    Core->>DB: enqueue a deployment job per binding with deploy_on_renewal
+    Core->>Tgt: install it, in wave order
+    Core->>Tgt: the verifier opens a TLS connection
+    Tgt-->>Core: the fingerprint actually being served
+    Note over Core,Tgt: Only now has the renewal happened.
 ```
-1. POST /api/v1/certificates
-      policy engine evaluates the request          (a BLOCK violation refuses it)
-      CA account config decrypted for one call
-      gRPC IssueCertificate → gateway → CA
-      certificate parsed before it is trusted
-      private key sealed with the KEK
-      row written
 
-2. renewal scheduler notices lead window
-      enqueue renewal_jobs (ON CONFLICT DO NOTHING)
+Events are published throughout, so SSE clients and the notification
+dispatcher see each of these as it occurs rather than on the next poll.
 
-3. renewal queue claims (FOR UPDATE SKIP LOCKED)
-      gRPC RenewCertificate → gateway → CA
-      new certificate stored, renewal_count incremented
-
-4. deployment enqueued for every binding with deploy_on_renewal
-      a failing target halts the rest of that certificate's rollout
-
-5. verifier opens a TLS connection to the endpoint
-      compares the fingerprint being served against the one stored
-
-6. throughout: events published, SSE clients updated, alerts dispatched
-```
-
-Step 5 is why this is a lifecycle manager rather than an issuance tool. Renewal
-that stops at "the certificate is in the database" is renewal that has not
-happened yet.
+That last exchange is why this is a lifecycle manager rather than an issuance
+tool. Renewal that stops at "the certificate is in the database" is renewal that
+has not happened yet.
 
 ## Where the private keys are
 
@@ -255,6 +324,49 @@ Four cases, deliberately different:
 The fourth case is the reason `auto_renew` is forced false on import. A record
 claiming it will renew itself, with no key and no CA account, is the failure
 this product exists to prevent.
+
+Which case a certificate is in is **stated, in `key_custody`, and never
+inferred from provenance.** A certificate signed from a CSR you supplied is
+`REQUESTED` like every other one issued here, so how the record arrived cannot
+answer whether there is a key behind it. Renewal is decided by the answer:
+
+```mermaid
+flowchart LR
+    subgraph prov["How the record arrived — discovered_via"]
+        RQ["REQUESTED"]
+        AGT["AGENT"]
+        SCN["SCAN"]
+        CTL["CT_LOG"]
+        CLD["CLOUD"]
+        IMP["IMPORT"]
+        MAN["MANUAL"]
+    end
+
+    CP["key_custody = CERTPILOT<br/>sealed here with the KEK"]
+    AG["key_custody = AGENT<br/>on that host only"]
+    EX["key_custody = EXTERNAL<br/>somebody else holds it"]
+
+    RQ -->|"no CSR sent, so<br/>the gateway made the key"| CP
+    RQ -->|"you sent a CSR"| EX
+    AGT --> AG
+    SCN --> EX
+    CTL --> EX
+    CLD --> EX
+    IMP --> EX
+    MAN --> EX
+
+    CP --> R1["The core's renewal<br/>sweep renews it."]
+    AG --> R2["The agent renews it —<br/>the sweep skips it."]
+    EX --> R3["Nothing here renews it.<br/>The executor refuses."]
+```
+
+That last refusal is the interesting one. Renewing an `EXTERNAL` certificate
+from here would issue against a key the certificate does not use, and would
+leave `key_custody` reading `EXTERNAL` while CertPilot quietly held a key —
+two failures at once, and the second one silent. `GetCertificatesDueForRenewal`
+excludes `AGENT` and `EXTERNAL` for the same reason: without it the queue would
+pick them up and fail on every attempt forever, which is a loud way of being
+wrong about something that is working perfectly.
 
 ## Modules
 
