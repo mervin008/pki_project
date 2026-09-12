@@ -42,6 +42,14 @@ If you touched `core/api/router.go`, also run `make routes`. The endpoint tables
 on the documentation site are generated from `docs/routes.json`, and CI fails if
 it has drifted.
 
+If you touched a ```mermaid diagram in `docs/`, two limits are worth knowing,
+because both produce a diagram that looks right on GitHub and wrong once the
+documentation site publishes it. **A node label is at most two lines**, since
+mermaid sizes the box from the label it measured and then draws it with
+different metrics, so a third line lands across the bottom edge of its own box.
+**A cluster title is one line**, since the second is drawn where the first row
+of nodes goes and ends up behind them.
+
 ## What we look for
 
 **Run it against the real thing.** This project has a history of green test
