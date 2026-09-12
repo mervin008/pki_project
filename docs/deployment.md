@@ -202,11 +202,23 @@ Lower goes first. Zero is the default and is what every target has unless
 somebody says otherwise, which is one wave and exactly the behaviour that
 existed before waves did — same-wave targets deploy in parallel.
 
-```
-wave 0   staging-lb          ──▶ must succeed
-wave 1   production-lb-01  ──┐
-         production-lb-02  ──┼──▶ then these, in parallel
-         production-lb-03  ──┘
+```mermaid
+flowchart TB
+    R["A renewal succeeds"] --> Q["One deployment job per binding<br/>with deploy_on_renewal"]
+    Q --> W0
+
+    subgraph W0["wave 0 — one target alone, so it is a canary"]
+        S["staging-lb"]
+    end
+
+    subgraph W1["wave 1 — in parallel"]
+        P1["production-lb-01"]
+        P2["production-lb-02"]
+        P3["production-lb-03"]
+    end
+
+    W0 -->|"succeeded"| W1
+    W0 -.->|"failed"| H["The rollout halts — wave 1 never<br/>becomes claimable"]
 ```
 
 **A canary is a target on its own in the lowest wave.** One target, exactly one
