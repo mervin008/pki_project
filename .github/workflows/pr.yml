@@ -1,0 +1,71 @@
+name: PR
+
+# Conventions this repository already follows, checked so they survive a busy
+# day rather than depending on one.
+#
+# The strongest of them is the last: a change here is described by what was run
+# against what, and by what was not. A pull request that does not say leaves a
+# reviewer guessing at exactly the thing this project is most careful about.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  standards:
+    name: pull request standards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Title and description
+        # Passed as environment variables rather than interpolated into the
+        # script. A pull request title is attacker-controlled text, and
+        # `run: echo ${{ github.event.pull_request.title }}` executes whatever a
+        # contributor puts in it.
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+          fail=0
+          note() { echo "::error::$1"; fail=1; }
+
+          # ---- Title
+          if [ "${#PR_TITLE}" -lt 15 ]; then
+            note "the title is $(printf %s "$PR_TITLE" | wc -c) characters; say what changed, not which area it touched"
+          fi
+          shopt -s nocasematch
+          if [[ "$PR_TITLE" =~ ^(wip|draft|temp|test|fix|update|changes)$ ]]; then
+            note "\"$PR_TITLE\" is a placeholder title"
+          fi
+          if [[ "$PR_TITLE" =~ ^(wip|\[wip\]) ]] && [ "$PR_DRAFT" != "true" ]; then
+            note "a WIP title on a non-draft pull request — mark it a draft instead"
+          fi
+          shopt -u nocasematch
+
+          # ---- Body
+          stripped="$(printf '%s' "${PR_BODY:-}" | sed -E 's/<!--.*-->//g; s/^#+ .*$//gm' | tr -d '[:space:]')"
+          if [ "${#stripped}" -lt 40 ]; then
+            note "the description is empty or only the template headings"
+          fi
+
+          # ---- Verification
+          #
+          # Escape hatch, because this should not block a typo fix: add the
+          # `no-verification-needed` label and say why in the body.
+          if [[ ",$PR_LABELS," == *",no-verification-needed,"* ]]; then
+            echo "verification waived by label"
+          elif ! grep -qiE 'verif|tested|ran |run against|reproduc' <<<"${PR_BODY:-}"; then
+            note "the description does not say how this was verified. Say what you ran and against what — and say plainly what you did NOT verify. Add the 'no-verification-needed' label to waive this."
+          fi
+
+          if [ "$fail" -eq 1 ]; then
+            echo
+            echo "See .github/pull_request_template.md and CONTRIBUTING.md."
+            exit 1
+          fi
+          echo "pull request standards met"

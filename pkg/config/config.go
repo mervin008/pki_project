@@ -324,11 +324,3 @@ func (c *CoreConfig) Validate() error {
 
 	return nil
 }
-
-func isLoopback(host string) bool {
-	switch host {
-	case "127.0.0.1", "::1", "localhost":
-		return true
-	}
-	return false
-}
