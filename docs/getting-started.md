@@ -41,7 +41,7 @@ make every private key already stored permanently unreadable.
 
 To use a database of your own, export `CERTPILOT_DB_URL` before running; the
 bootstrap above is skipped entirely, including the prelude, which must never run
-against a real Supabase project.
+against a real PostgreSQL server.
 
 The rest of this page is the same thing done by hand, which is what you want
 when you are changing one piece of it.
@@ -240,12 +240,8 @@ export CERTPILOT_DB_URL="postgresql://user:pass@localhost:5432/certpilot"
 make run-core
 ```
 
-Apply migrations in order from `migrations/`. Two caveats:
+Apply migrations in order from `migrations/`. One caveat:
 
-- `001_initial_schema.sql` references `auth.users` and `auth.jwt()`, which exist
-  only on Supabase. It will not apply to vanilla PostgreSQL as written. The Go
-  store layer is plain `pgx` and has no Supabase dependency; the schema is the
-  only coupling.
 - With a database configured, `CERTPILOT_KEK` is mandatory. Losing it makes
   every stored private key and CA credential unrecoverable, so put it in a
   secret manager, not a shell profile.
@@ -267,7 +263,7 @@ password, and prints it once:
 password and no anonymous mode.
 
 For anything else, point `auth.jwks_url` at your identity provider — Keycloak,
-Okta, Azure AD, Auth0, Authentik, or Supabase Auth all work. The core then
+Okta, Azure AD, Auth0, or Authentik all work. The core then
 verifies asymmetrically signed tokens against published public keys and holds
 nothing capable of minting one.
 
@@ -318,24 +314,20 @@ Once this works, the things worth doing next:
 [troubleshooting.md](troubleshooting.md) is organised by symptom.
 
 
-## Running against plain PostgreSQL
+## Running against PostgreSQL
 
-CertPilot's schema was written against Supabase, and migration 001 references
-things a plain server does not have — `auth.users`, `auth.jwt()`, and a
-`supabase_realtime` publication. Run the prelude once, then migrate:
+CertPilot stores everything in a PostgreSQL database you run. Point it at one
+and apply the schema:
 
 ```bash
-psql "$CERTPILOT_DB_URL" -f deploy/plain-postgres/prelude.sql
+export CERTPILOT_DB_URL='postgres://certpilot:<pw>@<host>:5432/certpilot?sslmode=require'
 certpilot-core --migrate
 ```
 
-The prelude creates a stub `auth.jwt()` that returns no claims, so the
-row-level security policies **fail closed**. That is deliberate: a stub cannot
-verify a token, and returning a role would hand every connection whatever role
-it named. CertPilot's own connection should own these tables — owners bypass RLS
-— and authorisation for people is enforced in the API layer, which is where it
-is enforced on Supabase too. What you do not get on a plain server is RLS as a
-second line.
+Every migration applies to a stock PostgreSQL 14 or later — no extensions, no
+prelude, no platform-specific objects. The schema carries no row-level security;
+authorisation for people is enforced in the API layer. CertPilot's own
+connection should own these tables.
 
 This path is exercised by `make test-store`, which migrates a throwaway database
 from the repository's own migration files on every run.

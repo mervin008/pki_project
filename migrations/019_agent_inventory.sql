@@ -36,7 +36,6 @@
 -- manages and nobody in this organisation is responsible for; it is recorded as
 -- one row that says so, rather than as a hundred findings.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 
@@ -118,28 +117,5 @@ alter table public.agents
   add column if not exists last_inventory_at timestamptz,
   add column if not exists certificates_seen int not null default 0,
   add column if not exists unmanaged_seen int not null default 0;
-
-alter table public.agent_certificates enable row level security;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    execute 'grant select, insert, update, delete on public.agent_certificates to authenticated';
-  end if;
-exception when others then
-  raise notice 'skipping grants: %', sqlerrm;
-end
-$$;
-
-do $$
-begin
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'agent_certificates'
-                   and policyname = 'agent_certificates_select') then
-    create policy "agent_certificates_select" on public.agent_certificates
-      for select to authenticated using (true);
-  end if;
-end
-$$;
 
 commit;

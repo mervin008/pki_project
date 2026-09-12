@@ -22,7 +22,6 @@
 -- result for a host and port, once per endpoint scanned, so it has to be an
 -- index hit and not a scan of every result ever recorded.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 
@@ -64,30 +63,6 @@ create table if not exists public.discovery_schedules (
 create index if not exists idx_discovery_schedules_due
   on public.discovery_schedules (next_run_at)
   where is_enabled;
-
-alter table public.discovery_schedules enable row level security;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    execute 'grant select, insert, update, delete on public.discovery_schedules to authenticated';
-  end if;
-exception when others then
-  raise notice 'skipping grants: %', sqlerrm;
-end
-$$;
-
-do $$
-begin
-  if not exists (
-    select 1 from pg_policies
-    where schemaname = 'public' and tablename = 'discovery_schedules' and policyname = 'discovery_schedules_select'
-  ) then
-    create policy "discovery_schedules_select" on public.discovery_schedules
-      for select to authenticated using (true);
-  end if;
-end
-$$;
 
 -- ── Reconciliation ─────────────────────────────────────────────────────────
 

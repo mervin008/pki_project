@@ -127,7 +127,7 @@ Two verification paths exist and they are not equivalent. With `jwks_url` the
 core verifies asymmetric signatures against published public keys and holds
 nothing capable of minting a token. With `jwt_secret` it holds a key that can
 forge an admin token. Use `jwks_url` wherever the provider supports it; the
-shared-secret path is kept for Supabase projects that have not migrated to
+shared-secret path is kept for providers that cannot issue
 asymmetric signing keys.
 
 `allow_anonymous` no longer exists and is refused in every mode, not only in
@@ -221,23 +221,6 @@ logging:
   level: "info"     # debug | info | warn | error
   format: "text"    # text | json
 ```
-
-### `supabase`
-
-```yaml
-supabase:
-  url: "${SUPABASE_URL}"
-  anon_key: "${SUPABASE_ANON_KEY}"
-```
-
-Supabase is one supported deployment target, not a requirement. The core talks
-to any PostgreSQL over `CERTPILOT_DB_URL`. These keys are used by the frontend
-for authentication, not by the core for storage.
-
-Prefer Supabase's **session pooler** (port 5432 on the pooler host) over the
-transaction pooler (6543): pgx caches prepared statements per connection, and
-transaction-mode pooling hands the next query to a backend that has never seen
-them. See [database.md](database.md).
 
 ---
 

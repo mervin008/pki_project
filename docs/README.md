@@ -17,7 +17,7 @@ team inside an organisation.
 | [configuration.md](configuration.md) | Every setting for every process, and what happens when it is wrong |
 | [operations.md](operations.md) | Deploying, migrating, rotating the KEK, backups, upgrades, what to watch |
 | [security.md](security.md) | Threat model, secrets at rest, key custody, authentication, and the known gaps |
-| [database.md](database.md) | Schema, migrations, PostgreSQL and Supabase, the conformance suite |
+| [database.md](database.md) | Schema, migrations, PostgreSQL, the conformance suite |
 | [troubleshooting.md](troubleshooting.md) | Symptom, cause, fix |
 
 ## What it does

@@ -37,7 +37,6 @@
 -- agent hosts being absent from that answer is exactly the property step 4c
 -- exists to create.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 
@@ -136,28 +135,5 @@ create index if not exists idx_agent_installations_certificate
 create index if not exists idx_agent_installations_attention
   on public.agent_installations (status, updated_at desc)
   where status in ('FAILED', 'UNFULFILLED');
-
-alter table public.agent_installations enable row level security;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    execute 'grant select, insert, update, delete on public.agent_installations to authenticated';
-  end if;
-exception when others then
-  raise notice 'skipping grants: %', sqlerrm;
-end
-$$;
-
-do $$
-begin
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'agent_installations'
-                   and policyname = 'agent_installations_select') then
-    create policy "agent_installations_select" on public.agent_installations
-      for select to authenticated using (true);
-  end if;
-end
-$$;
 
 commit;

@@ -9,7 +9,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.49.1",
     "@tailwindcss/vite": "^4.3.3",
     "chart.js": "^4.5.1",
     "lucide-vue-next": "^0.475.0",

@@ -9,8 +9,6 @@
 -- the index that makes filtering by action cheap, and gives notification
 -- channels the two columns they need to decide what is worth sending.
 --
--- Applies to plain PostgreSQL as well as Supabase: nothing here references
--- auth.users or auth.jwt().
 
 begin;
 
@@ -84,7 +82,5 @@ alter table public.notification_channels
 alter table public.notification_channels
   add constraint notification_channels_channel_type_check
   check (channel_type in ('email', 'slack', 'webhook'));
-
-alter table public.notification_channels enable row level security;
 
 commit;

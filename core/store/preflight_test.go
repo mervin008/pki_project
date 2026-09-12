@@ -11,7 +11,7 @@ import (
 // dashboard that looks like a healthy estate; too strict and it refuses to
 // start against a database it can read perfectly well.
 //
-// Verified live against Supabase for the BYPASSRLS case, which is how the
+// Verified live against PostgreSQL for the BYPASSRLS case, which is how the
 // documented setup connects (the `postgres` role there has rolbypassrls). The
 // non-owner cases are covered here rather than by creating a login role on a
 // real project.
@@ -36,7 +36,7 @@ func TestRLSBlockedTables(t *testing.T) {
 			wantBlocked: false,
 		},
 		{
-			// How the documented Supabase setup connects.
+			// How the documented setup connects: as the owner of the tables.
 			name:        "BYPASSRLS reads everything even when RLS is forced",
 			info:        tableInfo{rowSecurity: true, forceRowSecurity: true, isOwner: false},
 			bypassesRLS: true,

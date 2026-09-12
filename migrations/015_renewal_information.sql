@@ -33,7 +33,6 @@
 -- to one that has nothing to say, which is the same mistake as a monitor with
 -- one timestamp.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 

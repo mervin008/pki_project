@@ -80,7 +80,7 @@ func Preflight(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf(
 			"row-level security would silently hide rows in %s from this connection, "+
 				"so the dashboard would show an empty, healthy-looking estate. "+
-				"Connect as the role that owns these tables (on Supabase that is `postgres`), "+
+				"Connect as the role that owns these tables, "+
 				"or grant the current role BYPASSRLS",
 			strings.Join(blocked, ", "))
 	}
@@ -243,7 +243,7 @@ func warnOnStaleSchema(ctx context.Context, pool *pgxpool.Pool) {
 				JOIN pg_catalog.pg_namespace pns ON pns.oid = parent.relnamespace
 				WHERE con.contype = 'f' AND cns.nspname = 'public' AND pns.nspname = 'auth')`,
 			consequence: "tables still reference auth.users (migration 005); issuing a certificate or writing an audit " +
-				"entry will fail with a foreign key violation unless every actor exists in Supabase Auth",
+				"entry will fail with a foreign key violation unless every actor exists in that external table",
 		},
 	}
 

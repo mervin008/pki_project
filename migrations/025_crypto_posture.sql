@@ -30,7 +30,6 @@
 -- and that default could change in a release, so what was offered is recorded
 -- per observation rather than assumed from the code that made it.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 

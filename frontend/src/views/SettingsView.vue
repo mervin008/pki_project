@@ -21,7 +21,7 @@ import type { GatewaySummary, ListResponse } from '@/lib/types'
  * This page reports live state only.
  *
  * It previously rendered a hardcoded table — "localhost:8443", ":50051",
- * "Supabase (eu-north-1)", "Connection Pool 10 / 20", and a connected
+ * a database region, "Connection Pool 10 / 20", and a connected
  * "Vault Provider" for a gateway that does not exist in this repository — built
  * from a non-reactive array that read a ref before it was ever populated. On a
  * settings page that is worse than showing nothing, because it invites someone

@@ -35,9 +35,6 @@
 -- that already holds rows without rewriting them. In practice there are none:
 -- nothing has ever written to these tables.
 --
--- Applies to plain PostgreSQL as well as Supabase — no `auth.*` references, no
--- role grants. RLS is already enabled on both tables by 001 and its policies
--- are column-agnostic, so nothing here needs new policies.
 
 begin;
 

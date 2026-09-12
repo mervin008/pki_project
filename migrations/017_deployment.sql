@@ -52,7 +52,6 @@
 -- copied from the renewal queue would have silently deployed to the first
 -- target and quietly dropped the other five.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 
@@ -173,36 +172,5 @@ create index if not exists idx_deployment_jobs_claimable
 
 create index if not exists idx_deployment_jobs_certificate
   on public.deployment_jobs (certificate_id, created_at desc);
-
-alter table public.certificate_deployments enable row level security;
-alter table public.deployment_jobs enable row level security;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    execute 'grant select, insert, update, delete on public.certificate_deployments to authenticated';
-    execute 'grant select, insert, update, delete on public.deployment_jobs to authenticated';
-  end if;
-exception when others then
-  raise notice 'skipping grants: %', sqlerrm;
-end
-$$;
-
-do $$
-begin
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'certificate_deployments'
-                   and policyname = 'certificate_deployments_select') then
-    create policy "certificate_deployments_select" on public.certificate_deployments
-      for select to authenticated using (true);
-  end if;
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'deployment_jobs'
-                   and policyname = 'deployment_jobs_select') then
-    create policy "deployment_jobs_select" on public.deployment_jobs
-      for select to authenticated using (true);
-  end if;
-end
-$$;
 
 commit;
