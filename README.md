@@ -65,11 +65,32 @@ is aimed at.
 
 ## Quick start
 
-Requires Go 1.26+, Node 20+, and PostgreSQL 13+. No cloud account needed.
+Requires Docker. No toolchain, no database, no cloud account.
 
 ```bash
 git clone https://github.com/certpilot/certpilot.git
 cd certpilot
+docker compose -f deploy/docker-compose.quickstart.yml up -d --build
+```
+
+The frontend is on `:3000` and the API on `:8080`. The first start creates an
+administrator and prints its password once:
+
+```bash
+docker compose -f deploy/docker-compose.quickstart.yml logs core | grep -i password
+```
+
+This stack is for evaluating, not deploying, and it says so in its own
+comments: the database is a container, the key encryption key is committed to
+this repository, and the CA is the self-signed gateway. Mutual TLS on the
+core-to-gateway channel is **not** switched off to make the demo easier —
+`deploy/docker-compose.yml` is the one to start from for anything real.
+
+### From source instead
+
+Requires Go 1.26+, Node 20+, and PostgreSQL 13+.
+
+```bash
 make dev
 ```
 

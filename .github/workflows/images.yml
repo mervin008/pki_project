@@ -14,6 +14,7 @@ on:
       - '.dockerignore'
       - 'deploy/docker/**'
       - 'deploy/docker-compose*.yml'
+      - 'deploy/config.quickstart.yaml'
       - '.github/workflows/images.yml'
       - 'go.work'
       - '**/go.mod'
@@ -122,6 +123,63 @@ jobs:
           fi
           echo "${{ matrix.name }} runs as uid $uid"
 
+  # The quickstart, actually run. `docker compose config` proves a file parses;
+  # only this proves the thing starts, reaches its database, and completes the
+  # mTLS handshake the product is about.
+  quickstart:
+    name: quickstart stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Bring it up
+        run: docker compose -f deploy/docker-compose.quickstart.yml up -d --build
+
+      - name: The core answers
+        run: |
+          curl -fsS --retry 40 --retry-delay 3 --retry-all-errors \
+            http://localhost:8080/healthz
+
+      - name: The console is served
+        run: |
+          curl -fsS --retry 20 --retry-delay 3 --retry-all-errors \
+            http://localhost:3000/ | grep -q '<div id="app"'
+
+      # The roadmap bullet this job exists for. A failed gateway connection is
+      # only a warning in the core — it starts anyway — so a healthy core proves
+      # nothing on its own. The absence of this line is the proof that mTLS
+      # survived the compose network, service names and all.
+      - name: mTLS reached the gateway
+        run: |
+          set -euo pipefail
+          logs="$(docker compose -f deploy/docker-compose.quickstart.yml logs core)"
+          if grep -q "could not connect to configured gateway at startup" <<<"$logs"; then
+            echo "::error::the core could not reach gateway-selfsigned over mTLS"
+            grep -A3 "could not connect to configured gateway" <<<"$logs"
+            exit 1
+          fi
+          echo "the core registered its gateway over mTLS"
+
+      # And that it did not get there by giving up on TLS.
+      - name: The gateway is not running without TLS
+        run: |
+          set -euo pipefail
+          logs="$(docker compose -f deploy/docker-compose.quickstart.yml logs gateway-selfsigned)"
+          if grep -qi "WITHOUT TLS" <<<"$logs"; then
+            echo "::error::the quickstart gateway is serving without TLS"
+            exit 1
+          fi
+          echo "the gateway is serving with TLS"
+
+      - name: Logs, if any of that failed
+        if: failure()
+        run: docker compose -f deploy/docker-compose.quickstart.yml logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.quickstart.yml down -v
+
   compose:
     name: compose config
     runs-on: ubuntu-latest
@@ -136,3 +194,5 @@ jobs:
           CERTPILOT_KEK=ci CERTPILOT_DB_URL=postgres://ci \
             docker compose -f deploy/docker-compose.yml config -q
           echo "deploy/docker-compose.yml is valid"
+          docker compose -f deploy/docker-compose.quickstart.yml config -q
+          echo "deploy/docker-compose.quickstart.yml is valid"

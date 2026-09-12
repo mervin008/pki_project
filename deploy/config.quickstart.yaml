@@ -1,0 +1,58 @@
+# CertPilot, configured for an evaluation and nothing else.
+#
+# Differences from deploy/config.production.example.yaml, all deliberate:
+# development mode, a database in a container, a KEK committed to this
+# repository, and the self-signed gateway — which is the only one that needs no
+# account with any CA, and therefore the only one a first run can use.
+#
+# Do not point this at anything you care about.
+
+server:
+  port: 8080
+  mode: "development"
+  allowed_origins:
+    - "http://localhost:3000"
+
+auth:
+  role_claim: "certpilot_role"
+  # The core creates this account on first start, generates a password and
+  # prints it once. Read it out of the core's logs:
+  #
+  #   docker compose -f deploy/docker-compose.quickstart.yml logs core | grep -i password
+  bootstrap_admins:
+    - "you@example.com"
+
+plugins:
+  discovery_mode: "static"
+
+  # mTLS is on, in a quickstart, on purpose. The channel carries CSRs, private
+  # keys and CA credentials; a product that turns that off to make its own demo
+  # easier is making an argument it does not believe. The `certs` service writes
+  # this material before anything else starts, so it still costs one command.
+  tls:
+    cert_file: "/app/pki/core.pem"
+    key_file: "/app/pki/core-key.pem"
+    ca_file: "/app/pki/ca.pem"
+    insecure: false
+
+  gateways:
+    - name: "selfsigned-dev"
+      # The service name on the compose network...
+      addr: "gateway-selfsigned:9091"
+      type: "selfsigned"
+      # ...but the certificate says `localhost`, because that is what
+      # --generate-dev-certs puts in the SAN. Without this override the dial
+      # fails hostname verification, which is exactly the way a compose network
+      # breaks an mTLS story that works fine on loopback.
+      server_name: "localhost"
+
+pki:
+  ca_health_check_interval: 360
+  crl_ocsp_check_interval: 60
+
+renewal:
+  scan_interval: 60
+
+logging:
+  level: "info"
+  format: "text"

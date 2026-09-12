@@ -34,6 +34,13 @@ COPY config.example.yaml /app/config.example.yaml
 # one-off job or an init container.
 COPY migrations /app/migrations
 
+# Created here so that a named volume mounted at this path inherits certpilot's
+# ownership rather than root's. Docker seeds an empty volume from the image
+# directory it covers, permissions included — and without this, the quickstart's
+# `certs` service runs as uid 100 against a root-owned directory and cannot
+# write the mTLS material it exists to write.
+RUN mkdir -p /app/pki && chown certpilot:certpilot /app/pki
+
 USER certpilot
 
 EXPOSE 8080
