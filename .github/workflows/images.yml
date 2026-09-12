@@ -32,7 +32,7 @@ on:
 
 jobs:
   build:
-    name: ${{ matrix.name }}
+    name: image (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
       # Every image, every time. Stopping at the first failure would report one

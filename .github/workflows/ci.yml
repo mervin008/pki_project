@@ -147,7 +147,7 @@ jobs:
           echo "module graph is tidy"
 
   frontend:
-    name: frontend
+    name: frontend checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
