@@ -61,14 +61,29 @@ jobs:
           CERTPILOT_TEST_DB_URL: postgres://certpilot:ci@127.0.0.1:5432/postgres?sslmode=disable
         run: |
           set -euo pipefail
-          out="$(go test ./core/store/ -count=1 -v -run Conformance 2>&1)"
-          if ! grep -q "postgres" <<<"$out"; then
-            echo "::error::the conformance suite did not run against PostgreSQL"
+          # `make test-store`, not a hand-written `go test`, for the same reason
+          # every other job here calls a Makefile target.
+          #
+          # The assertion is on the subtest name. forEachStore runs each body
+          # once per implementation and names the subtest after it, so a run
+          # that reached the database contains `/postgres` and one that fell
+          # back to the in-memory store alone contains only `/memory`. Both
+          # directions were checked before this was written — there is no
+          # function named *Conformance*, so grepping for that matched nothing
+          # and the check passed on an empty result.
+          # DB= rather than the environment: test-store sets
+          # CERTPILOT_TEST_DB_URL from $(TEST_DB), which defaults to the
+          # plain-postgres container on 55432, so an exported value is ignored
+          # and the suite would quietly look for a server that is not here.
+          out="$(make test-store DB="$CERTPILOT_TEST_DB_URL" 2>&1)" || { echo "$out" | tail -30; exit 1; }
+          if ! grep -qE 'RUN[[:space:]]+Test[A-Za-z]+/postgres' <<<"$out"; then
+            echo "::error::the store suite did not run against PostgreSQL — it skipped to the in-memory store, which enforces no constraints"
             grep -i "not exercised" <<<"$out" || true
+            echo "$out" | tail -20
             exit 1
           fi
-          echo "conformance ran against PostgreSQL:"
-          grep -oE "Conformance/[a-z]+" <<<"$out" | sort -u
+          echo "the store suite ran against PostgreSQL:"
+          grep -oE 'Test[A-Za-z]+/postgres' <<<"$out" | sort -u | head
 
   race:
     name: race detector
