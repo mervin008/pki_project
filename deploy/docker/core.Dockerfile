@@ -1,24 +1,40 @@
-# Build stage
+# syntax=docker/dockerfile:1
+
+# The control plane.
+#
+# Built from the repository root because this is a Go workspace: core/go.mod
+# carries `replace github.com/certpilot/certpilot/pkg => ../pkg`, which a
+# context rooted at core/ cannot resolve. .dockerignore keeps the context to
+# source — and keeps .env and .certpilot/ out of the builder layer.
 FROM golang:1.26-alpine AS builder
 
-WORKDIR /app
+WORKDIR /src
 COPY . .
 
-RUN go build -o /app/bin/certpilot-core ./core/cmd/
+# CGO off: the runtime stage is alpine and a cgo-linked binary would pick up a
+# glibc dependency the image does not have. -trimpath keeps the build machine's
+# paths out of the binary.
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+      -o /out/certpilot-core ./core/cmd/
 
-# Runtime stage
 FROM alpine:3.20
 
 RUN apk --no-cache add ca-certificates tzdata
 
+RUN addgroup -S certpilot && adduser -S -G certpilot -h /app certpilot
+
 WORKDIR /app
-COPY --from=builder /app/bin/certpilot-core /app/certpilot-core
+COPY --from=builder /out/certpilot-core /app/certpilot-core
 COPY config.example.yaml /app/config.example.yaml
 
 # Shipped so `certpilot-core --migrate` works from the image. The server never
 # applies them itself; this is here for the operator who runs migrations as a
 # one-off job or an init container.
 COPY migrations /app/migrations
+
+USER certpilot
 
 EXPOSE 8080
 

@@ -10,9 +10,15 @@
 /vendor/
 go.work.sum
 
-# Generated protobuf code. Regenerate with `make proto`.
-pkg/pb/**/*.go
-!pkg/pb/.gitkeep
+# Generated protobuf code IS committed, deliberately.
+#
+# It used to be ignored, with `make proto` as the instruction. The consequence
+# only became visible when something built from a clean tree for the first
+# time: core and all three gateways import pkg/pb, so a fresh clone could not
+# build them at all — and `buf generate` reaches buf.build for its plugins, so
+# the fix was not local either. A clone now builds with nothing but a Go
+# toolchain. .github/workflows/proto.yml fails the build if what is committed
+# stops matching proto/.
 
 # ── Test output ──────────────────────────────────────────
 *.test
