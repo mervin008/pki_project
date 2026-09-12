@@ -20,7 +20,6 @@
 -- shape in this project; a container-backed test suite remains the fix and
 -- remains unwritten.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 

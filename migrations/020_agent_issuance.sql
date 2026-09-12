@@ -53,7 +53,6 @@
 -- to" is a question a security team should be able to answer, and this is the
 -- column that answers it.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 
@@ -128,30 +127,5 @@ where private_key_encrypted is not null and private_key_encrypted <> '';
 
 create index if not exists idx_certificates_key_custody
   on public.certificates (key_custody);
-
-alter table public.agent_grants enable row level security;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    execute 'grant select, insert, update, delete on public.agent_grants to authenticated';
-  end if;
-exception when others then
-  raise notice 'skipping grants: %', sqlerrm;
-end
-$$;
-
-do $$
-begin
-  -- Readable: a grant is a statement of policy, and who may ask for what is
-  -- something a team should be able to review. It holds no secret.
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'agent_grants'
-                   and policyname = 'agent_grants_select') then
-    create policy "agent_grants_select" on public.agent_grants
-      for select to authenticated using (true);
-  end if;
-end
-$$;
 
 commit;

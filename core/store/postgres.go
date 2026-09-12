@@ -61,7 +61,7 @@ func NewPostgresStore(ctx context.Context, connStr string) (*PostgresStore, erro
 		return nil, err
 	}
 
-	slog.Info("connected to PostgreSQL/Supabase database")
+	slog.Info("connected to PostgreSQL")
 	return &PostgresStore{pool: pool}, nil
 }
 

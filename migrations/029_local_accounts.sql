@@ -100,8 +100,6 @@ comment on table public.sessions is
   'holds no key capable of forging one, and so that a session can be ended '
   'the moment an account is suspended.';
 
-alter table public.sessions enable row level security;
-
 -- No policy is created for `authenticated`. Unlike users, a session row is a
 -- credential's shadow: anything able to read this table through PostgREST
 -- would learn which sessions are live and when, and nothing in the product

@@ -25,7 +25,6 @@
 -- NO_ENDPOINTS rather than guessed at — "we cannot verify this" is a useful
 -- sentence and a fabricated verification is not.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 

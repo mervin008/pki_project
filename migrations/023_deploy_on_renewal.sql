@@ -34,7 +34,6 @@
 -- shipping it alongside this would have been two half-built controls instead of
 -- one working one.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 

@@ -251,11 +251,11 @@ verification modes:
 **JWKS (preferred).** The core fetches the identity provider's published public
 keys and verifies asymmetric signatures. It holds nothing capable of minting a
 token. Works with any OIDC provider — Keycloak, Okta, Entra ID, Auth0,
-Authentik, Supabase.
+Authentik.
 
 **Shared secret (legacy).** HS256 against `auth.jwt_secret`. This requires the
-core to hold a key that can *forge* an admin token. Kept only for Supabase
-projects that have not migrated to asymmetric signing keys.
+core to hold a key that can *forge* an admin token. Kept only for providers
+that cannot issue asymmetrically signed tokens.
 
 `issuer` and `audience` are validated when configured.
 
@@ -352,9 +352,9 @@ Four roles, enforced per route by `RequireRole`:
 The role is read from `app_metadata.<role_claim>`, default
 `app_metadata.certpilot_role`.
 
-> **Never `user_metadata`.** In Supabase, `raw_user_meta_data` is user-editable
-> and appears in `auth.jwt()`. A role read from it is privilege escalation with
-> extra steps.
+> **Never a user-writable claim.** Many identity providers expose a metadata
+> object the user can edit and still carry it in the token. A role read from one
+> is privilege escalation with extra steps.
 
 ---
 

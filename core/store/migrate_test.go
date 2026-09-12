@@ -119,20 +119,25 @@ func TestVersionOf(t *testing.T) {
 	}
 }
 
-// The migrations the core needs on any deployment must not depend on Supabase.
-// Only 001 is permitted to, and that exception is documented in the README and
-// in docs/database.md rather than being discovered by an operator at deploy time.
-func TestOnlyTheInitialMigrationDependsOnSupabase(t *testing.T) {
+// No migration may depend on Supabase.
+//
+// This test used to permit 001 as a documented exception, and that exception is
+// precisely what made the schema unapplicable to a plain PostgreSQL server: 001
+// declared foreign keys into `auth.users`, policies over `auth.jwt()`, grants to
+// a Supabase role and membership of a Supabase publication, so a fresh database
+// needed a prelude of stub objects before the first migration would run at all.
+// The exception is gone and this is what keeps it gone.
+func TestNoMigrationDependsOnSupabase(t *testing.T) {
 	migrations, err := LoadMigrations(repoMigrationsDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, m := range migrations {
-		if m.Version == "001" {
-			continue
-		}
-		for _, symbol := range []string{"auth.users", "auth.jwt()", "auth.uid()"} {
+		for _, symbol := range []string{
+			"auth.users", "auth.jwt()", "auth.uid()",
+			"supabase_realtime", "to authenticated",
+		} {
 			if containsOutsideComments(m.SQL, symbol) {
 				t.Errorf("%s references %s, so it will not apply to plain PostgreSQL", m.Name, symbol)
 			}

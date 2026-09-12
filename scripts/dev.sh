@@ -130,17 +130,11 @@ if [[ -z "${CERTPILOT_KEK:-}" ]]; then
 fi
 
 # ── Schema ────────────────────────────────────────────────────────────────────
-# Migration 001 was written against Supabase and references auth.users, the
-# authenticated role, and the supabase_realtime publication. The prelude creates
-# those on a plain server; it is not in migrations/ because installing a stub
-# auth.jwt() on a real Supabase project would shadow the genuine one and break
-# every RLS policy in the database. So it runs only against a database this
-# script created — never against a CERTPILOT_DB_URL you brought yourself.
-if [[ -n "$local_db" ]]; then
-  printf 'Applying the plain-PostgreSQL prelude...\n'
-  psql -q -v ON_ERROR_STOP=1 -f deploy/plain-postgres/prelude.sql "$CERTPILOT_DB_URL"
-fi
-
+# No prelude: every migration applies to a stock PostgreSQL server. There used
+# to be one here, creating the objects migration 001 borrowed from a hosted
+# platform, and it was the reason this script could not point at an arbitrary
+# database somebody brought themselves.
+#
 # Applied here rather than by the server, which never migrates itself.
 printf 'Applying migrations...\n'
 go run ./core/cmd/ --migrate

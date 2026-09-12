@@ -34,14 +34,6 @@ services:
       POSTGRES_DB: certpilot
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # CertPilot's schema was written against Supabase: migration 001 references
-      # `auth.users` and the `authenticated` role, neither of which a plain
-      # server has, and it fails on its first foreign key without them. The
-      # prelude creates exactly those. It is deliberately not in migrations/ —
-      # a stub auth.jwt() applied to a real Supabase project would shadow the
-      # genuine one and break every RLS policy — so it runs here, on a database
-      # this file created and owns.
-      - ./plain-postgres/prelude.sql:/docker-entrypoint-initdb.d/00-prelude.sql:ro
     healthcheck:
       # Everything else waits on this rather than on a sleep, so a slow first
       # start on a cold machine delays the stack instead of breaking it.

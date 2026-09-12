@@ -4,21 +4,19 @@ package config
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 // CoreConfig is the main configuration for CertPilot Core.
 type CoreConfig struct {
-	Server   ServerConfig   `yaml:"server"`
-	Auth     AuthConfig     `yaml:"auth"`
-	Supabase SupabaseConfig `yaml:"supabase"`
-	Plugins  PluginsConfig  `yaml:"plugins"`
-	PKI      PKIConfig      `yaml:"pki"`
-	Renewal  RenewalConfig  `yaml:"renewal"`
-	Logging  LoggingConfig  `yaml:"logging"`
-	Secrets  SecretsConfig  `yaml:"secrets"`
+	Server  ServerConfig  `yaml:"server"`
+	Auth    AuthConfig    `yaml:"auth"`
+	Plugins PluginsConfig `yaml:"plugins"`
+	PKI     PKIConfig     `yaml:"pki"`
+	Renewal RenewalConfig `yaml:"renewal"`
+	Logging LoggingConfig `yaml:"logging"`
+	Secrets SecretsConfig `yaml:"secrets"`
 }
 
 // SecretsConfig says where the key encryption key comes from.
@@ -87,8 +85,8 @@ func (s ServerConfig) IsProduction() bool { return s.Mode == "production" }
 // verifies asymmetrically signed tokens against the provider's published public
 // keys and never holds anything capable of minting a token. JWTSecret is the
 // legacy shared-secret path, which requires the core to hold a key that can
-// forge admin tokens, and is kept only for existing Supabase projects that have
-// not migrated to asymmetric signing keys.
+// forge admin tokens, and is kept only for providers that cannot issue
+// asymmetrically signed tokens.
 type AuthConfig struct {
 	// JWKSURL is the JSON Web Key Set endpoint of the identity provider.
 	JWKSURL string `yaml:"jwks_url"`
@@ -149,14 +147,6 @@ type AuthConfig struct {
 	// leave in place: it is matched only when the user has no row yet, so it
 	// cannot silently restore an admin somebody deliberately demoted.
 	BootstrapAdmins []string `yaml:"bootstrap_admins"`
-}
-
-// SupabaseConfig holds Supabase connection details.
-type SupabaseConfig struct {
-	URL            string `yaml:"url"`
-	AnonKey        string `yaml:"anon_key"`
-	ServiceRoleKey string `yaml:"service_role_key"`
-	JWTSecret      string `yaml:"jwt_secret"`
 }
 
 // PluginsConfig holds gateway plugin settings.
@@ -252,10 +242,6 @@ func LoadCoreConfig(path string) (*CoreConfig, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
-	// Carry the legacy Supabase secret across so existing configs keep working.
-	if cfg.Auth.JWTSecret == "" && cfg.Supabase.JWTSecret != "" {
-		cfg.Auth.JWTSecret = cfg.Supabase.JWTSecret
-	}
 	if cfg.Auth.RoleClaim == "" {
 		cfg.Auth.RoleClaim = "certpilot_role"
 	}
@@ -264,12 +250,6 @@ func LoadCoreConfig(path string) (*CoreConfig, error) {
 		// what let a users list show a name instead of an opaque subject.
 		cfg.Auth.Scopes = []string{"openid", "profile", "email"}
 	}
-	// Supabase publishes its JWKS at a predictable path, so a project URL is
-	// enough to prefer asymmetric verification over the shared secret.
-	if cfg.Auth.JWKSURL == "" && cfg.Supabase.URL != "" {
-		cfg.Auth.JWKSURL = strings.TrimSuffix(cfg.Supabase.URL, "/") + "/auth/v1/.well-known/jwks.json"
-	}
-
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}

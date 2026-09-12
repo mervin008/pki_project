@@ -1,13 +1,13 @@
 -- 005_identity_decoupling.sql
 --
--- Severs the foreign keys from CertPilot's tables to Supabase's `auth.users`.
+-- Severs the foreign keys from CertPilot's tables to an external `auth.users`.
 --
 -- Why this is required rather than tidying:
 --
--- Migration 001 declared every actor column as
--- `references auth.users(id) on delete set null`. That makes Supabase Auth the
--- only identity provider the core can write against — but the core does not
--- authenticate against Supabase Auth. It verifies OIDC tokens against a JWKS
+-- Migration 001 used to declare every actor column as
+-- `references auth.users(id) on delete set null`, against an identity table
+-- CertPilot does not own — but the core does not authenticate against any such
+-- table. It verifies OIDC tokens against a JWKS
 -- endpoint (`auth.jwks_url`), which is just as likely to be Keycloak, Okta,
 -- Entra, Auth0, or Authentik, and stores the `sub` claim from whichever one is
 -- configured. None of those subjects exist in `auth.users`.
@@ -32,11 +32,13 @@
 --     existing indexes for no gain. A provider whose subjects are not uuids is
 --     a schema change, not a silent coercion.
 --   * Row-level security and its policies. They protect direct PostgREST
---     access on Supabase, which is a different threat model from the core's
---     connection. See the note at the bottom.
+--     access, which is a different threat model from the core's connection.
+--     (Both were later removed outright: the schema is plain PostgreSQL and
+--     authorisation for people is enforced in the API layer.)
 --
--- Applies to plain PostgreSQL as well as Supabase: dropping a constraint that
--- was never created is a no-op here by construction.
+-- On a database built by a current CertPilot this is a no-op by construction:
+-- 001 no longer creates the constraints. It still matters on a database built
+-- by an older one, where they exist and must be dropped.
 
 begin;
 

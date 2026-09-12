@@ -66,6 +66,5 @@ create index if not exists idx_display_tokens_active
 -- That is deny-by-default for every client role: nothing should ever read this
 -- table through PostgREST or any other direct path. The core connects as the
 -- table owner, which bypasses RLS, so it is unaffected.
-alter table public.display_tokens enable row level security;
 
 commit;

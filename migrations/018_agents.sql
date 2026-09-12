@@ -35,7 +35,6 @@
 -- that only lists what is enrolled. Silence is never success, here as
 -- everywhere else in this system.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 
@@ -130,40 +129,5 @@ create index if not exists idx_agents_status on public.agents (status);
 create index if not exists idx_agents_last_seen
   on public.agents (last_seen_at)
   where status = 'ACTIVE';
-
-alter table public.agent_enrol_tokens enable row level security;
-alter table public.agents enable row level security;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    execute 'grant select, insert, update, delete on public.agent_enrol_tokens to authenticated';
-    execute 'grant select, insert, update, delete on public.agents to authenticated';
-  end if;
-exception when others then
-  raise notice 'skipping grants: %', sqlerrm;
-end
-$$;
-
-do $$
-begin
-  -- Agents are readable by any authenticated user: the row carries a public key
-  -- and a last-seen time, and who is watching the estate is not a secret.
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'agents'
-                   and policyname = 'agents_select') then
-    create policy "agents_select" on public.agents for select to authenticated using (true);
-  end if;
-  -- Enrolment tokens deliberately get no policy at all. RLS is on and nothing
-  -- grants a read, so the table is invisible to `authenticated` and reachable
-  -- only by the owning role the core connects as. The hash is useless on its
-  -- own, but a list of live tokens is a map of which doors are currently open,
-  -- and no policy is a stronger statement than a policy that has to be right.
-  --
-  -- Not expressed with get_user_role(): that function is defined in migration
-  -- 001 and exists only on Supabase, and every migration since 002 has been
-  -- careful to apply anywhere.
-end
-$$;
 
 commit;

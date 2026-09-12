@@ -257,17 +257,15 @@ and will not re-run.
 
 **`prepared statement "stmtcache_..." already exists`**
 
-Supabase's **transaction** pooler (6543). pgx caches prepared statements per
-connection and transaction-mode pooling hands the next query to a backend that
-has never seen them. Use the session pooler on 5432. See
-[database.md](database.md).
+A connection pooler in **transaction** mode. pgx caches prepared statements per
+connection, and transaction-mode pooling hands the next query to a backend that
+has never seen them. Use session mode. See [database.md](database.md).
 
 **`relation "auth.users" does not exist` applying migration 001**
 
-Plain PostgreSQL without the Supabase-compatible prelude. Apply
-[`deploy/plain-postgres/prelude.sql`](../deploy/plain-postgres/prelude.sql)
-first — it creates the `auth` schema, a stub `auth.jwt()` that fails closed,
-the anonymous user, the publication and the `authenticated` role.
+A database built by a CertPilot older than the PostgreSQL-only change, whose
+migration 001 created foreign keys into an `auth.users` table. Migration 005
+severs them; apply outstanding migrations with `certpilot-core --migrate`.
 
 **`violates check constraint "..._check"`**
 

@@ -28,7 +28,6 @@
 -- than on a scan — a certificate valid for your domain exists, somebody holds
 -- its private key, and nothing in this system issued it.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 
@@ -112,34 +111,5 @@ create index if not exists idx_ct_certificates_monitor_state
 create index if not exists idx_ct_certificates_serial
   on public.ct_certificates (serial_number)
   where serial_number is not null;
-
-alter table public.ct_monitors enable row level security;
-alter table public.ct_certificates enable row level security;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    execute 'grant select, insert, update, delete on public.ct_monitors to authenticated';
-    execute 'grant select, insert, update, delete on public.ct_certificates to authenticated';
-  end if;
-exception when others then
-  raise notice 'skipping grants: %', sqlerrm;
-end
-$$;
-
-do $$
-begin
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'ct_monitors'
-                   and policyname = 'ct_monitors_select') then
-    create policy "ct_monitors_select" on public.ct_monitors for select to authenticated using (true);
-  end if;
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'ct_certificates'
-                   and policyname = 'ct_certificates_select') then
-    create policy "ct_certificates_select" on public.ct_certificates for select to authenticated using (true);
-  end if;
-end
-$$;
 
 commit;
