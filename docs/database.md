@@ -5,45 +5,44 @@ That is fine for a first look and useless for anything else: the seeded CAs and
 certificates are demonstration data, and every restart discards whatever you
 did. Once you want the dashboard to mean something, point it at PostgreSQL.
 
-Supabase is the smoothest target, because it is PostgreSQL and because the
-schema was written against it. Nothing in the Go store layer knows Supabase
-exists — it is `pgx` talking to `public.*` — so anything else that speaks
-PostgreSQL 15+ works the same way.
+CertPilot stores everything in a PostgreSQL database **you run**. It does not
+provision, manage or migrate a server on your behalf, and it has no hosted mode:
+you give it a connection string and it uses it. Anything speaking PostgreSQL 14
+or later works — a local server, a container, a managed instance, whatever your
+organisation already operates.
+
+The Go store layer is `pgx` talking to `public.*`, and the schema needs nothing
+a stock server does not have: no extensions, no platform-specific roles, no
+prelude. `TestNoMigrationDependsOnSupabase` fails the build if that stops being
+true.
 
 ---
 
 ## 1. Get a connection string
 
-In the Supabase dashboard: **Project Settings → Database → Connection string**.
-Three are offered, and the choice matters more than it looks.
-
-| | Host / port | Use it? |
-|:---|:---|:---|
-| **Session pooler** | `…pooler.supabase.com:5432` | **Yes — start here** |
-| Transaction pooler | `…pooler.supabase.com:6543` | Only with the extra parameters below |
-| Direct connection | `db.<ref>.supabase.co:5432` | Only if your network has IPv6 |
-
-**Session pooler** is the default recommendation for two reasons. It is reachable
-over IPv4, whereas the direct connection is IPv6-only on projects without the
-IPv4 add-on — on a network without IPv6 that fails as `network is unreachable`,
-which looks like a credentials problem and is not. And it holds one server
-connection per client session, so prepared statements behave normally.
-
-That second point is the one that bites. `pgx` uses the extended query protocol
-and caches prepared statements per connection. A transaction-mode pooler hands
-your next query to a different backend, where that statement was never prepared.
-If you must use port 6543, disable the cache explicitly:
+Whatever your server hands you, with a database CertPilot owns:
 
 ```
-postgres://…:6543/postgres?sslmode=require&default_query_exec_mode=exec&statement_cache_capacity=0
+postgres://certpilot:<password>@<host>:5432/certpilot?sslmode=require
 ```
 
-Add `sslmode=require` in all cases. Supabase will negotiate TLS anyway; saying so
-means a misconfiguration fails instead of quietly downgrading.
+Add `sslmode=require` unless the server is on the same host. Saying so means a
+misconfiguration fails instead of quietly downgrading to plaintext.
 
-**Connect as `postgres`** — the role in the pooler's `postgres.<project-ref>`
-username. Read [row-level security](#row-level-security) before you decide to use
-anything else, because the failure mode there is silent.
+**Connect as the role that owns the tables.** CertPilot creates and reads its
+own schema, and a role without ownership hits permission errors on migration
+rather than at a convenient moment.
+
+### If you put a pooler in front of it
+
+Use **session mode**, not transaction mode. `pgx` uses the extended query
+protocol and caches prepared statements per connection; a transaction-mode
+pooler hands your next query to a different backend, where that statement was
+never prepared. If you must use transaction mode, disable the cache explicitly:
+
+```
+postgres://…/certpilot?sslmode=require&default_query_exec_mode=exec&statement_cache_capacity=0
+```
 
 ---
 
@@ -103,17 +102,21 @@ operator decides to do, not a side effect of one replica restarting mid-deploy
 while the others still read the old shape. Run it as a job, an init container, or
 by hand.
 
-If you would rather paste the SQL into the Supabase SQL editor, apply the files
+If you would rather apply the SQL by hand with `psql`, apply the files
 in numeric order. `004`, `006`, `007`, `008`, and `012` add columns to or alter
 constraints on tables `001` creates.
 
 ### Migration 005 is not optional
 
-`001` declared every actor column as `references auth.users(id)` —
-`certificates.created_by`, `audit_logs.actor_id`, and five more. But the core does
-not authenticate against Supabase Auth; it verifies OIDC tokens against whatever
-`auth.jwks_url` points at, which is as likely to be Keycloak or Okta, and stores
-that provider's `sub`. Those subjects are not rows in `auth.users`.
+`001` used to declare every actor column as `references auth.users(id)` —
+`certificates.created_by`, `audit_logs.actor_id`, and five more — against an
+identity table CertPilot does not own. The core verifies OIDC tokens against
+whatever `auth.jwks_url` points at, as likely to be Keycloak or Okta, and stores
+that provider's `sub`. Those subjects were never rows in that table.
+
+`001` no longer creates those constraints, so on a database built today `005` is
+a no-op by construction. It matters on a database built by an older CertPilot,
+where the constraints exist and still need dropping.
 
 The result is not a cosmetic inconsistency. Issuing a certificate raises a
 foreign key violation and fails. Local development hits it on the first request,
@@ -138,7 +141,7 @@ or `--db=postgres://…`. Resolution order is `--db`, then `CERTPILOT_DB_URL`, t
 You should see:
 
 ```
-INFO connected to PostgreSQL/Supabase database
+INFO connected to PostgreSQL
 ```
 
 The dashboard will show zeros, because the database is empty and the sample data
@@ -149,53 +152,37 @@ the point.
 
 ## Row-level security
 
-Every table from `001` has RLS enabled with policies written for Supabase's
-`authenticated` role. The core is unaffected because it connects as `postgres`,
-which owns the tables, and PostgreSQL does not apply RLS to a table's owner
-unless the table is set to `force row level security`. None are.
+**CertPilot's schema does not use it.** Authorisation for people is enforced in
+the API layer, which is where it was always enforced — the tables carry no
+policies and no `enable row level security`.
 
-This is load-bearing, and it fails in the worst possible direction:
+Earlier versions did, with policies written against a hosted platform's JWT
+function and its `authenticated` role. On a server without those objects the
+policies could not be created at all, and where they could, they protected a
+path CertPilot does not use.
+
+The startup check in `store.Preflight` stays, because an operator can still
+enable RLS on these tables by hand, and the failure mode is the worst available:
 
 > **A policy that denies a `SELECT` does not raise an error. It returns zero
 > rows.**
 
-A core connected as some other role would start cleanly, answer every request,
-and report an estate with no certificates, no CAs, and nothing expiring — which
-on a wall display is indistinguishable from an organisation whose PKI is in
-perfect health. That is precisely the failure this product exists to prevent,
-arriving through its own database connection.
-
-So the core checks at startup, in `store.Preflight`, and refuses to run rather
-than serve a reassuring lie:
+A core connected as a role that RLS applied to would start cleanly, answer every
+request, and report an estate with no certificates, no CAs and nothing expiring
+— which on a wall display is indistinguishable from an organisation whose PKI is
+in perfect health. That is precisely the failure this product exists to prevent,
+arriving through its own database connection. So the core refuses to start
+rather than serve a reassuring lie:
 
 ```
 failed to connect to the database: row-level security would silently hide rows
 in ca_authorities, certificates from this connection, so the dashboard would
 show an empty, healthy-looking estate. Connect as the role that owns these
-tables (on Supabase that is `postgres`), or grant the current role BYPASSRLS
+tables, or grant the current role BYPASSRLS
 ```
 
 The same check refuses an unmigrated or half-migrated database, for the same
 reason — an empty dashboard is a plausible-looking dashboard.
-
-If you do create a dedicated role for the core, it needs `BYPASSRLS` (or
-ownership of the tables). The RLS policies stay useful either way: they still
-govern anything reaching the database through PostgREST, which is a different
-path with a different threat model.
-
----
-
-## Plain PostgreSQL
-
-Migrations `002` through `010` apply anywhere. **`001` does not**: it defines
-`get_user_role()` in terms of `auth.jwt()` and its RLS policies grant to the
-`authenticated` role, neither of which exists outside Supabase. A portable `001`
-is a known gap, tracked in the README.
-
-Until then, on vanilla PostgreSQL, create the schema from `001` with the
-`auth.users` references and the RLS block removed. `005` is then a no-op, which
-is the intended behaviour rather than an accident — it drops constraints by
-searching for foreign keys into the `auth` schema, and finds none.
 
 ---
 
@@ -215,7 +202,7 @@ searching for foreign keys into the `auth` schema, and finds none.
 
 ## What running this for the first time found
 
-Everything above was verified against a live Supabase project (PostgreSQL 17,
+Everything above was verified against a live PostgreSQL 17 server (
 session pooler, `eu-north-1`): all five migrations applied and reapplied
 idempotently, three CAs registered, a certificate issued through the self-signed
 gateway, renewed with key rotation, its private key exported and checked against
@@ -353,12 +340,11 @@ its first run and the rest arrived later, which is the more useful lesson — th
 suite earns its keep on every schema change, not once.
 
 **The schema did not apply to plain PostgreSQL at all.** Migration 001
-references `auth.users`, `auth.jwt()` and a `supabase_realtime` publication.
-This had been a known gap since week one and nothing had ever tried it. It is
-now [`deploy/plain-postgres/prelude.sql`](../deploy/plain-postgres/prelude.sql)
-— a supported path, run by the suite so it cannot rot, and deliberately not in
-`migrations/` because a stub `auth.jwt()` applied to a real Supabase project
-would shadow the genuine one and break every RLS policy in the database.
+referenced `auth.users`, `auth.jwt()` and a hosted platform's publication. This
+had been a known gap since week one and nothing had ever tried it. It was first
+worked around with a prelude of stub objects, and then removed properly: the
+migrations carry no platform coupling, all of them apply to a stock server, and
+`TestNoMigrationDependsOnSupabase` fails the build if any returns.
 
 **`PostgresStore.CreateAgent` refused an agent the in-memory store accepted.**
 `agents.heartbeat_interval_seconds` carries `DEFAULT 300` and a CHECK that it is

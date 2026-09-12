@@ -64,8 +64,12 @@ func freshPostgres(t *testing.T, adminURL string) Store {
 		}
 	})
 
+	// Straight from an empty database to the migrations, with nothing applied
+	// first. That is the claim being tested: the schema this project ships needs
+	// nothing a stock PostgreSQL server does not already have. The harness used
+	// to apply a prelude of borrowed platform objects here, which meant the
+	// suite proved the migrations worked on a database no deployment had.
 	url := replaceDatabase(adminURL, name)
-	applyPrelude(t, url)
 
 	result, err := Migrate(ctx, url, repoPath(t, "migrations"))
 	if err != nil {
@@ -85,32 +89,6 @@ func freshPostgres(t *testing.T, adminURL string) Store {
 	}
 	pool.Close()
 	return store
-}
-
-// applyPrelude creates the `auth` schema and the `authenticated` role that
-// migration 001 references.
-//
-// The same file a plain-PostgreSQL deployment runs — `deploy/plain-postgres/prelude.sql`
-// — rather than a copy of it in the test. Two versions of the compatibility
-// shim would mean the suite proving that a file nobody deploys works.
-func applyPrelude(t *testing.T, url string) {
-	t.Helper()
-
-	body, err := os.ReadFile(repoPath(t, "deploy", "plain-postgres", "prelude.sql"))
-	if err != nil {
-		t.Fatalf("could not read the plain-PostgreSQL prelude: %v", err)
-	}
-
-	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("could not connect to the test database: %v", err)
-	}
-	defer func() { _ = conn.Close(ctx) }()
-
-	if _, err := conn.Exec(ctx, string(body)); err != nil {
-		t.Fatalf("the plain-PostgreSQL prelude did not apply: %v", err)
-	}
 }
 
 // refuseIfProduction is a guard, not a security control.

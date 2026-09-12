@@ -141,7 +141,9 @@ Guard everything: `create table if not exists`, `add column if not exists`, and
 a `do $$ … pg_constraint … $$` block for a CHECK, since PostgreSQL has no
 `add constraint if not exists`.
 
-Anything that must not run on Supabase does not belong in `migrations/`.
+The store is plain PostgreSQL. A migration that needs anything a stock server
+does not have does not belong in `migrations/`, and `TestNoMigrationDependsOnSupabase`
+fails the build if one appears.
 
 ---
 

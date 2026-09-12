@@ -129,21 +129,5 @@ comment on column public.users.subject is
 -- Row-level security, consistent with every other table here. The core
 -- connects as the owner and is unaffected; this protects direct PostgREST
 -- access on a Supabase deployment.
-alter table public.users enable row level security;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    -- Readable by signed-in callers, never writable through PostgREST: role
-    -- assignment goes through the core, which audits it.
-    if not exists (
-      select 1 from pg_policies
-      where schemaname = 'public' and tablename = 'users' and policyname = 'users_select'
-    ) then
-      create policy "users_select" on public.users
-        for select to authenticated using (true);
-    end if;
-  end if;
-end $$;
 
 commit;

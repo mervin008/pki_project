@@ -95,6 +95,4 @@ create index if not exists idx_alert_ack_silenced
   on public.alert_acknowledgements(silence_until)
   where silence_until is not null and revoked_at is null;
 
-alter table public.alert_acknowledgements enable row level security;
-
 commit;

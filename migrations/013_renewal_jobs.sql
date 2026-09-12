@@ -32,7 +32,6 @@
 -- sentence somebody can act on. "Last error: timeout" is not, because it cannot
 -- distinguish a blip from a fortnight of silence.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 
@@ -106,27 +105,5 @@ create index if not exists idx_renewal_jobs_claimable
 
 create index if not exists idx_renewal_jobs_certificate
   on public.renewal_jobs (certificate_id, created_at desc);
-
-alter table public.renewal_jobs enable row level security;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    execute 'grant select, insert, update, delete on public.renewal_jobs to authenticated';
-  end if;
-exception when others then
-  raise notice 'skipping grants: %', sqlerrm;
-end
-$$;
-
-do $$
-begin
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'renewal_jobs'
-                   and policyname = 'renewal_jobs_select') then
-    create policy "renewal_jobs_select" on public.renewal_jobs for select to authenticated using (true);
-  end if;
-end
-$$;
 
 commit;

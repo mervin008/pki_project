@@ -95,13 +95,12 @@ starting from empty.
 
 ## Things that are true and non-obvious
 
-**Migration 001 was written against Supabase.** It references `auth.users`, the
-`authenticated` role, and the `supabase_realtime` publication. Plain PostgreSQL
-needs [`deploy/plain-postgres/prelude.sql`](deploy/plain-postgres/prelude.sql)
-run once first. That file is deliberately **not** in `migrations/` — the migrator
-applies everything it finds there, and installing a stub `auth.jwt()` on a real
-Supabase project would shadow the genuine one and silently break every RLS
-policy. Never move it, and never run it against a database you did not create.
+**The store is plain PostgreSQL, and only that.** Every migration applies to a
+stock PostgreSQL 14+ server with no extensions, no prelude and no platform
+objects. Migration 001 used to reference `auth.users`, the `authenticated` role
+and a `supabase_realtime` publication, which meant a fresh database could not be
+built without stubbing those first; that is gone, and
+`TestNoMigrationDependsOnSupabase` fails the build if any of it returns.
 
 **The server never migrates itself.** A schema change is something an operator
 runs, not a side effect of a replica restarting mid-deploy.
@@ -261,8 +260,9 @@ history of green suites over broken behaviour:
   tests agreed.
 - `GetCAChain` had been broken against any real database since migration 006;
   the in-memory store had no such column and never noticed.
-- The store conformance suite fabricates the Supabase objects migration 001
-  needs, so it never noticed that the schema cannot be created without them.
+- The store conformance suite used to fabricate the platform objects migration
+  001 needed, so it never noticed that the schema could not be created without
+  them.
 
 So: **run it against the real thing.** The stack starts in about ten seconds and
 `make seed` gives it something to work on. For UI work, screenshot it — headless
@@ -385,9 +385,8 @@ need a container runtime.
 
 ## Secrets
 
-`.env` is gitignored and holds `CERTPILOT_DB_URL` (a Supabase project) and
-`CERTPILOT_KEK`. **`make dev` does not read it** — it uses the local PostgreSQL
+`.env` is gitignored and holds `CERTPILOT_DB_URL` and `CERTPILOT_KEK`. **`make dev` does not read it** — it uses the local PostgreSQL
 instead, and no Go code loads `.env`. Never print, commit, or echo its contents.
 
-Two items the owner has deferred: the Supabase database password has not been
-rotated, and `CERTPILOT_KEK` is not stored anywhere durable.
+Two items the owner has deferred: the database password has not been rotated,
+and `CERTPILOT_KEK` is not stored anywhere durable.

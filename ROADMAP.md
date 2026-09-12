@@ -1633,8 +1633,10 @@ Tracked honestly rather than quietly:
   from the *recorded* status rather than the check's own result, so a blip at
   the responder cannot return it to healthy
 - `migrations/001_initial_schema.sql` references `auth.users` and `auth.jwt()`
-  and applies only to Supabase. The Go store layer is plain `pgx` with no
-  Supabase dependency; the schema is the only coupling
+  and is now gone. The Go store layer is plain `pgx`, and as of the
+  PostgreSQL-only change the schema carries no external-platform coupling
+  either: all 35 migrations apply to a stock PostgreSQL 17 server with no
+  prelude, and `TestNoMigrationDependsOnSupabase` keeps it that way
 - Policy is evaluated on issuance only, not renewal; `key_type`, `naming`, and
   `approval_required` rule types are accepted by the schema but not implemented
 - The conformance suite covers the store's constraint, round-trip and queue

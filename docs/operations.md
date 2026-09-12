@@ -39,7 +39,7 @@ export CERTPILOT_KEK='...'
 export CERTPILOT_DB_URL='postgres://user:pass@host:5432/certpilot?sslmode=require'
 ```
 
-Any PostgreSQL 13 or later — the schema uses `gen_random_uuid()`, which is built in from 13. Tested against 17. Supabase is supported and not required — see
+Any PostgreSQL 13 or later — the schema uses `gen_random_uuid()`, which is built in from 13. Tested against 17. You run the server; CertPilot does not provision one — see
 [database.md](database.md) for the pooler note, which matters.
 
 Without a connection string the core runs on the in-memory store with sample

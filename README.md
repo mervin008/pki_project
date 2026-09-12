@@ -180,7 +180,7 @@ the implementation.
 | [Posture](docs/posture.md) | CNSA 2.0 scoring and CBOM export |
 | [Vault gateway](docs/gateways/vault.md) | HashiCorp Vault PKI in depth |
 | [Writing a gateway](docs/writing-a-gateway.md) | Adding a CA, in any language |
-| [Database](docs/database.md) | Schema, migrations, PostgreSQL and Supabase |
+| [Database](docs/database.md) | Schema, migrations, PostgreSQL, the conformance suite |
 | [Troubleshooting](docs/troubleshooting.md) | Symptom, cause, fix |
 | [Implementation status](docs/status.md) | What is built, what is partial, what is not |
 | [Roadmap](ROADMAP.md) | A record of what was found on the way |

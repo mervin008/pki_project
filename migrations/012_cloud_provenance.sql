@@ -16,7 +16,6 @@
 -- pasted and a certificate discovered sitting in a production Key Vault throws
 -- away the more interesting half.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 

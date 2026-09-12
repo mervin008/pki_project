@@ -43,7 +43,6 @@
 -- certificates for one hostname are two certificates and only one of them is
 -- the one that expires.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 
@@ -157,34 +156,5 @@ create index if not exists idx_cloud_certificates_fingerprint
 create index if not exists idx_cloud_certificates_expiry
   on public.cloud_certificates (not_after)
   where removed_at is null;
-
-alter table public.cloud_connections enable row level security;
-alter table public.cloud_certificates enable row level security;
-
-do $$
-begin
-  if exists (select 1 from pg_roles where rolname = 'authenticated') then
-    execute 'grant select, insert, update, delete on public.cloud_connections to authenticated';
-    execute 'grant select, insert, update, delete on public.cloud_certificates to authenticated';
-  end if;
-exception when others then
-  raise notice 'skipping grants: %', sqlerrm;
-end
-$$;
-
-do $$
-begin
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'cloud_connections'
-                   and policyname = 'cloud_connections_select') then
-    create policy "cloud_connections_select" on public.cloud_connections for select to authenticated using (true);
-  end if;
-  if not exists (select 1 from pg_policies
-                 where schemaname = 'public' and tablename = 'cloud_certificates'
-                   and policyname = 'cloud_certificates_select') then
-    create policy "cloud_certificates_select" on public.cloud_certificates for select to authenticated using (true);
-  end if;
-end
-$$;
 
 commit;

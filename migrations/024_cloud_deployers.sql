@@ -28,7 +28,6 @@
 -- dropping a permitted value from a check constraint is a thing that fails on
 -- somebody's database at three in the morning because one row somewhere has it.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 

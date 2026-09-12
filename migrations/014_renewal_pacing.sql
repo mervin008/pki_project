@@ -25,7 +25,6 @@
 -- renewals for a constraint that does not exist, and a certificate that expired
 -- because this tool was being cautious is the worst possible outcome.
 --
--- Applies to plain PostgreSQL as well as Supabase.
 
 begin;
 
