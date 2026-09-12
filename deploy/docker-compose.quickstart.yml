@@ -1,0 +1,137 @@
+# CertPilot in one command, for deciding whether it is interesting.
+#
+#   docker compose -f deploy/docker-compose.quickstart.yml up -d --build
+#   docker compose -f deploy/docker-compose.quickstart.yml logs core | grep -i password
+#   open http://localhost:3000
+#
+# This is NOT deploy/docker-compose.yml, and the difference is the point. That
+# file deliberately has no database: CertPilot stores certificate private keys
+# and CA credentials, and running its store as a container beside the app is how
+# an evaluation becomes a deployment nobody meant to make. This file has one,
+# because an evaluation that needs you to provision PostgreSQL first is an
+# evaluation that does not happen.
+#
+# So it buys the ten minutes back by giving up things you must not give up in
+# production, all of them visible here rather than hidden:
+#
+#   - the database is a container, and its volume is as durable as your laptop
+#   - the KEK is committed to this repository, so every key it encrypts is
+#     readable by anyone who has the repository
+#   - the CA is the self-signed gateway, which trusts nothing and nothing trusts
+#   - the mTLS material is generated on first run, and its CA key is written
+#     next to the certificates it signs
+#
+# Migrations still run as their own step rather than on startup. That rule does
+# not bend for a demo.
+name: certpilot-quickstart
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: certpilot
+      POSTGRES_PASSWORD: quickstart
+      POSTGRES_DB: certpilot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Everything else waits on this rather than on a sleep, so a slow first
+      # start on a cold machine delays the stack instead of breaking it.
+      test: ["CMD-SHELL", "pg_isready -U certpilot -d certpilot"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Writes the mTLS material for the core-to-gateway channel, then exits.
+  #
+  # Uses the core image because `certpilot-core --generate-dev-certs` is where
+  # that code already lives — there is no second implementation to keep honest,
+  # and the quickstart needs no Go toolchain on the host to get it.
+  certs:
+    build:
+      context: ..
+      dockerfile: deploy/docker/core.Dockerfile
+    command: ["--generate-dev-certs=/app/pki"]
+    volumes:
+      - pki:/app/pki
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/docker/core.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CERTPILOT_DB_URL: "postgres://certpilot:quickstart@postgres:5432/certpilot?sslmode=disable"
+      CERTPILOT_KEK: "Q2VydFBpbG90UXVpY2tzdGFydERlbW9LZXlfMDAwMDA="
+    command: ["--migrate", "--migrations=/app/migrations"]
+
+  gateway-selfsigned:
+    build:
+      context: ..
+      dockerfile: deploy/docker/gateway-selfsigned.Dockerfile
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - pki:/app/pki:ro
+    command:
+      - "--port=9091"
+      - "--tls-cert=/app/pki/gateway.pem"
+      - "--tls-key=/app/pki/gateway-key.pem"
+      - "--tls-ca=/app/pki/ca.pem"
+    healthcheck:
+      # A TCP probe, not a gRPC one: the channel is mutually authenticated, so
+      # anything that actually speaks to it needs a client certificate. This
+      # only answers "is the listener up", which is precisely what the core has
+      # to wait for. Without it, `service_started` lets the core dial a gateway
+      # that has not bound its port yet, and the core logs a warning and carries
+      # on — leaving a stack that looks fine and has no CA attached.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9091 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  core:
+    build:
+      context: ..
+      dockerfile: deploy/docker/core.Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      certs:
+        condition: service_completed_successfully
+      gateway-selfsigned:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      CERTPILOT_DB_URL: "postgres://certpilot:quickstart@postgres:5432/certpilot?sslmode=disable"
+      # Committed on purpose and safe only because everything this instance
+      # holds is throwaway. Decodes to "CertPilotQuickstartDemoKey_00000" so
+      # that anybody who looks can tell at a glance it is not a secret.
+      CERTPILOT_KEK: "Q2VydFBpbG90UXVpY2tzdGFydERlbW9LZXlfMDAwMDA="
+    volumes:
+      - ./config.quickstart.yaml:/app/config.yaml:ro
+      - pki:/app/pki:ro
+    command: ["--config=/app/config.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/docker/frontend.Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      core:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  pki:
