@@ -204,7 +204,7 @@ existed before waves did — same-wave targets deploy in parallel.
 
 ```mermaid
 flowchart TB
-    R["A renewal succeeds"] --> Q["One deployment job per binding<br/>with deploy_on_renewal"]
+    R["A renewal succeeds"] --> Q["One job per binding<br/>with deploy_on_renewal"]
     Q --> W0
 
     subgraph W0["wave 0 — one target alone, so it is a canary"]
@@ -218,7 +218,7 @@ flowchart TB
     end
 
     W0 -->|"succeeded"| W1
-    W0 -.->|"failed"| H["The rollout halts — wave 1 never<br/>becomes claimable"]
+    W0 -.->|"failed"| H["The rollout halts — wave 1<br/>never becomes claimable"]
 ```
 
 **A canary is a target on its own in the lowest wave.** One target, exactly one

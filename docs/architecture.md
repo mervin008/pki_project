@@ -12,12 +12,12 @@ flowchart TB
 
     subgraph plane["Control plane — the only thing holding the KEK"]
         direction LR
-        CORE["CertPilot Core<br/>REST API · 13 engines · event broker"]
-        DB[("PostgreSQL<br/>sealed secrets · durable queues")]
+        CORE["CertPilot Core<br/>REST API · 13 engines"]
+        DB[("PostgreSQL<br/>sealed secrets, queues")]
         CORE <--> DB
     end
 
-    subgraph gws["Gateways — reached over gRPC with mutual TLS.<br/>No database, and no CertPilot state."]
+    subgraph gws["Gateways — gRPC over mutual TLS, and no state of their own"]
         direction LR
         ACME["ACME gateway<br/>:9092"]
         VAULT["Vault gateway<br/>:9093"]
@@ -312,9 +312,9 @@ sequenceDiagram
 Events are published throughout, so SSE clients and the notification
 dispatcher see each of these as it occurs rather than on the next poll.
 
-Step 5 is why this is a lifecycle manager rather than an issuance tool. Renewal
-that stops at "the certificate is in the database" is renewal that has not
-happened yet.
+That last exchange is why this is a lifecycle manager rather than an issuance
+tool. Renewal that stops at "the certificate is in the database" is renewal that
+has not happened yet.
 
 ## Where the private keys are
 
@@ -349,8 +349,8 @@ flowchart LR
     end
 
     CP["key_custody = CERTPILOT<br/>sealed here with the KEK"]
-    AG["key_custody = AGENT<br/>on that host, and nowhere else"]
-    EX["key_custody = EXTERNAL<br/>somebody holds it, and it is not us"]
+    AG["key_custody = AGENT<br/>on that host only"]
+    EX["key_custody = EXTERNAL<br/>somebody else holds it"]
 
     RQ -->|"no CSR sent, so<br/>the gateway made the key"| CP
     RQ -->|"you sent a CSR"| EX
@@ -361,9 +361,9 @@ flowchart LR
     IMP --> EX
     MAN --> EX
 
-    CP --> R1["The core's renewal sweep renews it."]
-    AG --> R2["The agent renews it, with a new key each time.<br/>The sweep skips it deliberately."]
-    EX --> R3["Nothing here can renew it. The executor refuses<br/>and asks for a new signing request instead."]
+    CP --> R1["The core's renewal<br/>sweep renews it."]
+    AG --> R2["The agent renews it —<br/>the sweep skips it."]
+    EX --> R3["Nothing here renews it.<br/>The executor refuses."]
 ```
 
 That last refusal is the interesting one. Renewing an `EXTERNAL` certificate
