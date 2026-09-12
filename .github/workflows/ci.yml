@@ -1,0 +1,166 @@
+name: CI
+
+# Runs what a developer runs. Every job below shells out to a Makefile target
+# rather than restating the commands, so CI and a local `make test` cannot drift
+# into checking different things — which is the failure that makes a green run
+# meaningless.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A superseded run tells you nothing about the commit that replaced it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+
+    # The store suite runs against a real PostgreSQL here, and that is the whole
+    # point of this service block. `core/store` has two implementations behind
+    # one interface, and the in-memory one enforces no constraints: no CHECK, no
+    # NOT NULL, no type coercion. Testing against it alone finds none of the
+    # defects that actually ship — GetCAChain was broken against every real
+    # database from migration 006 until somebody ran it.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: certpilot
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U certpilot"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+
+      - name: Every module, with PostgreSQL
+        env:
+          CERTPILOT_TEST_DB_URL: postgres://certpilot:ci@127.0.0.1:5432/postgres?sslmode=disable
+        run: make test
+
+      # A skip is invisible in a green run. The store suite quietly drops its
+      # PostgreSQL half when CERTPILOT_TEST_DB_URL is unset, so without this
+      # step a broken service block would look exactly like a passing build.
+      - name: Prove PostgreSQL was actually exercised
+        env:
+          CERTPILOT_TEST_DB_URL: postgres://certpilot:ci@127.0.0.1:5432/postgres?sslmode=disable
+        run: |
+          set -euo pipefail
+          # `make test-store`, not a hand-written `go test`, for the same reason
+          # every other job here calls a Makefile target.
+          #
+          # The assertion is on the subtest name. forEachStore runs each body
+          # once per implementation and names the subtest after it, so a run
+          # that reached the database contains `/postgres` and one that fell
+          # back to the in-memory store alone contains only `/memory`. Both
+          # directions were checked before this was written — there is no
+          # function named *Conformance*, so grepping for that matched nothing
+          # and the check passed on an empty result.
+          # DB= rather than the environment: test-store sets
+          # CERTPILOT_TEST_DB_URL from $(TEST_DB), which defaults to the
+          # plain-postgres container on 55432, so an exported value is ignored
+          # and the suite would quietly look for a server that is not here.
+          out="$(make test-store DB="$CERTPILOT_TEST_DB_URL" 2>&1)" || { echo "$out" | tail -30; exit 1; }
+          if ! grep -qE 'RUN[[:space:]]+Test[A-Za-z]+/postgres' <<<"$out"; then
+            echo "::error::the store suite did not run against PostgreSQL — it skipped to the in-memory store, which enforces no constraints"
+            grep -i "not exercised" <<<"$out" || true
+            echo "$out" | tail -20
+            exit 1
+          fi
+          echo "the store suite ran against PostgreSQL:"
+          grep -oE 'Test[A-Za-z]+/postgres' <<<"$out" | sort -u | head
+
+  race:
+    name: race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+      # Without a database on purpose: the races worth finding here are in the
+      # engines and the event broker, which are goroutine-heavy and need no
+      # store, and the DB-backed paths are already covered by `tests` above.
+      - run: make test-race
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+
+      # `make lint` skips staticcheck when it is not installed, so that a fresh
+      # clone can still be linted. In CI that would mean silently dropping every
+      # check it contributes — dead assignments, impossible conditions,
+      # unreachable code — so it is installed here and asserted below.
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
+
+      - name: go vet, gofmt, staticcheck
+        run: |
+          set -euo pipefail
+          command -v staticcheck >/dev/null || { echo "::error::staticcheck did not install"; exit 1; }
+          make lint | tee lint.out
+          grep -q "staticcheck not installed" lint.out && {
+            echo "::error::make lint skipped staticcheck"; exit 1; } || true
+
+  tidy:
+    name: go.mod is tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+      # An untidy go.mod means the module graph in the repository is not the one
+      # the build actually uses, and the difference shows up as a mystery on
+      # somebody else's machine.
+      - run: make tidy
+      - name: Fail if it changed
+        run: |
+          if ! git diff --quiet -- '**/go.mod' '**/go.sum'; then
+            echo "::error::go.mod or go.sum is out of date. Run: make tidy"
+            git --no-pager diff -- '**/go.mod' '**/go.sum'
+            exit 1
+          fi
+          echo "module graph is tidy"
+
+  frontend:
+    name: frontend checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      # vue-tsc plus the three hand-written checks that guard the parts a type
+      # checker cannot see: the SSE stream, the chain rendering, and the display
+      # token flow.
+      - run: make test-frontend
+      - run: npm run build
+        working-directory: frontend
